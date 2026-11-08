@@ -1020,3 +1020,23 @@ def test_pme_round_trip() -> None:
     assert restored.pme_spacing == 1.0
     # the default order is recorded too, so that it survives a change of default
     assert _periodic_long_range().serialize()["pme_order"] == 8
+
+
+@pytest.mark.parametrize("n", [6, 10, 20])
+def test_ellipsoid_grid_packs_fewer_slots_than_fixed(n: int) -> None:
+    """The packed ellipsoid holds the same sphere in at least 1.8x fewer slots."""
+    from deepmd.dpmodel.utils.neighbor_graph.reciprocal_graph import (
+        build_ellipsoid_k_grid,
+        build_fixed_k_grid,
+    )
+
+    cell = np.array([[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]]])
+    coord = np.zeros((1, 3))
+    n_node = np.array([1])
+    k_max = 2.0 * np.pi * n / 8.0
+    fixed = build_fixed_k_grid(cell, [n, n, n], k_max, coord, n_node)
+    packed = build_ellipsoid_k_grid(cell, k_max, coord, n_node, [n, n, n])
+    # The same physical cutoff: both keep every point of the sphere.
+    assert int(np.sum(fixed.mask)) == int(np.sum(packed.mask))
+    # But the packed grid allocates far fewer slots.
+    assert fixed.mask.size / packed.mask.size >= 1.8

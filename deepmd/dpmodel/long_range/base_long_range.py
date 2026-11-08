@@ -39,15 +39,22 @@ def check_long_range_support(descriptor: Any) -> None:
     NotImplementedError
         If the descriptor is not among the validated ones.
     """
-    from deepmd.dpmodel.descriptor.dpa4c import (
-        DescrptDPA4C,
-    )
-
-    if not isinstance(descriptor, DescrptDPA4C):
-        raise NotImplementedError(
-            "long-range modules are currently validated with the DPA4C "
-            f"descriptor only, got {type(descriptor).__name__}"
+    supports = getattr(descriptor, "supports_long_range", None)
+    if callable(supports):
+        if supports():
+            return
+    else:
+        # Back-compat for descriptors written before the capability flag.
+        from deepmd.dpmodel.descriptor.dpa4c import (
+            DescrptDPA4C,
         )
+
+        if isinstance(descriptor, DescrptDPA4C):
+            return
+    raise NotImplementedError(
+        "long-range modules are currently validated with the DPA4C and DPA4 "
+        f"descriptors only, got {type(descriptor).__name__}"
+    )
 
 
 def make_base_long_range(t_tensor: Any) -> type:

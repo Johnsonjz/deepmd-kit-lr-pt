@@ -590,6 +590,28 @@ def get_sezm_model(model_params: dict) -> BaseModel:
     use_compile = bool(model_params.get("use_compile", False))
     enable_tf32 = bool(model_params.get("enable_tf32", True))
 
+    # === Long-range module (pt backend) ===
+    long_range = None
+    long_range_cfg = model_params.get("long_range")
+    if long_range_cfg is not None:
+        if modelcls is not SeZMModel:
+            raise ValueError(
+                "a long-range module requires an energy fitting; the "
+                "DPA4/SeZM property model does not support one"
+            )
+        from deepmd.pt.long_range import (
+            BaseLongRange,
+        )
+
+        lr_type = long_range_cfg.get("type")
+        lr_cls = BaseLongRange.get_class_by_type(lr_type)
+        long_range = lr_cls.from_config(
+            long_range_cfg,
+            descriptor,
+            fitting,
+            fitting_seed=getattr(fitting, "seed", None),
+        )
+
     model = modelcls(
         descriptor=descriptor,
         fitting=fitting,
@@ -601,6 +623,7 @@ def get_sezm_model(model_params: dict) -> BaseModel:
         use_compile=use_compile,
         enable_tf32=enable_tf32,
         bridging_method=bridging_method,
+        long_range=long_range,
     )
     model.model_def_script = json.dumps(model_params_old)
     return model
@@ -621,6 +644,14 @@ def get_sezm_spin_model(model_params: dict) -> BaseModel:
     model_params.setdefault("fitting_net", {})
     model_params["descriptor"].setdefault("type", "dpa4")
     _normalize_spin_use_spin(model_params)
+
+    if model_params.get("long_range") is not None:
+        # The long-range host of the pt backend rides the collinear energy
+        # path; a spin model would silently drop the reciprocal term.
+        raise NotImplementedError(
+            "a long-range module is not supported together with a spin model "
+            "in the PyTorch backend"
+        )
 
     use_spin = [bool(flag) for flag in model_params["spin"]["use_spin"]]
     spin = Spin(
@@ -682,9 +713,25 @@ def get_sezm_spin_model(model_params: dict) -> BaseModel:
     return model
 
 
+_LEGACY_SOG_TYPES = {"sezm_sog", "dpa4_sog", "sog_sezm", "dpa4c_sog"}
+
+
+def _reject_legacy_sog(model_type: str) -> None:
+    if str(model_type).lower() in _LEGACY_SOG_TYPES:
+        raise ValueError(
+            f"the legacy SOG model type {model_type!r} is not part of the "
+            "upstream `long_range` schema. Convert its configuration and "
+            "checkpoint with "
+            "`sog_work/tools/convert_sog_to_long_range.py`, then use "
+            "`model.type: dpa4` (or `standard` for DPA4C) with a "
+            "`long_range: latent_charge` section."
+        )
+
+
 def get_model(model_params: dict) -> Any:
     model_params = expand_bridging_method(model_params)
     model_type = model_params.get("type", "standard")
+    _reject_legacy_sog(model_type)
     if model_type == "standard":
         if "spin" in model_params:
             return get_spin_model(model_params)

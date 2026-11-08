@@ -243,6 +243,26 @@ def k_grid_bounds_of_cells(box: Array, k_max: float) -> np.ndarray:
     return np.ceil(k_max * length / (2.0 * math.pi)).astype(np.int64)
 
 
+def _warn_truncated_grid(
+    cells: np.ndarray,
+    bounds: np.ndarray,
+    k_max: float,
+    mode: str,
+    key: str,
+) -> None:
+    """Warn when a frame needs a larger integer grid than the one supplied."""
+    required = k_grid_bounds_of_cells(cells, k_max)
+    beyond = np.any(required > bounds[None, :], axis=1)
+    if np.any(beyond):
+        f = int(np.argmax(beyond))
+        warnings.warn(
+            f"frame {f} needs integer k-grid bounds {required[f].tolist()}, "
+            f"beyond the {mode} grid {bounds.tolist()}: its k-space sum is "
+            f"truncated to the grid; enlarge `{key}` for the full sum",
+            stacklevel=3,
+        )
+
+
 def enumerate_k_grid_bounds(bounds: Array | list[int]) -> np.ndarray:
     r"""Enumerate the integer wave-number indices within per-axis bounds.
 
@@ -430,6 +450,126 @@ def build_fixed_k_grid(
     k = np.einsum("jm,fdm->fjd", n_grid.astype(np.float64), rec)
     vec, real = _k_blocks(list(k))
     mask = real & (np.sum(vec * vec, axis=-1) <= k_max * k_max)
+    return _k_grid(box, vec, mask, _frame_slots(n_node), coord)
+
+
+def build_ellipsoid_k_grid(
+    box: Array,
+    k_max: float,
+    coord: Array,
+    n_node: Array,
+    nk: Array | list[int],
+) -> KGrid:
+    r"""Reciprocal points of an orthogonal cell, packed inside an ellipsoid.
+
+    The integer triples satisfy :math:`\sum_d (n_d / nk_d)^2 \le 1`, so with
+    :math:`nk_d = \lceil k_{max} |\mathbf{a}_d| / 2\pi \rceil` the packed set
+    is exactly the wave-number sphere for an orthogonal cell.  The set is
+    shared by every frame and its length is fixed by ``nk``, which keeps the
+    k axis static for a compiled or exported graph.  A tilted cell is
+    rejected: the integer ellipsoid is axis-aligned, while the physical
+    cutoff surface is rotated, so a packed set could silently omit modes.
+
+    Parameters
+    ----------
+    box
+        Simulation cells with shape ``(nf, 3, 3)`` or ``(nf, 9)``; rows are the
+        lattice vectors.
+    k_max
+        The wave-number cutoff, in Å⁻¹.
+    coord
+        Node positions with shape ``(N, 3)``.
+    n_node
+        Per-frame node counts with shape ``(nf,)``.
+    nk
+        The per-axis integer semi-axes :math:`nk_d` of the packed ellipsoid.
+
+    Returns
+    -------
+    KGrid
+        The packed wave numbers of every frame, one row each.
+    """
+    box = _cells(box)
+    cells = np.asarray(to_numpy_array(box), dtype=np.float64)
+    nk = np.asarray(to_numpy_array(nk), dtype=np.int64).reshape(-1)
+    if nk.shape != (3,) or np.any(nk < 1):
+        raise ValueError(f"`nk` must be three positive integers, got {nk.tolist()}")
+    diag = np.zeros_like(cells)
+    index = np.arange(3)
+    diag[:, index, index] = cells[:, index, index]
+    if np.any(np.abs(cells - diag) > 1e-8):
+        raise ValueError(
+            "the `ellipsoid` k-grid requires orthogonal cells; use "
+            "`pme` or `ragged` for a tilted cell"
+        )
+    _warn_truncated_grid(cells, nk, k_max, "ellipsoid", "nk")
+    axes = [np.arange(-int(n), int(n) + 1, dtype=np.float64) for n in nk]
+    g0, g1, g2 = np.meshgrid(*axes, indexing="ij")
+    ell = (g0 / nk[0]) ** 2 + (g1 / nk[1]) ** 2 + (g2 / nk[2]) ** 2
+    keep = (ell <= 1.0) & ~((g0 == 0.0) & (g1 == 0.0) & (g2 == 0.0))
+    n_grid = np.stack([g0[keep], g1[keep], g2[keep]], axis=-1)
+    rec = 2.0 * math.pi * np.linalg.inv(cells)
+    k = np.einsum("jm,fdm->fjd", n_grid, rec)
+    rows = [
+        k[f][np.sum(k[f] * k[f], axis=-1) <= k_max * k_max] for f in range(k.shape[0])
+    ]
+    vec, mask = _k_blocks(rows)
+    return _k_grid(box, vec, mask, _frame_slots(n_node), coord)
+
+
+def build_metric_ellipsoid_k_grid(
+    box: Array,
+    k_max: float,
+    coord: Array,
+    n_node: Array,
+    bounds: Array | list[int],
+) -> KGrid:
+    r"""Reciprocal points of a periodic batch inside the physical k sphere.
+
+    Every frame enumerates the integer triples inside ``bounds``, maps them
+    by :math:`\mathbf{k} = 2\pi B^{-1}\mathbf{n}` and keeps
+    :math:`0 < |\mathbf{k}| \le k_{max}`.  Unlike ``fixed``, which evaluates
+    the whole integer box and masks the points beyond the cutoff, this keeps
+    only the points inside the (possibly rotated) cutoff surface, so a
+    triclinic cell costs the number of sphere points rather than the box.
+
+    Parameters
+    ----------
+    box
+        Simulation cells with shape ``(nf, 3, 3)`` or ``(nf, 9)``; rows are the
+        lattice vectors.
+    k_max
+        The wave-number cutoff, in Å⁻¹.
+    coord
+        Node positions with shape ``(N, 3)``.
+    n_node
+        Per-frame node counts with shape ``(nf,)``.
+    bounds
+        The per-axis integer bounds of the enumeration.
+
+    Returns
+    -------
+    KGrid
+        The cutoff wave numbers of every frame, one row each.
+    """
+    box = _cells(box)
+    cells = np.asarray(to_numpy_array(box), dtype=np.float64)
+    bounds = np.asarray(to_numpy_array(bounds), dtype=np.int64).reshape(-1)
+    if bounds.shape != (3,) or np.any(bounds < 1):
+        raise ValueError(
+            f"`bounds` must be three positive integers, got {bounds.tolist()}"
+        )
+    _warn_truncated_grid(cells, bounds, k_max, "metric-ellipsoid", "bounds")
+    axes = [np.arange(-int(n), int(n) + 1, dtype=np.float64) for n in bounds]
+    g0, g1, g2 = np.meshgrid(*axes, indexing="ij")
+    n_grid = np.stack([g0.ravel(), g1.ravel(), g2.ravel()], axis=-1)
+    rec = 2.0 * math.pi * np.linalg.inv(cells)
+    k = np.einsum("jm,fdm->fjd", n_grid, rec)
+    rows = []
+    for f in range(k.shape[0]):
+        k_sq = np.sum(k[f] * k[f], axis=-1)
+        rows.append(k[f][(k_sq > 0.0) & (k_sq <= k_max * k_max)])
+    vec, mask = _k_blocks(rows)
     return _k_grid(box, vec, mask, _frame_slots(n_node), coord)
 
 

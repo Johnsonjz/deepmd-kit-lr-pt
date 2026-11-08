@@ -87,7 +87,8 @@ TORCH_LIBRARY_FRAGMENT(deepmd, library) {
       "latent_charge_sum(Tensor coord, Tensor charge, Tensor node_mask, "
       "Tensor n_node_per_frame, Tensor total_charge, Tensor? box, "
       "Tensor coefficient, Tensor communicator, int kernel, int channel, "
-      "float prefactor, int order, float spacing) -> "
+      "float prefactor, int order, float spacing, "
+      "int mesh_backend=0) -> "
       "(Tensor atom_energy, Tensor charge_gradient, Tensor force, "
       "Tensor atom_virial, Tensor virial)");
 }

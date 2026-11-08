@@ -949,6 +949,13 @@ def _freeze_sezm_to_pt2(
         )
 
     model = get_model(params)
+    if getattr(model.atomic_model, "long_range", None) is not None:
+        raise NotImplementedError(
+            "the pt `.pt2` freeze path does not carry the long-range "
+            "topologies; freeze a long-range model with "
+            "`dp --pt-expt freeze` (and convert a pt checkpoint with "
+            "`dp convert-backend` first)."
+        )
     is_spin = _model_has_spin(model)
     ModelWrapper(model).load_state_dict(state_dict)
     if model.get_active_mode() == "dens":

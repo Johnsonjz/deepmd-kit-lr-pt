@@ -138,6 +138,22 @@ class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")
         """
         raise NotImplementedError
 
+    def kspace_virial(self, k_sq: Array) -> Array:
+        r"""The coefficient :math:`K_v(k^2) = -2 \partial \hat K / \partial k^2`,
+        which forms the analytic k-space virial.
+
+        Parameters
+        ----------
+        k_sq
+            Squared wave numbers with shape ``(nk,)`` or ``(rows, nk)``.
+
+        Returns
+        -------
+        Array
+            The coefficient with the shape of ``k_sq``, in Å⁵.
+        """
+        raise NotImplementedError
+
     def kspace_cutoff(self, tolerance: float = 1e-8) -> float:
         """Wave number at which the kernel weight falls below ``tolerance``.
 
@@ -285,6 +301,12 @@ class LESKernel(BaseInteractionKernel):
         alpha = self._row_values(xp.exp(self._parameter("log_alpha", k_sq)), k_sq)
         return 4.0 * np.pi * xp.exp(-k_sq / (4.0 * alpha * alpha)) / k_sq
 
+    def kspace_virial(self, k_sq: Array) -> Array:
+        xp = array_api_compat.array_namespace(k_sq)
+        alpha = self._row_values(xp.exp(self._parameter("log_alpha", k_sq)), k_sq)
+        transform = 4.0 * np.pi * xp.exp(-k_sq / (4.0 * alpha * alpha)) / k_sq
+        return transform * (1.0 / (2.0 * alpha * alpha) + 2.0 / k_sq)
+
     def contact_value(self, like: Array) -> Array:
         xp = array_api_compat.array_namespace(like)
         alpha = xp.exp(self._parameter("log_alpha", like))
@@ -397,6 +419,17 @@ class SOGKernel(BaseInteractionKernel):
         terms = []
         for m in range(width.shape[0]):
             weight = self._row_values(amplitude[m] * width[m] ** 3, k_sq)
+            rate = self._row_values(0.5 * width[m] ** 2, k_sq)
+            terms.append((2.0 * np.pi) ** 1.5 * weight * xp.exp(-rate * k_sq))
+        return sum(terms[1:], terms[0])
+
+    def kspace_virial(self, k_sq: Array) -> Array:
+        xp = array_api_compat.array_namespace(k_sq)
+        amplitude = self._parameter("amplitude", k_sq)
+        width = xp.exp(self._parameter("log_width", k_sq))
+        terms = []
+        for m in range(width.shape[0]):
+            weight = self._row_values(amplitude[m] * width[m] ** 5, k_sq)
             rate = self._row_values(0.5 * width[m] ** 2, k_sq)
             terms.append((2.0 * np.pi) ** 1.5 * weight * xp.exp(-rate * k_sq))
         return sum(terms[1:], terms[0])

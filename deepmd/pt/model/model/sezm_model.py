@@ -449,6 +449,7 @@ from __future__ import (
 )
 
 import logging
+import math
 import os
 import time
 from contextlib import (
@@ -622,10 +623,23 @@ def _sezm_structure_key(model: SeZMModel) -> tuple[Any, ...]:
         bool(fitting.needs_vacuum_descriptor()),
     )
     atomic_state = (_int_tuple(atomic_model.atom_exclude_types),)
+    _lr = getattr(atomic_model, "long_range", None)
+    lr_state = (
+        None
+        if _lr is None
+        else (
+            str(_lr.k_grid_mode),
+            bool(_lr.periodic),
+            tuple(int(v) for v in _lr.k_grid_bounds)
+            if getattr(_lr, "k_grid_bounds", None) is not None
+            else (),
+        )
+    )
     model_state = (
         str(model.bridging_method),
         model.inter_potential is not None,
         tuple(model.get_type_map()),
+        lr_state,
     )
     return (
         descriptor_key
@@ -1013,6 +1027,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 edge_schema.edge_vec,
                 edge_schema.edge_scatter_index,
                 edge_schema.edge_mask,
+                box=bb,
                 fparam=fp,
                 aparam=ap,
                 charge_spin=charge_spin,
@@ -1040,6 +1055,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         use_compile: bool | None = None,
         embedding_only: bool = False,
         atomic_output_only: bool = False,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Run the conservative SeZM lower interface on explicit edge vectors.
@@ -1078,10 +1094,25 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         if spin is not None:
             spin = spin.to(device=coord.device, dtype=coord.dtype)
         nf = atype.shape[0]
+        self._check_long_range_cell(box)
         should_compile = (
             self.should_use_compile() if use_compile is None else use_compile
         )
         if atomic_output_only:
+            should_compile = False
+        if self._has_long_range_correction() and not self._lr_compile_eligible():
+            # The pme mesh and non-periodic pair topologies are data-dependent;
+            # the static k-grid modes compile through the torch topology.
+            if should_compile and not getattr(
+                self, "_lr_compile_fallback_warned", False
+            ):
+                log.warning(
+                    "`use_compile` is ignored for the long-range module in "
+                    "k_grid_mode=%r: it runs eagerly. Use 'fixed', 'ellipsoid' "
+                    "or 'metric-ellipsoid' to compile the long-range term.",
+                    str(self.atomic_model.long_range.k_grid_mode),
+                )
+                self._lr_compile_fallback_warned = True
             should_compile = False
         if comm_dict is not None:
             if extended_atype is None:
@@ -1098,6 +1129,11 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         )
         with self.tf32_precision_ctx():
             if should_compile:
+                compile_box = (
+                    box
+                    if box is not None
+                    else torch.zeros((nf, 3, 3), dtype=coord.dtype, device=coord.device)
+                )
                 fp, ap = self.convert_fp_ap(
                     fp,
                     ap,
@@ -1120,6 +1156,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                             fp,
                             ap,
                             charge_spin,
+                            box=compile_box,
                             embedding_only=True,
                         )
                     cache_key = None
@@ -1138,6 +1175,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                             fp,
                             ap,
                             charge_spin,
+                            box=compile_box,
                             spin=spin,
                         )
                     compiled_core_compute = self.compiled_core_compute_cache[cache_key]
@@ -1157,6 +1195,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                             fp,
                             ap,
                             charge_spin,
+                            compile_box,
                             spin,
                             *task_buf_vals,
                         )
@@ -1171,6 +1210,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                             fp,
                             ap,
                             charge_spin,
+                            compile_box,
                             *task_buf_vals,
                         )
                 if (
@@ -1196,6 +1236,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         edge_vec,
                         edge_scatter_index,
                         edge_mask,
+                        box=box,
                         fparam=fp,
                         aparam=ap,
                         charge_spin=charge_spin,
@@ -1333,6 +1374,344 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             model_predict = self._output_type_cast(model_predict, input_prec)
             return model_predict
 
+    # =========================================================================
+    # Long-range hooks (pt backend, upstream ``long_range`` module)
+    # =========================================================================
+    def _has_long_range_correction(self) -> bool:
+        """Whether the atomic model carries a latent-charge long-range module."""
+        return getattr(self.atomic_model, "long_range", None) is not None
+
+    @staticmethod
+    def _releaf_long_range_topologies(topologies: dict[str, Any]) -> dict[str, Any]:
+        """Make the geometry fields of every topology autograd leaves."""
+        import dataclasses
+
+        return {
+            name: dataclasses.replace(
+                topology,
+                **{
+                    leaf: getattr(topology, leaf).detach().requires_grad_(True)
+                    for leaf in topology.LEAVES
+                },
+            )
+            for name, topology in topologies.items()
+        }
+
+    def _lr_compile_eligible(self) -> bool:
+        """Whether the long-range host can run inside ``torch.compile``."""
+        lr = getattr(self.atomic_model, "long_range", None)
+        return (
+            lr is not None
+            and bool(lr.periodic)
+            and str(lr.k_grid_mode) in ("fixed", "ellipsoid", "metric-ellipsoid")
+            and lr.k_grid_bounds is not None
+        )
+
+    @staticmethod
+    def _long_range_integer_grid(lr: Any) -> torch.Tensor:
+        """The static integer k points of the compile-friendly modes."""
+        import itertools
+
+        nk = [int(v) for v in lr.k_grid_bounds]
+        mode = str(lr.k_grid_mode)
+        points = []
+        for n0, n1, n2 in itertools.product(
+            range(-nk[0], nk[0] + 1),
+            range(-nk[1], nk[1] + 1),
+            range(-nk[2], nk[2] + 1),
+        ):
+            if n0 == 0 and n1 == 0 and n2 == 0:
+                continue
+            if mode == "ellipsoid":
+                if (n0 / nk[0]) ** 2 + (n1 / nk[1]) ** 2 + (n2 / nk[2]) ** 2 > 1.0:
+                    continue
+            points.append((n0, n1, n2))
+        return torch.tensor(points, dtype=torch.float64, device="cpu")
+
+    def _warn_static_grid_truncation(self, lr: Any, cell: torch.Tensor) -> None:
+        """Warn once when a frame outgrows the static integer k grid."""
+        if getattr(self, "_lr_grid_truncation_warned", False):
+            return
+        nk = torch.as_tensor(lr.k_grid_bounds, dtype=cell.dtype, device=cell.device)
+        k_max = float(lr._k_max())
+        length = torch.linalg.norm(cell, dim=-1)
+        required = torch.ceil(k_max * length / (2.0 * math.pi))
+        over = (required > nk).any(dim=-1)
+        if bool(over.any().item()):
+            f = int(torch.argmax(over.to(torch.int8)).item())
+            log.warning(
+                "frame %d needs integer k-grid bounds %s, beyond the %s grid "
+                "%s: its k-space sum is truncated; enlarge `k_grid_bounds` "
+                "for the full sum",
+                f,
+                [int(v) for v in required[f].tolist()],
+                str(lr.k_grid_mode),
+                [int(v) for v in nk.tolist()],
+            )
+            self._lr_grid_truncation_warned = True
+
+    def _check_long_range_cell(self, box: torch.Tensor | None) -> None:
+        """Validate the cell of a periodic long-range module.
+
+        A tilted cell is rejected for the axis-aligned packed ellipsoid, and a
+        static integer grid that cannot hold a frame's wave numbers warns
+        instead of silently truncating the k-space sum.
+        """
+        lr = getattr(self.atomic_model, "long_range", None)
+        if lr is None or box is None:
+            return
+        mode = str(lr.k_grid_mode)
+        cell = box.reshape(-1, 3, 3)
+        if mode == "ellipsoid":
+            diag = torch.diag_embed(torch.diagonal(cell, dim1=1, dim2=2))
+            if bool(torch.any((cell - diag).abs() > 1e-8).item()):
+                raise ValueError(
+                    "the `ellipsoid` k-grid requires orthogonal cells; use "
+                    "`pme`, `ragged` or `metric-ellipsoid` for a tilted cell"
+                )
+        if mode in ("fixed", "ellipsoid", "metric-ellipsoid") and (
+            getattr(lr, "k_grid_bounds", None) is not None
+        ):
+            self._warn_static_grid_truncation(lr, cell)
+
+    def _build_long_range_topologies_pt(
+        self,
+        lr: Any,
+        coord_flat: torch.Tensor,
+        n_node: torch.Tensor,
+        box: torch.Tensor | None,
+        nf: int,
+        nloc: int,
+    ) -> dict[str, Any] | None:
+        """Build the periodic topology with torch ops only (compile path)."""
+        if box is None or not self._lr_compile_eligible():
+            return None
+        from deepmd.dpmodel.utils.neighbor_graph import (
+            ALL_PAIRS,
+            K_GRID,
+            KGrid,
+        )
+        from deepmd.dpmodel.utils.neighbor_graph.pair_graph import (
+            empty_pair_graph,
+        )
+
+        cell = box.reshape(nf, 3, 3)
+        n_grid = self._long_range_integer_grid(lr).to(
+            device=cell.device, dtype=cell.dtype
+        )
+        rec = 2.0 * math.pi * torch.linalg.inv(cell)
+        k_vec = torch.matmul(n_grid.unsqueeze(0), rec.transpose(1, 2))
+        k_sq = torch.sum(k_vec * k_vec, dim=-1)
+        # ``lr._k_max()`` reads the parameters through numpy, which a traced
+        # graph cannot do.  The SOG/LES cutoff is a tensor expression here and
+        # broadcasts into the mask.
+        kernel = lr.kernel
+        if hasattr(kernel, "log_width"):
+            sigma_min = torch.exp(kernel.log_width).min()
+            k_max = math.sqrt(2.0 * math.log(1.0 / lr.kspace_tolerance)) / sigma_min
+        else:
+            alpha = torch.exp(kernel.log_alpha)
+            k_max = 2.0 * alpha * math.sqrt(math.log(1.0 / lr.kspace_tolerance))
+        mask = (k_sq > 0.0) & (k_sq <= k_max * k_max)
+        volume = torch.linalg.det(cell).abs()
+        slot = torch.arange(nloc, dtype=torch.long, device=coord_flat.device).expand(
+            nf, nloc
+        )
+        kgrid = KGrid(
+            vec=k_vec.unsqueeze(1),
+            mask=mask.unsqueeze(1),
+            slot=slot,
+            volume=volume,
+            coord=coord_flat,
+            strain=torch.zeros_like(cell),
+        )
+        return {ALL_PAIRS: empty_pair_graph(coord_flat), K_GRID: kgrid}
+
+    def _apply_long_range_correction(
+        self,
+        fit_ret: dict[str, torch.Tensor],
+        descriptor: torch.Tensor,
+        atype: torch.Tensor,
+        coord: torch.Tensor,
+        atom_mask: torch.Tensor,
+        nloc: int,
+        box: torch.Tensor | None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any] | None]:
+        """Inject the latent-charge reciprocal energy into ``fit_ret["energy"]``.
+
+        The energy is added before ``edge_energy_deriv`` runs, so the same
+        backward that produces the short-range force also produces the charge
+        response ``-Σ_i φ_i ∂q_i/∂r``.  The direct force and the cell virial,
+        which do not flow through ``edge_vec``, are added afterwards by
+        :meth:`_apply_long_range_derivatives` from the topology leaves.
+        """
+        lr = getattr(self.atomic_model, "long_range", None)
+        if lr is None:
+            return fit_ret, None
+        if comm_dict is not None:
+            raise NotImplementedError(
+                "the pt long-range host evaluates single-domain frames; use "
+                "the pt_expt `.pt2` path for multi-rank inference"
+            )
+        from deepmd.dpmodel.utils.neighbor_graph import build_topologies
+
+        nf = coord.shape[0]
+        dtype = fit_ret["energy"].dtype
+        device = coord.device
+        n_node = torch.full((nf,), nloc, dtype=torch.long, device=device)
+        node_mask = atom_mask.reshape(-1).to(torch.bool)
+        atype_flat = atype.reshape(-1).to(torch.long)
+        coord_lr = coord[:, :nloc].to(dtype=dtype)
+        box_lr = None if box is None else box.to(dtype=dtype)
+        names = lr.required_topologies()
+        has_reciprocal = any(name in ("k_grid", "pme_mesh") for name in names)
+        pair_excl = None
+        if getattr(self.atomic_model, "pair_exclude_types", None):
+            if has_reciprocal:
+                raise NotImplementedError(
+                    "`pair_exclude_types` is not supported with a periodic "
+                    "long-range module, whose reciprocal-space sum is global"
+                )
+            # The dpmodel mask carries the graph-native
+            # ``build_edge_exclude_mask`` contract; the pt wrapper does not.
+            from deepmd.dpmodel.utils.exclude_mask import (
+                PairExcludeMask as PairExcludeMaskDP,
+            )
+
+            pair_excl = PairExcludeMaskDP(
+                self.atomic_model.get_ntypes(),
+                self.atomic_model.pair_exclude_types,
+            )
+        topologies = self._build_long_range_topologies_pt(
+            lr, coord_lr.reshape(-1, 3), n_node, box_lr, nf, nloc
+        )
+        if topologies is None:
+            topologies = build_topologies(
+                names,
+                coord_lr.reshape(-1, 3),
+                n_node,
+                box_lr,
+                node_mask=node_mask,
+                atype=atype_flat,
+                pair_excl=pair_excl,
+                topology_params=lr.topology_params(),
+            )
+        topologies = self._releaf_long_range_topologies(topologies)
+        e_lr_atom, f_direct, box_a = lr.call_graph(
+            descriptor.reshape(-1, descriptor.shape[-1]),
+            atype_flat,
+            node_mask,
+            n_node,
+            topologies,
+            fparam=fparam,
+            aparam=(
+                None
+                if aparam is None or int(aparam.shape[-1]) == 0
+                else aparam.reshape(-1, aparam.shape[-1])
+            ),
+            charge_spin=charge_spin,
+            want_derivatives=True,
+        )
+        e_lr_atom = e_lr_atom.reshape(nf, nloc, 1).to(dtype)
+        mask = atom_mask[:, :, None].to(dtype)
+        fit_ret["energy"] = fit_ret["energy"] + e_lr_atom * mask
+        return fit_ret, {
+            "e_lr": e_lr_atom.sum(),
+            "force_direct": (
+                None if f_direct is None else f_direct.reshape(nf, nloc, 3)
+            ),
+            "box_A": None if box_a is None else box_a.reshape(nf, 3, 3),
+            "topologies": topologies,
+            "coord": coord_lr,
+            "n_node": n_node,
+            "nloc": nloc,
+            "atom_mask": atom_mask,
+            "need_grad": self.do_grad_r("energy") or self.do_grad_c("energy"),
+            "need_virial": self.do_grad_c("energy"),
+        }
+
+    def _apply_long_range_derivatives(
+        self,
+        model_ret: dict[str, torch.Tensor],
+        lr_ctx: dict[str, Any] | None,
+    ) -> dict[str, torch.Tensor]:
+        """Add the direct force and cell virial from the topology leaves."""
+        if lr_ctx is None or not lr_ctx["need_grad"]:
+            return model_ret
+        topologies = lr_ctx["topologies"]
+        nf = lr_ctx["coord"].shape[0]
+        nloc = lr_ctx["nloc"]
+        dtype = model_ret["energy_derv_r"].dtype
+        device = model_ret["energy_derv_r"].device
+        if lr_ctx["force_direct"] is not None and lr_ctx["box_A"] is not None:
+            # Closed-form k-space direct force and box term: no second
+            # autograd traversal.
+            f_flat = lr_ctx["force_direct"].reshape(nf * nloc, 3)
+            virial_global = -lr_ctx["box_A"].reshape(nf, 3, 3)
+        else:
+            leaves: list[torch.Tensor] = []
+            spec: list[tuple[str, str]] = []
+            for name, topology in topologies.items():
+                for leaf in topology.LEAVES:
+                    leaves.append(getattr(topology, leaf))
+                    spec.append((name, leaf))
+            grads = torch.autograd.grad(
+                [lr_ctx["e_lr"]],
+                leaves,
+                create_graph=self.training,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            f_flat = torch.zeros((nf * nloc, 3), dtype=dtype, device=device)
+            virial_global = torch.zeros((nf, 3, 3), dtype=dtype, device=device)
+            for (name, leaf), grad in zip(spec, grads):
+                if grad is None:
+                    continue
+                topology = topologies[name]
+                if leaf == "vec":
+                    # Pair topology: vec = r_src - r_dst.
+                    src = topology.index[0].to(device)
+                    dst = topology.index[1].to(device)
+                    g = grad * topology.mask.to(dtype)[:, None]
+                    f_flat = f_flat.index_add(0, src, -g)
+                    f_flat = f_flat.index_add(0, dst, g)
+                elif leaf == "coord":
+                    f_flat = f_flat - grad.reshape(nf * nloc, 3)
+                elif leaf == "strain":
+                    virial_global = virial_global - grad.reshape(nf, 3, 3)
+        atom_mask = lr_ctx["atom_mask"].to(dtype)
+        f_direct = f_flat.reshape(nf, nloc, 3) * atom_mask[:, :, None]
+
+        derv_r = model_ret["energy_derv_r"]
+        corr_r = torch.zeros_like(derv_r)
+        corr_r[:, :nloc] = f_direct.unsqueeze(-2)
+        model_ret["energy_derv_r"] = derv_r + corr_r
+
+        if not lr_ctx["need_virial"]:
+            return model_ret
+
+        coord = lr_ctx["coord"]
+        pos_vir = torch.einsum("fai,faj->faij", f_direct, coord).reshape(nf, nloc, 1, 9)
+        nreal = atom_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        corr_c = torch.zeros_like(model_ret["energy_derv_c"])
+        corr_c[:, :nloc] = pos_vir
+        if any(name in ("k_grid", "pme_mesh") for name in topologies):
+            pos_sum = pos_vir.reshape(nf, nloc, 9).sum(dim=1).reshape(nf, 1, 9)
+            cell_vir = virial_global.reshape(nf, 1, 9)
+            corr_c[:, :nloc] = corr_c[:, :nloc] + (
+                (cell_vir - pos_sum) / nreal[:, :, None]
+            ).unsqueeze(1)
+        derv_c = model_ret["energy_derv_c"] + corr_c
+        model_ret["energy_derv_c"] = derv_c
+        model_ret["energy_derv_c_redu"] = torch.sum(
+            derv_c.to(model_ret["energy_derv_c_redu"].dtype), dim=1
+        )
+        return model_ret
+
     def core_compute(
         self,
         coord: torch.Tensor,
@@ -1350,6 +1729,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         embedding_only: bool = False,
         conservative: bool = True,
         atomic_output_only: bool = False,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute SeZM lower outputs from the unified edge-vector schema.
@@ -1373,6 +1753,9 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Force/virial scatter indices in flattened ``coord`` space.
         edge_mask
             Boolean validity mask aligned with ``edge_vec``.
+        box
+            Simulation cell with shape (nf, 3, 3) or (nf, 9), or ``None`` for
+            a non-periodic system.  Read by the long-range module only.
         fparam
             Frame parameters with shape (nf, ndf), or ``None``.
         aparam
@@ -1417,6 +1800,12 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         """
         nf, nloc = atype.shape[:2]
         nscatter = coord.shape[1]
+        if box is None and comm_dict is not None:
+            box = comm_dict.get("box")
+        if box is not None:
+            box = box.to(device=coord.device, dtype=coord.dtype)
+            if box.ndim == 2:
+                box = box.reshape(nf, 3, 3)
         descriptor_model = self.atomic_model.descriptor
 
         # === Step 1. Establish the force-autograd endpoint ===
@@ -1553,6 +1942,24 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 n_node=nf * nloc,
             ).view(nf, nloc, 1)
 
+        # === Step 4.5. Optional long-range correction (no-op without a module) ===
+        # Runs before ``edge_energy_deriv`` so the reciprocal energy is part of
+        # the energy the edge backward differentiates; the charge response
+        # therefore rides the same backward as the short-range force.
+        fit_ret, lr_ctx = self._apply_long_range_correction(
+            fit_ret,
+            descriptor,
+            atype,
+            coord,
+            atom_mask,
+            nloc,
+            box,
+            fparam=fparam,
+            aparam=aparam,
+            charge_spin=charge_spin,
+            comm_dict=comm_dict,
+        )
+
         # === Step 5. Apply atom mask to the complete physical output ===
         for key in fit_ret:
             out_shape = fit_ret[key].shape
@@ -1611,6 +2018,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         }
         if energy_derv_r_mag is not None:
             model_ret["energy_derv_r_mag"] = energy_derv_r_mag
+        if lr_ctx is not None:
+            model_ret = self._apply_long_range_derivatives(model_ret, lr_ctx)
         return model_ret
 
     def core_compute_dens(
@@ -1736,6 +2145,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         comm_dict: dict[str, torch.Tensor] | None = None,
         charge_spin: torch.Tensor | None = None,
         extended_atype: Int[Tensor, "nf nall"] | None = None,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Lower-level public forward using the compact-edge contract.
@@ -1800,6 +2210,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             comm_dict=comm_dict,
             extended_atype=extended_atype,
             charge_spin=charge_spin,
+            box=box,
         )
         model_predict: dict[str, torch.Tensor] = {}
 
@@ -1846,6 +2257,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         fp: torch.Tensor,
         ap: torch.Tensor,
         charge_spin: torch.Tensor,
+        box: torch.Tensor | None = None,
         spin: torch.Tensor | None = None,
         embedding_only: bool = False,
     ) -> None:
@@ -1980,6 +2392,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 fp: torch.Tensor,
                 ap: torch.Tensor,
                 charge_spin: torch.Tensor,
+                box: torch.Tensor,
                 spin: torch.Tensor,
                 *task_buf_vals: torch.Tensor,
             ) -> dict[str, torch.Tensor]:
@@ -1997,6 +2410,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         edge_vec,
                         edge_scatter_index,
                         edge_mask,
+                        box=box,
                         fparam=fp,
                         aparam=ap,
                         charge_spin=charge_spin,
@@ -2018,6 +2432,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 fp: torch.Tensor,
                 ap: torch.Tensor,
                 charge_spin: torch.Tensor,
+                box: torch.Tensor,
                 *task_buf_vals: torch.Tensor,
             ) -> dict[str, torch.Tensor]:
                 _saved = _patch_task_bufs(task_buf_vals)
@@ -2029,6 +2444,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         edge_vec,
                         edge_scatter_index,
                         edge_mask,
+                        box=box,
                         fparam=fp,
                         aparam=ap,
                         charge_spin=charge_spin,
@@ -2091,6 +2507,11 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         ap_for_trace = trace_pad_dim(ap[:1], 0, trace_nf)
         ap_for_trace = trace_pad_dim(ap_for_trace, 1, trace_nloc)
         charge_spin_for_trace = trace_pad_dim(charge_spin[:1], 0, trace_nf)
+        box_for_trace = (
+            trace_pad_dim(box[:1], 0, trace_nf)
+            if box is not None
+            else torch.zeros((trace_nf, 3, 3), dtype=coord.dtype, device=coord.device)
+        )
 
         trace_args = [
             coord_for_trace,
@@ -2102,6 +2523,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             fp_for_trace,
             ap_for_trace,
             charge_spin_for_trace,
+            box_for_trace,
         ]
         if spin is not None:
             spin_for_trace = trace_pad_dim(spin[:1], 0, trace_nf)

@@ -839,6 +839,12 @@ class DeepEval(DeepEvalBackend):
                 list(inner.get_sel()),
                 return_mode="edges",
             )
+            lower_kwargs = {}
+            if (
+                hasattr(inner, "_has_long_range_correction")
+                and inner._has_long_range_correction()
+            ):
+                lower_kwargs["box"] = box
             predict = inner.forward_common_lower(
                 edge_schema.coord,
                 edge_schema.atype,
@@ -846,6 +852,7 @@ class DeepEval(DeepEvalBackend):
                 edge_schema.edge_vec,
                 edge_schema.edge_scatter_index,
                 edge_schema.edge_mask,
+                **lower_kwargs,
                 fparam=fparam,
                 aparam=aparam,
                 charge_spin=charge_spin,

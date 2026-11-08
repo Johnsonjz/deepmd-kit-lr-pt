@@ -57,6 +57,15 @@ def make_base_descriptor(
         set_davg_zero: bool = False
         set_stddev_constant: bool = False
 
+        def supports_long_range(self) -> bool:
+            """Whether the descriptor can feed a long-range module.
+
+            A long-range module reads the invariant scalar feature of the
+            descriptor. Descriptors that expose it override this to return
+            ``True``; the default keeps the capability closed.
+            """
+            return False
+
         def __new__(cls, *args: Any, **kwargs: Any) -> Any:
             if cls is BD:
                 cls = cls.get_class_by_type(j_get_type(kwargs, cls.__name__))

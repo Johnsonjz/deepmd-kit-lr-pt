@@ -15,6 +15,7 @@
 #include <torch/types.h>
 
 #include <cstdint>
+#include <string>
 #include <tuple>
 
 #include "domain_exchange.h"
@@ -73,6 +74,52 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
                           int owner_count,
                           const torch::Tensor* communicator);
 
+// The mesh sum of the midtown backend: the CubeS2 / QuadS splines and cuFFT of
+// the SOG library, with the same arguments and outputs as ``mesh_sum``.  The
+// first version serves the SOG kernel, one channel, orthogonal cells and a
+// single rank, and raises on every other combination.
+ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
+                             const torch::Tensor& charge,
+                             const torch::Tensor& node_mask,
+                             const torch::Tensor& n_node_per_frame,
+                             const torch::Tensor& total_charge,
+                             const torch::Tensor& box,
+                             const torch::Tensor& coefficient,
+                             int64_t kernel,
+                             int64_t channel,
+                             double prefactor,
+                             int64_t order,
+                             double spacing,
+                             int owner_begin,
+                             int owner_count,
+                             const torch::Tensor* communicator);
+
+// The distributed midtown solve: every rank spreads its own atoms into the
+// full mesh, the meshes are summed over the ranks, and each rank gathers its
+// own atoms.  Takes one frame and an orthogonal cell.
+// The z-slab distributed solve (NCCL between the transform stages).
+ChargeSumOutputs midtown_sum_slab(
+    const torch::Tensor& coord, const torch::Tensor& charge,
+    const torch::Tensor& node_mask, const torch::Tensor& n_node_per_frame,
+    const torch::Tensor& total_charge, const torch::Tensor& box,
+    const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
+    double prefactor, int64_t order, double spacing,
+    const torch::Tensor* communicator);
+
+ChargeSumOutputs midtown_sum_local(const torch::Tensor& coord,
+                                   const torch::Tensor& charge,
+                                   const torch::Tensor& node_mask,
+                                   const torch::Tensor& n_node_per_frame,
+                                   const torch::Tensor& total_charge,
+                                   const torch::Tensor& box,
+                                   const torch::Tensor& coefficient,
+                                   int64_t kernel,
+                                   int64_t channel,
+                                   double prefactor,
+                                   int64_t order,
+                                   double spacing,
+                                   const torch::Tensor* communicator);
+
 // deepmd::latent_charge_sum (schema and formulas in ops.cc): validates the
 // inputs and evaluates the frames by the direct or the mesh sum, across the
 // domains of ``communicator`` when it holds several ranks.
@@ -88,7 +135,8 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                                    int64_t channel,
                                    double prefactor,
                                    int64_t order,
-                                   double spacing);
+                                   double spacing,
+                                   int64_t mesh_backend);
 
 }  // namespace long_range
 }  // namespace deepmd

@@ -77,6 +77,34 @@ int domain_count(const torch::Tensor& communicator) {
 #endif
 }
 
+int domain_rank(const torch::Tensor& communicator) {
+  if (address_of(communicator) == 0) {
+    return 0;
+  }
+#ifdef USE_MPI
+  int rank = 0;
+  MPI_Comm_rank(communicator_of(communicator), &rank);
+  return rank;
+#else
+  TORCH_CHECK(false,
+              "domain_rank: an evaluation across MPI ranks requires "
+              "DeePMD-kit built with MPI");
+#endif
+}
+
+void broadcast_bytes(const torch::Tensor& communicator, void* data, int count) {
+#ifdef USE_MPI
+  if (address_of(communicator) == 0) {
+    return;
+  }
+  MPI_Bcast(data, count, MPI_BYTE, 0, communicator_of(communicator));
+#else
+  TORCH_CHECK(false,
+              "broadcast_bytes: an evaluation across MPI ranks requires "
+              "DeePMD-kit built with MPI");
+#endif
+}
+
 std::pair<torch::Tensor, std::int64_t> gather_domain_rows(
     const torch::Tensor& communicator, const torch::Tensor& rows) {
 #ifdef USE_MPI
@@ -158,6 +186,34 @@ torch::Tensor sum_over_domains(const torch::Tensor& communicator,
   TORCH_CHECK(false,
               "sum_over_domains: an evaluation across MPI ranks requires "
               "DeePMD-kit built with MPI");
+#endif
+}
+
+torch::Tensor sum_over_domains_f32(const torch::Tensor& communicator,
+                                   const torch::Tensor& values) {
+#ifdef USE_MPI
+  TORCH_CHECK(values.dim() == 1 && values.scalar_type() == torch::kFloat32,
+              "sum_over_domains_f32: values must be a float32 vector");
+  const MPI_Comm comm = communicator_of(communicator);
+  const int count = static_cast<int>(values.numel());
+  if (values.is_cuda() && reads_device_memory()) {
+    auto total = torch::empty_like(values.contiguous());
+    at::cuda::getCurrentCUDAStream().synchronize();
+    MPI_Allreduce(values.contiguous().data_ptr<float>(),
+                  total.data_ptr<float>(), count, MPI_FLOAT, MPI_SUM, comm);
+    return total;
+  }
+  const auto host_options =
+      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
+  const auto local = values.to(torch::kCPU).contiguous();
+  auto total = torch::empty({values.numel()}, host_options);
+  MPI_Allreduce(local.data_ptr<float>(), total.data_ptr<float>(), count,
+                MPI_FLOAT, MPI_SUM, comm);
+  return total.to(values.device(), /*non_blocking=*/true);
+#else
+  TORCH_CHECK(false,
+              "sum_over_domains_f32: an evaluation across MPI ranks "
+              "requires DeePMD-kit built with MPI");
 #endif
 }
 

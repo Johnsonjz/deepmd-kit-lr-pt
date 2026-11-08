@@ -55,6 +55,7 @@ class DPAtomicModel(BaseAtomicModel):
         descriptor: BaseDescriptor,
         fitting: BaseFitting,
         type_map: list[str],
+        long_range: Any | None = None,
         **kwargs: Any,
     ) -> None:
         if fitting.vacuum_ref and not self._supports_vacuum_ref:
@@ -70,6 +71,7 @@ class DPAtomicModel(BaseAtomicModel):
         self.rcut = self.descriptor.get_rcut()
         self.sel = self.descriptor.get_sel()
         self.fitting_net = fitting
+        self.long_range = long_range
         if hasattr(self.fitting_net, "reinit_exclude"):
             self.fitting_net.reinit_exclude(self.atom_exclude_types)
         super().init_out_stat()
@@ -101,6 +103,10 @@ class DPAtomicModel(BaseAtomicModel):
         typically concatenated with the output of the descriptor and fed into the fitting net.
         """
         self.fitting_net.set_case_embd(case_idx)
+        if getattr(self, "long_range", None) is not None:
+            # The charge network of the long-range module carries a case
+            # embedding of its own.
+            self.long_range.set_case_embd(case_idx)
 
     def mixed_types(self) -> bool:
         """If true, the model
@@ -134,6 +140,9 @@ class DPAtomicModel(BaseAtomicModel):
             else None,
         )
         self.fitting_net.change_type_map(type_map=type_map)
+        if getattr(self, "long_range", None) is not None:
+            # The per-type charge bias lives in the long-range module.
+            self.long_range.change_type_map(type_map=type_map)
         # Reinitialize fitting to get correct sel_type
         if hasattr(self.fitting_net, "reinit_exclude"):
             self.fitting_net.reinit_exclude(self.atom_exclude_types)
@@ -158,6 +167,8 @@ class DPAtomicModel(BaseAtomicModel):
                 "fitting": self.fitting_net.serialize(),
             }
         )
+        if getattr(self, "long_range", None) is not None:
+            dd["long_range"] = self.long_range.serialize()
         return dd
 
     @classmethod
@@ -170,6 +181,13 @@ class DPAtomicModel(BaseAtomicModel):
         fitting_obj = BaseFitting.deserialize(data.pop("fitting"))
         data["descriptor"] = descriptor_obj
         data["fitting"] = fitting_obj
+        long_range_data = data.pop("long_range", None)
+        if long_range_data is not None:
+            from deepmd.pt.long_range.base_long_range import (
+                BaseLongRange,
+            )
+
+            data["long_range"] = BaseLongRange.deserialize(long_range_data)
         obj = super().deserialize(data)
         return obj
 
@@ -436,6 +454,14 @@ class DPAtomicModel(BaseAtomicModel):
             protection=self.data_stat_protect,
             stat_file_path=stat_file_path,
         )
+        if getattr(self, "long_range", None) is not None:
+            # The charge network takes the fitting inputs; a fixed integer
+            # k grid is additionally sized by the largest sampled cell.
+            self.long_range.compute_input_stats(
+                sample_merged,
+                protection=self.data_stat_protect,
+                stat_file_path=stat_file_path,
+            )
 
     def get_dim_fparam(self) -> int:
         """Get the number (dimension) of frame parameters of this atomic model."""

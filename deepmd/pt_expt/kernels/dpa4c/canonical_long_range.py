@@ -186,13 +186,22 @@ def dpa4c_canonical_compress_long_range_energy_force(
         kernel,
         channel,
         COULOMB_CONSTANT,
-        long_range.pme_order,
+        # The midtown mesh carries the CubeS2 spline: the 88-node stencil of
+        # order 6, or the 32-node stencil of order 4 when the configuration
+        # asks for it.  Never the B-spline default of 8.
+        (4 if long_range.pme_order == 4 else 6)
+        if long_range.mesh_backend == "midtown"
+        else long_range.pme_order,
         long_range.mesh_spacing() if long_range.periodic else 1.0,
         # No table is passed as None rather than as an empty list: the
         # AOTInductor proxy executor of torch 2.13 and earlier hands a
         # serialized empty int list to the operator as None.
         list(fitting_routes) if fitting_routes else None,
         list(charge_fitting_routes) if charge_fitting_routes else None,
+        # 0 is the B-spline mesh, 1 the midtown mesh; the default is left
+        # explicit here because the operator's own default keeps older graphs
+        # valid.
+        {"bspline": 0, "midtown": 1}[long_range.mesh_backend],
     )
 
 

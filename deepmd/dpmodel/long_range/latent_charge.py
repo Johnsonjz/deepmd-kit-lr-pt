@@ -12,6 +12,7 @@ import numpy as np
 
 from deepmd.dpmodel.array_api import (
     Array,
+    xp_add_at,
 )
 from deepmd.dpmodel.common import (
     GLOBAL_NP_FLOAT_PRECISION,
@@ -56,6 +57,51 @@ CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
 
 CHARGE_NET_NEURON = [64, 64]
 """Default hidden widths of the charge network."""
+
+RCUT_TO_SIGMA = 1.9892536839080267
+"""The SOG library's receptive field to width ratio, ``sigma = r_c / this``."""
+
+SOG_DEFAULT_B = 2.0
+"""The SOG library's default width ratio."""
+
+SOG_DEFAULT_M = 12
+"""The SOG library's default number of Gaussian bands."""
+
+
+def sog_default_ladder(
+    descriptor: Any,
+    n_gaussian: int = SOG_DEFAULT_M,
+    b: float = SOG_DEFAULT_B,
+) -> tuple[list[float], list[float]]:
+    r"""Default SOG widths and amplitudes from the descriptor's receptive field.
+
+    The SOG library rule is :math:`\sigma = r_c / 1.9892536839080267` with
+    :math:`r_c = n_{layers} \, r_{cut}`.  The geometric initial embedding
+    already reaches ``rcut`` before the first message-passing block, so a
+    descriptor with ``B`` blocks sees ``(B + 1) * rcut``; a message-passing-free
+    descriptor such as DPA4C sees one hop.
+
+    Parameters
+    ----------
+    descriptor
+        The descriptor that owns the receptive field.
+    n_gaussian
+        Number of Gaussian bands.
+    b
+        Ratio between successive widths.
+
+    Returns
+    -------
+    tuple[list[float], list[float]]
+        ``width`` and ``amplitude`` in the units of the upstream kernel,
+        :math:`a_k = \sqrt{2/\pi}\ln b / \sigma_k`.
+    """
+    n_layers = int(getattr(descriptor, "n_blocks", 0) or 0) + 1
+    sigma = n_layers * float(descriptor.get_rcut()) / RCUT_TO_SIGMA
+    widths = sigma * np.power(b, np.arange(n_gaussian, dtype=np.float64))
+    amplitudes = np.sqrt(2.0 / np.pi) * np.log(b) / widths
+    return widths.tolist(), amplitudes.tolist()
+
 
 PME_ORDER = 8
 """Default order of the B-splines that spread the charges to the mesh."""
@@ -177,6 +223,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         decouple_k_grid: bool = False,
         pme_spacing: float | None = None,
         pme_order: int | None = None,
+        mesh_backend: str = "bspline",
     ) -> None:
         if charge_net.vacuum_ref:
             raise ValueError(
@@ -203,17 +250,38 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         if k_grid_mode is None:
             k_grid_mode = "pme" if self.periodic else "ragged"
         self.k_grid_mode = str(k_grid_mode)
-        if self.k_grid_mode not in ("ragged", "fixed", "pme"):
+        if self.k_grid_mode not in (
+            "ragged",
+            "fixed",
+            "pme",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             raise ValueError(
-                f"`k_grid_mode` must be 'ragged', 'fixed' or 'pme', got {self.k_grid_mode!r}"
+                f"`k_grid_mode` must be 'ragged', 'fixed', 'pme', 'ellipsoid' or "
+                f"'metric-ellipsoid', got {self.k_grid_mode!r}"
             )
-        if self.k_grid_mode in ("fixed", "pme") and not self.periodic:
+        if (
+            self.k_grid_mode
+            in (
+                "fixed",
+                "pme",
+                "ellipsoid",
+                "metric-ellipsoid",
+            )
+            and not self.periodic
+        ):
             raise ValueError(
                 f"`k_grid_mode='{self.k_grid_mode}'` requires `periodic=True`"
             )
-        if k_grid_bounds is not None and self.k_grid_mode != "fixed":
+        if k_grid_bounds is not None and self.k_grid_mode not in (
+            "fixed",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             raise ValueError(
-                "`k_grid_bounds` is only meaningful with `k_grid_mode='fixed'`"
+                "`k_grid_bounds` is only meaningful with `k_grid_mode='fixed'`, "
+                "'ellipsoid' or 'metric-ellipsoid'"
             )
         self.decouple_k_grid = bool(decouple_k_grid)
         if self.decouple_k_grid and not self.periodic:
@@ -240,7 +308,11 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                     f"all zero, got {list(k_grid_bounds)}"
                 )
             self.k_grid_bounds = bounds
-        elif self.k_grid_mode == "fixed":
+        elif self.k_grid_mode in (
+            "fixed",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             self.k_grid_bounds = np.zeros(3, dtype=np.int64)
         else:
             self.k_grid_bounds = None
@@ -248,6 +320,12 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         # and every frozen model evaluate the reciprocal sum.
         if not self.periodic and (pme_spacing is not None or pme_order is not None):
             raise ValueError("`pme_spacing` and `pme_order` require `periodic=True`")
+        self.mesh_backend = str(mesh_backend)
+        if self.mesh_backend not in ("bspline", "midtown"):
+            raise ValueError(
+                "`mesh_backend` must be 'bspline' or 'midtown', got "
+                f"{self.mesh_backend!r}"
+            )
         self.pme_order = PME_ORDER if pme_order is None else int(pme_order)
         if self.pme_order < 2:
             raise ValueError(f"`pme_order` must be at least 2, got {self.pme_order}")
@@ -322,12 +400,25 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             "seed": child_seed(fitting_seed, CHARGE_NET_SEED_INDEX),
             **config.get("charge_net", {}),
         }
+        bias_atom_q = charge_net_config.pop("bias_atom_q", None)
         kernel_config = {
             "type": "les",
             "precision": charge_net_config["precision"],
             **config.get("kernel", {}),
         }
-        kernel_cls = BaseInteractionKernel.get_class_by_type(kernel_config.pop("type"))
+        kernel_type = str(kernel_config.pop("type"))
+        if kernel_type == "sog" and not any(
+            key in kernel_config
+            for key in ("width", "amplitude", "base_width", "width_ratio")
+        ):
+            # The SOG library rule: sigma = nlayers * rcut / RCUT_TO_SIGMA.
+            widths, amplitudes = sog_default_ladder(
+                descriptor,
+                n_gaussian=int(kernel_config.get("n_gaussian", SOG_DEFAULT_M)),
+            )
+            kernel_config["width"] = widths
+            kernel_config["amplitude"] = amplitudes
+        kernel_cls = BaseInteractionKernel.get_class_by_type(kernel_type)
         charge_net = LatentChargeFitting(
             var_name="latent_charge",
             ntypes=descriptor.get_ntypes(),
@@ -340,6 +431,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             use_aparam_as_mask=fitting.use_aparam_as_mask,
             mixed_types=descriptor.mixed_types(),
             type_map=fitting.get_type_map(),
+            bias_atom=(
+                None
+                if bias_atom_q is None
+                else np.asarray(bias_atom_q, dtype=np.float64).reshape(
+                    -1, int(config.get("channels", 1))
+                )
+            ),
             **charge_net_config,
         )
         return cls(
@@ -353,6 +451,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             decouple_k_grid=config.get("decouple_k_grid", False),
             pme_spacing=config.get("pme_spacing"),
             pme_order=config.get("pme_order"),
+            mesh_backend=config.get("mesh_backend", "bspline"),
         )
 
     def _k_max(self) -> float:
@@ -410,14 +509,22 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         if self.k_grid_mode == "pme":
             return {PME_MESH: {"spacing": self.mesh_spacing()}}
         params = {"k_max": self._k_max()}
-        if self.k_grid_mode == "fixed":
+        if self.k_grid_mode in (
+            "fixed",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             if not self._k_grid_sized():
                 raise ValueError(
-                    "the fixed k grid is not sized yet: run the data "
-                    "statistics (`compute_input_stats`) on periodic "
+                    f"the {self.k_grid_mode} k grid is not sized yet: run the "
+                    "data statistics (`compute_input_stats`) on periodic "
                     "frames, or configure `k_grid_bounds`"
                 )
-            params["bounds"] = to_numpy_array(self.k_grid_bounds)
+            key = {
+                "ellipsoid": "nk",
+                "metric-ellipsoid": "metric_bounds",
+            }.get(self.k_grid_mode, "bounds")
+            params[key] = to_numpy_array(self.k_grid_bounds)
         return {K_GRID: params}
 
     def required_topologies(self) -> tuple[str, ...]:
@@ -476,7 +583,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         fparam: Array | None = None,
         aparam: Array | None = None,
         charge_spin: Array | None = None,
-    ) -> Array:
+        want_potential: bool = False,
+        want_derivatives: bool = False,
+    ) -> Array | tuple[Array, ...]:
         xp = array_api_compat.array_namespace(descriptor)
         n = descriptor.shape[0]
         pairs = topologies[ALL_PAIRS]
@@ -493,7 +602,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             charge = self._constrain(
                 charge, node_mask, frame_id, n_node, fparam, charge_spin
             )
-        energy = self._pair_branch(charge, pairs, n)
+        if want_potential:
+            energy, phi = self._pair_branch(charge, pairs, n, want_potential=True)
+        else:
+            energy = self._pair_branch(charge, pairs, n)
+            phi = None
+        force = None
+        box = None
         if self.periodic:
             # The lattice sum of a periodic frame and its self term cancel to
             # a small fraction of either, so the reciprocal-space energy is
@@ -506,26 +621,64 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                     frame_id,
                     self.kernel,
                     self.pme_order,
+                    want_potential=want_potential,
                 )
+                if want_potential:
+                    reciprocal, phi_rec = reciprocal
+                    phi = phi + xp.astype(phi_rec, phi.dtype)
             else:
-                reciprocal = kspace_energy(charge_64, topologies[K_GRID], self.kernel)
+                reciprocal = kspace_energy(
+                    charge_64,
+                    topologies[K_GRID],
+                    self.kernel,
+                    want_potential=want_potential,
+                    want_force=want_derivatives,
+                    want_box=want_derivatives,
+                )
+                if want_derivatives:
+                    reciprocal, phi_rec, force, box = reciprocal
+                    if want_potential:
+                        phi = phi + xp.astype(phi_rec, phi.dtype)
+                    force = xp.astype(force, energy.dtype)
+                    box = xp.astype(box, energy.dtype)
+                elif want_potential:
+                    reciprocal, phi_rec = reciprocal
+                    phi = phi + xp.astype(phi_rec, phi.dtype)
             energy = energy + xp.astype(reciprocal, energy.dtype)
-        return xp.reshape(energy, (n, 1))
+        energy = xp.reshape(energy, (n, 1))
+        if want_derivatives:
+            if want_potential:
+                return energy, phi, force, box
+            return energy, force, box
+        if want_potential:
+            return energy, phi
+        return energy
 
-    def _pair_branch(self, charge: Array, pairs: Any, n: int) -> Array:
+    def _pair_branch(
+        self, charge: Array, pairs: Any, n: int, want_potential: bool = False
+    ) -> Array | tuple[Array, Array]:
         """Direct pair sum over the non-periodic frames, per atom."""
         xp = array_api_compat.array_namespace(charge)
         src = pairs.index[0]
         dst = pairs.index[1]
-        pair_charge = xp.sum(
-            xp.take(charge, src, axis=0) * xp.take(charge, dst, axis=0), axis=-1
-        )
+        q_src = xp.take(charge, src, axis=0)
+        q_dst = xp.take(charge, dst, axis=0)
+        pair_charge = xp.sum(q_src * q_dst, axis=-1)
         r_sq = xp.sum(pairs.vec * pairs.vec, axis=-1)
-        pair_energy = pair_charge * self._pair_kernel(r_sq, src, n)
-        half_energy = (0.5 * COULOMB_CONSTANT) * xp.where(
-            pairs.mask, pair_energy, xp.zeros_like(r_sq)
+        kernel = self._pair_kernel(r_sq, src, n)
+        kernel = xp.where(pairs.mask, kernel, xp.zeros_like(r_sq))
+        half_energy = (0.5 * COULOMB_CONSTANT) * pair_charge * kernel
+        energy = segment_sum(half_energy, src, n) + segment_sum(half_energy, dst, n)
+        if not want_potential:
+            return energy
+        phi = xp.zeros(
+            charge.shape,
+            dtype=charge.dtype,
+            device=array_api_compat.device(charge),
         )
-        return segment_sum(half_energy, src, n) + segment_sum(half_energy, dst, n)
+        phi = xp_add_at(phi, src, COULOMB_CONSTANT * q_dst * kernel[:, None])
+        phi = xp_add_at(phi, dst, COULOMB_CONSTANT * q_src * kernel[:, None])
+        return energy, phi
 
     def _pair_kernel(self, r_sq: Array, src: Array, n: int) -> Array:
         """Kernel values of the pairs.
@@ -627,7 +780,15 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         protection: float = 1e-2,
         stat_file_path: DPPath | None = None,
     ) -> None:
-        if self.k_grid_mode == "fixed" and not self._k_grid_sized():
+        if (
+            self.k_grid_mode
+            in (
+                "fixed",
+                "ellipsoid",
+                "metric-ellipsoid",
+            )
+            and not self._k_grid_sized()
+        ):
             # Materialize the samples once for the grid sizing and the
             # networks; a lazy sampler is shared by the callers.
             sampled = merged() if callable(merged) else merged
@@ -689,13 +850,22 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
             data["k_grid_mode"] = self.k_grid_mode
-        if self.k_grid_mode == "fixed" and self._k_grid_sized():
+        if (
+            self.k_grid_mode
+            in (
+                "fixed",
+                "ellipsoid",
+                "metric-ellipsoid",
+            )
+            and self._k_grid_sized()
+        ):
             data["k_grid_bounds"] = to_numpy_array(self.k_grid_bounds).tolist()
         if self.decouple_k_grid:
             data["decouple_k_grid"] = True
             data["frozen_k_max"] = self.frozen_k_max
         if self.periodic:
             data["pme_order"] = self.pme_order
+            data["mesh_backend"] = self.mesh_backend
             if self.pme_spacing is not None:
                 data["pme_spacing"] = self.pme_spacing
         if self.charge_state is not None:
@@ -712,6 +882,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             data["charge_constraint"],
             periodic=data.get("periodic", False),
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),
+            mesh_backend=data.get("mesh_backend", "bspline"),
             # A periodic record without a mode is one of the explicit wave
             # numbers.
             k_grid_mode=data.get("k_grid_mode", "ragged"),
