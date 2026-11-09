@@ -9,11 +9,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include <type_traits>
 #include <unordered_map>
 
@@ -2942,6 +2944,35 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
                                   atype, n_node, n_local, source, edge_vec,
                                   destination_row_ptr, source_row_ptr,
                                   source_order, coord, world, cell));
+      // Debug: dump the compact canonical arrays and the outputs of this rank,
+      // so a replay through the Python model separates "the arrays are wrong"
+      // from "the model is wrong". Enabled by DEEPMD_CANONICAL_DUMP=<dir>; the
+      // rank suffix comes from the launcher's environment. One file per tensor
+      // keeps every write on the single-Tensor overload of torch::save.
+      if (const char* dump_dir = std::getenv("DEEPMD_CANONICAL_DUMP")) {
+        const char* rank_env = std::getenv("OMPI_COMM_WORLD_RANK");
+        const std::string dump_rank = rank_env != nullptr ? rank_env : "0";
+        const std::string prefix =
+            std::string(dump_dir) + "/rank" + dump_rank + "_";
+        auto write = [&prefix](const std::string& name,
+                               const torch::Tensor& value) {
+          torch::save(value.detach().cpu().clone(), prefix + name + ".pt");
+        };
+        write("atype", atype);
+        write("n_node", n_node);
+        write("n_local", n_local);
+        write("source", source);
+        write("edge_vec", edge_vec);
+        write("destination_row_ptr", destination_row_ptr);
+        write("source_row_ptr", source_row_ptr);
+        write("source_order", source_order);
+        if (coord.defined()) {
+          write("coord", coord);
+        }
+        for (const auto& entry : output) {
+          write("out_" + entry.first, entry.second);
+        }
+      }
       auto atom_energy = output["atom_energy"]
                              .reshape({nall_nodes})
                              .slice(0, 0, nloc)
