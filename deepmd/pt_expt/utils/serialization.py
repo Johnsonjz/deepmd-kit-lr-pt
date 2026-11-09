@@ -1595,6 +1595,26 @@ def _collect_metadata(
         meta["canonical_requires_source_csr"] = _canonical_requires_source_csr(
             model, lower_kind
         )
+        # The compact canonical lower reconstructs the graph in Python from the
+        # dual CSR and never opens a cross-rank exchange: its descriptor runs
+        # with `comm_dict=None`. A descriptor whose message passing extends
+        # across a rank boundary therefore re-uses the ghost features of its
+        # first block for every later one, which leaves the energy nearly right
+        # and the forces badly wrong (measured on the SeZM family: 1.4e-4
+        # relative on the energy, 176 % of |F|rms on the forces) as soon as
+        # there is more than one rank. Recorded so a deployment can refuse the
+        # multi-rank case instead of running it.
+        single_rank_only = bool(
+            meta["has_message_passing"]
+            and not _needs_with_comm_artifact(model, lower_kind)
+        )
+        meta["canonical_single_rank_only"] = single_rank_only
+        if single_rank_only:
+            log.warning(
+                "the compact canonical lower of this model has no cross-rank "
+                "message-passing exchange; the artifact is faithful on a single "
+                "rank only. Run it with one rank, or deploy the graph lower."
+            )
 
     # Model-level pair-type exclusion (``pair_exclude_types``): a list of
     # ``[ti, tj]`` type pairs whose interaction is dropped.  Exclusion is a

@@ -52,21 +52,34 @@ itself, on a ghosted node axis.
 Ruled out as well: the adapter's ghost arithmetic. Relabelling 4 or 16 nodes of
 a single-domain frame as ghosts (`n_local < n_node`) keeps the compact lower
 and the autograd topology lower within 3e-8 eV/atom and 1.3e-6 eV/Å of each
-other, and the C++ does pass the MPI communicator
+other; the C++ does pass the MPI communicator
 (`pair_deepmd_kokkos.cpp`: `world_ptr = long_range && multi_rank ? &world :
 nullptr`) and does require the source CSR (`canonical_requires_source_csr`).
 
-The remaining difference between that experiment and a real decomposition is
-the array the **C++ builds**, not the model: an extended node set whose ghost
-rows are images of neighbours, with a destination CSR over all of them.
-Next step: dump `atype`, `n_node`, `n_local`, `source`,
-`destination_row_ptr`, `source_row_ptr`, `source_order` and `edge_vec` from
-`compute_canonical_graph_gpu` at np = 2 and replay them through
-`forward_lower_canonical_graph` in Python; the eager result then says whether
-the arrays or the model are at fault.
+### Root cause: the compact canonical lower has no cross-rank exchange
 
-DPA4C is unaffected because its fused operator consumes the CSR in C++ and
-never reconstructs an edge list in Python.
+`sezm_canonical_energy_force` calls `forward_common_lower_graph` with
+`comm_dict=None` — the canonical adapter reconstructs the graph in Python from
+the dual CSR and never opens a `border_op` exchange. A descriptor whose message
+passing extends across a rank boundary therefore keeps the ghost features of
+its **first** block for every later one.
+
+That is exactly the observed signature: the energy stays close
+(1.4e-4 relative) because it is a per-node sum, while the forces are wrong
+everywhere (rms 2.68 eV/Å against |F|rms 1.52), uniformly rather than
+concentrated on the boundary atoms, and identically for an x- and a
+z-decomposition (−29389.174 and −29389.077 eV).
+
+DPA4C is unaffected because it is **not** a message-passing descriptor
+(`has_message_passing: False` in its metadata, against `True` for SeZM).
+
+`_collect_metadata` now records `canonical_single_rank_only` for such an
+artifact and logs a warning. Running the multi-rank case needs the canonical
+lower to thread `comm_dict` through `canonical_graph_edge_inputs` and the
+descriptor, i.e. a with-comm canonical artifact — which
+`_needs_with_comm_artifact` currently answers `False` for, because DPA4's dense
+and canonical lowers are documented as raising on `comm_dict`.
+
 
 
 See `SEZM_AOTI_MISCOMPILE.md` for the full isolation and the ruled-out list.
