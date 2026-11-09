@@ -1918,23 +1918,24 @@ _LEVEL_TWO_GRAPH_TYPES = frozenset(("dpa1", "dpa4c", "se_atten", "se_atten_v2"))
 
 @contextlib.contextmanager
 def _sezm_canonical_reference_kernels() -> Iterator[None]:
-    """Trace the compact canonical lower of the SeZM family on the reference kernels.
+    """Pin the compact canonical lower of the SeZM family to the reference kernels.
 
-    The accelerator levels are read when the model is built and baked into the
-    exported graph. For the SeZM family that baking is not faithful: a graph
-    that carries the ``sezm_triton::*`` operators does not reproduce the
-    model's own forward once it leaves the Python module -- the packed
-    non-persistent buffers of the SO(2) value path and the per-call scalars of
-    those operators are not lifted with it. Measured on
-    ``water_dpa4_sog/model.ckpt-30000.pt``: the exported program of a
-    ``DP_TRITON_INFER=2`` trace returns -29931.156 eV against the model's
-    -29925.230 eV even when run eagerly, with no AOTInductor involved, while a
-    ``DP_TRITON_INFER=0`` trace reproduces the model to 6e-8 eV/atom.
-
-    A compact canonical artifact is a long-lived deployment object, so it is
-    built on the reference kernels until the accelerator operators lift
-    faithfully.
+    A no-op by default: the exported program of a SeZM canonical trace
+    reproduces the model with the accelerator operators in it as well (measured
+    on ``water_dpa4_sog/model.ckpt-30000.pt``: 9.2e-8 eV/atom and 1.7e-5 eV/Å
+    for a ``DP_TRITON_INFER=2`` trace, against 5.9e-8 and 2.1e-6 for level 0),
+    and the kernels make no measurable difference to the step time (12 288
+    atoms: 1.97 steps/s either way). The pinning stays behind
+    ``DP_SEZM_CANONICAL_REFERENCE_KERNELS=1`` as a bisection aid: swapping the
+    accelerator operators out isolates a defect in the exported program from a
+    defect in a kernel.
     """
+    if os.environ.get("DP_SEZM_CANONICAL_REFERENCE_KERNELS", "").strip() in (
+        "",
+        "0",
+    ):
+        yield
+        return
     levels = (
         "DP_TRITON_INFER",
         "DP_CUDA_INFER",
@@ -1946,8 +1947,7 @@ def _sezm_canonical_reference_kernels() -> Iterator[None]:
         os.environ[name] = "0"
     log.warning(
         "Freezing the compact canonical lower of a DPA4/SeZM model on the "
-        "reference kernels (DP_*_INFER=0): the accelerator operators do not "
-        "survive export into a frozen graph yet."
+        "reference kernels (DP_*_INFER=0) by request."
     )
     try:
         yield

@@ -53,6 +53,14 @@ Throughput (30 NVT steps, `timestep 0.0005`, one GPU per rank):
 | 1 536 atoms | 15.8 steps/s | 14.2 steps/s | 0.90× |
 | 12 288 atoms | 1.97 steps/s | 2.64 steps/s | **1.34×** |
 
+Where the time actually goes: an eager step at 1536 atoms takes 0.080 s and
+the compiled canonical artifact 0.063 s, while **DPA4C needs 0.078 s at 12288
+atoms** — the SeZM descriptor costs roughly eight times more per atom. That gap
+does not move with the kernel level, so it is the generic graph-lower autograd
+adapter, not a missing fast kernel; a fused SeZM operator (the B-lineage route)
+is the lever that would close it. The exchange and the replicated mesh are
+costs stacked on top of that baseline.
+
 Small systems lose, large ones gain: the reciprocal-space mesh is **replicated
 per rank**, so a decomposition splits the pair and descriptor work but not the
 long-range solve, and adds the border exchange on top. Scaling past that needs
@@ -82,6 +90,11 @@ nothing, which rules that route out for good.
   `run_model_canonical_graph_with_comm`. The long-range module gets the
   caller's `world` handle rather than the payload's communicator, which is not
   always populated here (that mismatch segfaulted in `MPI_Comm_size`).
+* **Kernels** — the reference-kernel pinning of the family is gone:
+  a `DP_TRITON_INFER=2` canonical trace is faithful (parity 1.0e-7 eV/atom,
+  1.7e-5 eV/Å) and LAMMPS gives −29946.758 eV at np = 1 and np = 2 alike. It
+  bought only 2–4 % of the step time, so it stays behind
+  `DP_SEZM_CANONICAL_REFERENCE_KERNELS=1` as a bisection aid.
 * **Capability** — `DPAtomicModel.supports_edge_parallel()` now keeps the
   descriptor's answer instead of turning False for every model carrying a
   module, as the pt backend already did; `BaseLongRange.supports_multi_rank()`
