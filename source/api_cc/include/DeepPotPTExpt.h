@@ -746,6 +746,7 @@ class DeepPotPTExpt : public DeepPotBackend {
       const torch::Tensor& source_row_ptr,
       const torch::Tensor& source_order,
       const torch::Tensor& coord,
+      const void* world,
       const torch::Tensor& cell,
       const std::vector<at::Tensor>& comm_tensors);
 

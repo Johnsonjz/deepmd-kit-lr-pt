@@ -690,6 +690,7 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph_with_comm(
     const torch::Tensor& source_row_ptr,
     const torch::Tensor& source_order,
     const torch::Tensor& coord,
+    const void* world,
     const torch::Tensor& cell,
     const std::vector<at::Tensor>& comm_tensors) {
   if (!with_comm_loader) {
@@ -711,9 +712,10 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph_with_comm(
       edge_vec,       destination_row_ptr,
       source_row_ptr, source_order};
   if (long_range_) {
-    // The comm payload's communicator serves the long-range module too, so
-    // the compact with-comm ABI carries one MPI handle rather than two.
+    // The module reads its own communicator; the payload's communicator drives
+    // the descriptor's border exchange.
     inputs.push_back(coord);
+    inputs.push_back(communicator_tensor(world));
     inputs.push_back(cell);
   }
   for (const auto& t : comm_tensors) {
@@ -1026,7 +1028,10 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
   // path must populate ``lmp_list.mapping``.
   bool multi_rank = (lmp_list.nprocs > 1);
   bool atom_map_present = (lmp_list.mapping != nullptr);
-  bool use_with_comm = has_comm_artifact_ && multi_rank;
+  // The compact canonical lower carries its own with-comm dispatch below; the
+  // generic chain (dense / graph / edge) would feed it the wrong input list.
+  bool use_with_comm =
+      has_comm_artifact_ && multi_rank && !lower_input_is_canonical_;
   // A long-range module sums over every pair of atoms of a non-periodic
   // system, which the caller marks with an empty box, and over the images of
   // the cell of a periodic one. A single rank holds every atom, so a ghost
@@ -1558,7 +1563,7 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
           flat_outputs = run_model_canonical_graph_with_comm(
               compact.atype, compact.n_node, compact.n_local, compact.source,
               compact.edge_vec, compact.destination_row_ptr,
-              compact.source_row_ptr, compact.source_order, node_coord,
+              compact.source_row_ptr, compact.source_order, node_coord, world,
               long_range_ ? cell_tensor(long_range_box) : torch::Tensor(),
               canonical_comm);
         } else {

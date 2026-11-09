@@ -32,57 +32,54 @@ Three freeze-time defects had to be fixed first (all in
    reported its native float64, so LAMMPS refused the artifact with "compact
    canonical graph artifacts require float32 edge vectors".
 
-## Open: multi-rank (np ≥ 2) — a defect of the canonical lower itself
+## Multi-rank (np ≥ 2): delivered
 
-| run | PE (eV) | vs single rank |
-|---|---|---|
-| full model (SeZM+SOG), 1 rank | −29946.758 | — |
-| full model (SeZM+SOG), 2 ranks (`processors 1 1 2`) | −29931.239 | **+15.52 eV**, rms\|dF\| 0.96 eV/Å |
-| **short-range-only SeZM**, 1 rank | −29393.266 | — |
-| **short-range-only SeZM**, 2 ranks | −29389.077 | **+4.19 eV**, rms\|dF\| 2.68 eV/Å |
-| DPA4C canonical control, 1 rank | −29946.558 | — |
-| DPA4C canonical control, 2 ranks | −29946.558 | identical, max\|dF\| 1e-5 |
+The compact canonical lower now carries the descriptor's cross-rank border
+exchange, so a frame decomposed over ranks reproduces the single-domain run.
 
-The short-range-only artifact is frozen from `model_30k_sr.pt` (no
-`long_range` key), and it passes the parity gate at
-2.7e-7 eV/atom / 6.9e-6 eV/Å. It still breaks at np = 2, so **the long-range
-wiring is exonerated**: the defect is in the SeZM compact canonical lower
-itself, on a ghosted node axis.
+| run (`data_192.lmp`, `run 0`) | PE (eV) | press (atm) | max\|dF\| vs np = 1 |
+|---|---|---|---|
+| 1 rank | −29946.758 | −3151.5968 | — |
+| 2 ranks (`processors 1 1 2`) | −29946.758 | −3151.5949 | 1.0e-5 (rms 2.3e-6) |
+| 4 ranks (`processors 1 1 4`) | −29946.758 | −3151.5929 | 1.0e-5 (rms 2.5e-6) |
 
-Ruled out as well: the adapter's ghost arithmetic. Relabelling 4 or 16 nodes of
-a single-domain frame as ghosts (`n_local < n_node`) keeps the compact lower
-and the autograd topology lower within 3e-8 eV/atom and 1.3e-6 eV/Å of each
-other; the C++ does pass the MPI communicator
-(`pair_deepmd_kokkos.cpp`: `world_ptr = long_range && multi_rank ? &world :
-nullptr`) and does require the source CSR (`canonical_requires_source_csr`).
+`|F|rms` of the frame is 1.404 eV/Å, so the force agreement is at the
+single-precision floor — the same 1e-5 the DPA4C control shows.
 
-### Root cause: the compact canonical lower has no cross-rank exchange
+### What it took
 
-`sezm_canonical_energy_force` calls `forward_common_lower_graph` with
-`comm_dict=None` — the canonical adapter reconstructs the graph in Python from
-the dual CSR and never opens a `border_op` exchange. A descriptor whose message
-passing extends across a rank boundary therefore keeps the ghost features of
-its **first** block for every later one.
+A message-passing descriptor refreshes its ghost features between blocks
+through `deepmd_export::border_op`; a rank cannot compute a ghost's feature
+locally, because LAMMPS never makes a ghost a neighbour-list centre. Widening
+the ghost region (a 13 Å neighbour list with `comm_modify cutoff 13.5`) changes
+nothing, which rules that route out for good.
 
-That is exactly the observed signature: the energy stays close
-(1.4e-4 relative) because it is a per-node sum, while the forces are wrong
-everywhere (rms 2.68 eV/Å against |F|rms 1.52), uniformly rather than
-concentrated on the boundary atoms, and identically for an x- and a
-z-decomposition (−29389.174 and −29389.077 eV).
+* **Freeze** — `if canonical:` now honours `with_comm_dict`:
+  `forward_lower_canonical_graph_exportable_with_comm` traces the compact ABI
+  with the eight comm tensors after it, one frame at a time (the exchange is
+  per frame and its frame axis is static). A model with a long-range module
+  keeps the positions, **its own** communicator and the cells between the two
+  groups. `_needs_canonical_with_comm` drives `has_comm_artifact` and
+  `canonical_single_rank_only`.
+* **C++** — `DeepPotPTExpt::compute` no longer hands a compact canonical
+  artifact to the generic with-comm chain (which fed it the dense input list);
+  the canonical branch builds the payload with
+  `build_comm_tensors_positional` and calls
+  `run_model_canonical_graph_with_comm`. The long-range module gets the
+  caller's `world` handle rather than the payload's communicator, which is not
+  always populated here (that mismatch segfaulted in `MPI_Comm_size`).
+* **Capability** — `DPAtomicModel.supports_edge_parallel()` now keeps the
+  descriptor's answer instead of turning False for every model carrying a
+  module, as the pt backend already did; `BaseLongRange.supports_multi_rank()`
+  says whether the module can follow a decomposed frame.
 
-DPA4C is unaffected because it is **not** a message-passing descriptor
-(`has_message_passing: False` in its metadata, against `True` for SeZM).
+### Known limitation
 
-`_collect_metadata` now records `canonical_single_rank_only` for such an
-artifact and logs a warning. Running the multi-rank case needs the canonical
-lower to thread `comm_dict` through `canonical_graph_edge_inputs` and the
-descriptor, i.e. a with-comm canonical artifact — which
-`_needs_with_comm_artifact` currently answers `False` for, because DPA4's dense
-and canonical lowers are documented as raising on `comm_dict`.
-
-
-
-See `SEZM_AOTI_MISCOMPILE.md` for the full isolation and the ruled-out list.
+A rank that owns no atom still takes the empty-subdomain early return and never
+joins the artefact's collectives, so a decomposition that empties a rank would
+hang rather than answer. The DPA4C route pads two phantom local atoms for this;
+the compact canonical ABI has no place for them yet, and this run does not hit
+the case.
 
 ## The model-level long-range connection
 

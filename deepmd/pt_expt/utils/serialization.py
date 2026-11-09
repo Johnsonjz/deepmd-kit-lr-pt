@@ -968,6 +968,7 @@ def build_synthetic_canonical_graph_inputs(
     device: torch.device,
     want_spin: bool = False,
     want_long_range: bool = False,
+    nframes: int = 2,
 ) -> tuple[torch.Tensor, ...]:
     """Build compact canonical trace inputs for compressed CUDA descriptors.
 
@@ -990,6 +991,7 @@ def build_synthetic_canonical_graph_inputs(
     sample = build_synthetic_graph_inputs(
         model,
         e_max,
+        nframes=nframes,
         dtype=torch.float32,
         edge_dtype=torch.float32,
         device=device,
@@ -1129,7 +1131,7 @@ def _build_canonical_graph_dynamic_shapes_with_comm(
         {0: source_order_dim},
     )
     if has_long_range:
-        shapes = (*shapes, {0: node_dim}, {0: nframes_val})
+        shapes = (*shapes, {0: node_dim}, None, {0: nframes_val})
     return (*shapes, *(None,) * 8)
 
 
@@ -2644,12 +2646,15 @@ def _trace_and_export_impl(
             # the long range, and the communicator of the domains of a
             # decomposed frame.
             want_long_range = bool(model.atomic_model.required_topologies())
+            # One frame for the with-comm trace: its border exchange is
+            # driven one frame at a time and its frame axis is static.
             sample_inputs = build_synthetic_canonical_graph_inputs(
                 model,
                 e_sample,
                 device=torch.device("cpu"),
                 want_spin=is_native_spin,
                 want_long_range=want_long_range,
+                nframes=1 if with_comm_dict else 2,
             )
             if with_comm_dict:
                 from deepmd.pt_expt.utils.comm import (
@@ -2667,11 +2672,10 @@ def _trace_and_export_impl(
                     raise NotImplementedError(
                         "the compact canonical with-comm lower has no spin slot."
                     )
-                # The comm payload's communicator serves the long-range module
-                # too, so the positions and the cells travel without the
-                # separate communicator slot of the plain canonical ABI.
-                tail = sample_inputs[8:]
-                compact_inputs = (*sample_inputs[:8], *(tail[:1] + tail[2:]))
+                # The positions, the communicator that serves the long-range
+                # module and the cells follow the compact eight exactly as in
+                # the plain canonical ABI; the comm payload follows them.
+                compact_inputs = tuple(sample_inputs)
                 nnode = int(sample_inputs[1].reshape(-1)[0])
                 nloc = int(sample_inputs[2].reshape(-1)[0])
                 comm_inputs = _make_comm_sample_inputs(
