@@ -41,31 +41,53 @@ or `rms|dF| > 1e-3 eV/Å`; `freeze.sh` runs it. It caught both defects.
 
 ## Two independent defects
 
-### 1. A graph with the `sezm_triton.*` operators does not reproduce the model
+### 1. The frozen graph does not reproduce the model — but not for the reason first supposed
 
 The freeze pins `DP_TRITON_INFER=2` / `DP_CUDA_INFER=1` for a DPA4 target
-(`_dpa4_kernel_level_defaults`), so the SeZM descriptor's Triton hot paths are
-traced **into** the graph as opaque custom operators:
+(`_dpa4_kernel_level_defaults`), so the SeZM descriptor's accelerator paths are
+traced **into** the graph as opaque custom operators
+(`sezm_triton.so2_rotate_mix`, `flash_atten_aggregate`, `so2_mixing_stack`,
+`edge_force_assembly`, …). Saving the freeze's exported program and running it
+eagerly — no AOTInductor involved — gives −29931.1557 eV against the model's
+−29925.2297.
+
+**But the operators themselves survive the trace.** Reproducing the whole
+freeze pipeline by hand — `use_mesh_evaluation`, the SO2/embedding pinning,
+`run_autotune`, `_prepare_dpa4_triton_value_path_weights`,
+`forward_lower_canonical_graph_exportable`, `torch.export.export`,
+`_strip_shape_assertions`, `move_to_device_pass` — at the same kernel levels
+gives a program that reproduces the model to 1.2e-6 eV/Å, with 16
+`sezm_triton` nodes in its graph. A make_fx trace and a `torch.export` of the
+plain graph lower likewise agree to 1e-6 at `DP_TRITON_INFER=2`.
+
+What separates the faithful reconstruction from the freeze is the **trace
+sample**. The freeze derives it from
+`count_synthetic_graph_edges(model, nframes=11, nloc=7)` → 353 edge slots;
+tracing the same pipeline at that size raises
 
 ```
-torch.ops.sezm_triton.so2_rotate_mix.default
-torch.ops.sezm_triton.flash_atten_aggregate.default
-...
+GuardOnDataDependentSymNode: Could not guard on data-dependent expression
+zuf0 (unhinted). ... consider guard_or_false / guard_or_true /
+statically_known_true.
 ```
 
-Saving that exported program and running it eagerly — no AOTInductor involved —
-already gives the wrong numbers:
+That is a Python-level `int(tensor.shape[k])` on an **unbacked symbolic**
+extent inside the accelerator path (candidates:
+`kernels/triton/sezm/radial_mix.py:647,684` `rank = int(compact.shape[-1])`,
+`so2_value_path.py:2487,2531` `c_wide = int(x.shape[2])`,
+`so2_rotation.py:1166`). Under
+`prefer_deferred_runtime_asserts_over_guards=True` such a guard is resolved
+from the sample and, when `_strip_shape_assertions` then replaces the deferred
+check with `True`, nothing catches the mismatch at run time.
 
-| evaluation | E (eV) | dE (eV/atom) |
-|---|---|---|
-| eager `DeepPot(ckpt)`, `DP_TRITON_INFER=2` | −29925.2297 | — |
-| the freeze's pre-compile exported program, run eagerly, Triton ops in the graph | **−29931.1557** | **3.09e-2** |
-| the same freeze at `DP_TRITON_INFER=0` (aten-only graph), run eagerly | −29925.2297 | 5.9e-8 |
+The mechanism is therefore: **a shape guard in the accelerator path is
+specialised on the trace sample, and the deployment runs on other shapes.**
+This is the lead for an upstream report; the operator-lifting hypothesis above
+is *not* confirmed and the earlier wording of this document overstated it.
 
-The descriptor's Triton operators therefore do not survive being lifted out of
-the model's Python forward into an exported graph. The eager model is
-unaffected. `_sezm_canonical_reference_kernels()` now traces the compact
-canonical lower of the family on the reference kernels and logs the reason.
+Tracing on the reference kernels avoids the path entirely and is what the
+freeze now does.
+
 
 ### 2. `aot_inductor.use_runtime_constant_folding` corrupts a correct graph
 
