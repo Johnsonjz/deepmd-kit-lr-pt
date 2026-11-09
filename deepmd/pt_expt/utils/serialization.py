@@ -2672,10 +2672,18 @@ def _trace_and_export_impl(
                     raise NotImplementedError(
                         "the compact canonical with-comm lower has no spin slot."
                     )
-                # The positions, the communicator that serves the long-range
-                # module and the cells follow the compact eight exactly as in
-                # the plain canonical ABI; the comm payload follows them.
-                compact_inputs = tuple(sample_inputs)
+                # The positions, the module's communicator and the cells ride
+                # as keywords; the traced program places them between the
+                # compact eight and the comm payload, as the plain canonical
+                # ABI does.
+                lr_kwargs = {}
+                if want_long_range:
+                    lr_kwargs = {
+                        "coord": sample_inputs[8],
+                        "lr_communicator": sample_inputs[9],
+                        "box": sample_inputs[10],
+                    }
+                compact_inputs = tuple(sample_inputs[:8])
                 nnode = int(sample_inputs[1].reshape(-1)[0])
                 nloc = int(sample_inputs[2].reshape(-1)[0])
                 comm_inputs = _make_comm_sample_inputs(
@@ -2683,9 +2691,22 @@ def _trace_and_export_impl(
                     nghost=nnode - nloc,
                     device=torch.device("cpu"),
                 )
-                sample_inputs = (*compact_inputs, *comm_inputs)
+                # ``sample_inputs`` must follow the TRACED order, which places
+                # the positions, the module's communicator and the cells
+                # between the compact eight and the comm payload.
+                if want_long_range:
+                    sample_inputs = (
+                        *compact_inputs,
+                        lr_kwargs["coord"],
+                        lr_kwargs["lr_communicator"],
+                        lr_kwargs["box"],
+                        *comm_inputs,
+                    )
+                else:
+                    sample_inputs = (*compact_inputs, *comm_inputs)
                 traced = model.forward_lower_canonical_graph_exportable_with_comm(
-                    *sample_inputs,
+                    *(*compact_inputs, *comm_inputs),
+                    **lr_kwargs,
                     do_atomic_virial=do_atomic_virial,
                     tracing_mode="symbolic",
                     _allow_non_fake_inputs=True,
