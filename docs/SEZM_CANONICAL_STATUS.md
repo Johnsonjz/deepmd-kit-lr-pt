@@ -32,21 +32,42 @@ Three freeze-time defects had to be fixed first (all in
    reported its native float64, so LAMMPS refused the artifact with "compact
    canonical graph artifacts require float32 edge vectors".
 
-## Open: multi-rank (np ≥ 2)
+## Open: multi-rank (np ≥ 2) — a defect of the canonical lower itself
 
 | run | PE (eV) | vs single rank |
 |---|---|---|
-| SeZM canonical, 1 rank | −29946.758 | — |
-| SeZM canonical, 2 ranks (`processors 1 1 2`) | −29931.239 | **+15.52 eV (8.1e-2 eV/atom)**, rms\|dF\| 0.96 eV/Å |
+| full model (SeZM+SOG), 1 rank | −29946.758 | — |
+| full model (SeZM+SOG), 2 ranks (`processors 1 1 2`) | −29931.239 | **+15.52 eV**, rms\|dF\| 0.96 eV/Å |
+| **short-range-only SeZM**, 1 rank | −29393.266 | — |
+| **short-range-only SeZM**, 2 ranks | −29389.077 | **+4.19 eV**, rms\|dF\| 2.68 eV/Å |
 | DPA4C canonical control, 1 rank | −29946.558 | — |
 | DPA4C canonical control, 2 ranks | −29946.558 | identical, max\|dF\| 1e-5 |
 
-The control proves the C++ ingestion, the communicator plumbing and the
-domain-decomposed long-range operator all work; the gap is specific to the SeZM
-adapter. Single-rank runs have `n_local == n_node`, so ghost rows first appear
-at np ≥ 2 — the leading suspects are the edge reconstruction in
-`canonical_graph_edge_inputs` and the `node_mask` / `n_node` pair handed to the
-operator, on a ghosted node axis.
+The short-range-only artifact is frozen from `model_30k_sr.pt` (no
+`long_range` key), and it passes the parity gate at
+2.7e-7 eV/atom / 6.9e-6 eV/Å. It still breaks at np = 2, so **the long-range
+wiring is exonerated**: the defect is in the SeZM compact canonical lower
+itself, on a ghosted node axis.
+
+Ruled out as well: the adapter's ghost arithmetic. Relabelling 4 or 16 nodes of
+a single-domain frame as ghosts (`n_local < n_node`) keeps the compact lower
+and the autograd topology lower within 3e-8 eV/atom and 1.3e-6 eV/Å of each
+other, and the C++ does pass the MPI communicator
+(`pair_deepmd_kokkos.cpp`: `world_ptr = long_range && multi_rank ? &world :
+nullptr`) and does require the source CSR (`canonical_requires_source_csr`).
+
+The remaining difference between that experiment and a real decomposition is
+the array the **C++ builds**, not the model: an extended node set whose ghost
+rows are images of neighbours, with a destination CSR over all of them.
+Next step: dump `atype`, `n_node`, `n_local`, `source`,
+`destination_row_ptr`, `source_row_ptr`, `source_order` and `edge_vec` from
+`compute_canonical_graph_gpu` at np = 2 and replay them through
+`forward_lower_canonical_graph` in Python; the eager result then says whether
+the arrays or the model are at fault.
+
+DPA4C is unaffected because its fused operator consumes the CSR in C++ and
+never reconstructs an edge list in Python.
+
 
 See `SEZM_AOTI_MISCOMPILE.md` for the full isolation and the ruled-out list.
 
