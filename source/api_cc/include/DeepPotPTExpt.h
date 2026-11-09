@@ -720,6 +720,36 @@ class DeepPotPTExpt : public DeepPotBackend {
       const torch::Tensor& cell);
 
   /**
+   * @brief Run the compact canonical with-comm artifact of this model.
+   *
+   * The eight comm tensors follow the compact ABI — and, for a model with a
+   * long-range module, follow the positions and the cells that sit between
+   * them — so the descriptor's blocks exchange ghost features across the
+   * ranks of the payload's communicator. That communicator serves the
+   * long-range module too, so the compact with-comm ABI carries one MPI
+   * handle rather than two.
+   *
+   * @param[in] atype, n_node, n_local, source, edge_vec, destination_row_ptr,
+   * source_row_ptr, source_order The compact graph tensors.
+   * @param[in] coord Node positions, empty without a long-range module.
+   * @param[in] cell The cell of the frame, empty without a long-range module.
+   * @param[in] comm_tensors The eight comm tensors of the border exchange.
+   * @return The outputs of the with-comm artifact, under their public keys.
+   */
+  std::vector<torch::Tensor> run_model_canonical_graph_with_comm(
+      const torch::Tensor& atype,
+      const torch::Tensor& n_node,
+      const torch::Tensor& n_local,
+      const torch::Tensor& source,
+      const torch::Tensor& edge_vec,
+      const torch::Tensor& destination_row_ptr,
+      const torch::Tensor& source_row_ptr,
+      const torch::Tensor& source_order,
+      const torch::Tensor& coord,
+      const torch::Tensor& cell,
+      const std::vector<at::Tensor>& comm_tensors);
+
+  /**
    * @brief Evaluate the long-range module on a rank that holds no node.
    *
    * The compact lower runs on one halo node without edges, which carries no

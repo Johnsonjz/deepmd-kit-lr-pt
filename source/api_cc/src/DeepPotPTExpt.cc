@@ -680,6 +680,49 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph(
   return loader->run(inputs);
 }
 
+std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph_with_comm(
+    const torch::Tensor& atype,
+    const torch::Tensor& n_node,
+    const torch::Tensor& n_local,
+    const torch::Tensor& source,
+    const torch::Tensor& edge_vec,
+    const torch::Tensor& destination_row_ptr,
+    const torch::Tensor& source_row_ptr,
+    const torch::Tensor& source_order,
+    const torch::Tensor& coord,
+    const torch::Tensor& cell,
+    const std::vector<at::Tensor>& comm_tensors) {
+  if (!with_comm_loader) {
+    throw deepmd::deepmd_exception(
+        "The with-comm artifact is unavailable for this model. Multi-rank "
+        "message-passing inference requires a with-comm artifact that is both "
+        "present in the .pt2 metadata and successfully loaded.");
+  }
+  if (comm_tensors.size() != 8) {
+    throw deepmd::deepmd_exception(
+        "run_model_canonical_graph_with_comm: comm_tensors must contain "
+        "exactly 8 tensors (send_list, send_proc, recv_proc, send_num, "
+        "recv_num, communicator, nlocal, nghost). Got " +
+        std::to_string(comm_tensors.size()) + ".");
+  }
+  std::vector<torch::Tensor> inputs = {
+      atype,          n_node,
+      n_local,        canonicalIndexBytes(source),
+      edge_vec,       destination_row_ptr,
+      source_row_ptr, source_order};
+  if (long_range_) {
+    // The comm payload's communicator serves the long-range module too, so
+    // the compact with-comm ABI carries one MPI handle rather than two.
+    inputs.push_back(coord);
+    inputs.push_back(cell);
+  }
+  for (const auto& t : comm_tensors) {
+    inputs.push_back(t);
+  }
+  const std::lock_guard<std::recursive_mutex> evaluation(evaluation_mutex_);
+  return with_comm_loader->run(inputs);
+}
+
 void DeepPotPTExpt::check_long_range_box(const std::vector<double>& box) const {
   if (!box.empty() && box.size() != 9) {
     throw deepmd::deepmd_exception(
@@ -1496,11 +1539,35 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
           coord_Tensor.slice(1, 0, n_node_count).reshape({n_node_count, 3});
       if (lower_input_is_canonical_) {
         const auto compact = compactCanonicalGraph(graph_pack);
-        flat_outputs = run_model_canonical_graph(
-            compact.atype, compact.n_node, compact.n_local, compact.source,
-            compact.edge_vec, compact.destination_row_ptr,
-            compact.source_row_ptr, compact.source_order, node_coord, world,
-            long_range_ ? cell_tensor(long_range_box) : torch::Tensor());
+        // A message-passing descriptor needs its ghost features refreshed
+        // between blocks; the plain compact ABI has no channel for that, so a
+        // decomposed frame runs on the with-comm sibling when the archive
+        // carries one.
+        std::vector<at::Tensor> canonical_comm;
+        if (multi_rank && has_message_passing_ && with_comm_loader) {
+          if (nall_real < nall) {
+            throw deepmd::deepmd_exception(
+                "the compact canonical with-comm lower does not serve "
+                "NULL-type atoms on several ranks.");
+          }
+          canonical_comm = deepmd::ptexpt::build_comm_tensors_positional(
+              lmp_list, lmp_list.sendlist, lmp_list.sendnum, lmp_list.recvnum,
+              nloc, nghost_real);
+        }
+        if (!canonical_comm.empty()) {
+          flat_outputs = run_model_canonical_graph_with_comm(
+              compact.atype, compact.n_node, compact.n_local, compact.source,
+              compact.edge_vec, compact.destination_row_ptr,
+              compact.source_row_ptr, compact.source_order, node_coord,
+              long_range_ ? cell_tensor(long_range_box) : torch::Tensor(),
+              canonical_comm);
+        } else {
+          flat_outputs = run_model_canonical_graph(
+              compact.atype, compact.n_node, compact.n_local, compact.source,
+              compact.edge_vec, compact.destination_row_ptr,
+              compact.source_row_ptr, compact.source_order, node_coord, world,
+              long_range_ ? cell_tensor(long_range_box) : torch::Tensor());
+        }
       } else {
         flat_outputs = run_model_graph(
             node_atype, n_node_tensor, n_local_tensor, graph_pack.edge_index,

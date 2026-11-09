@@ -330,6 +330,25 @@ def _needs_with_comm_artifact(
     return bool(atomic_model.dense_lower_supports_comm())
 
 
+def _needs_canonical_with_comm(model: Any, lower_kind: str) -> bool:
+    """Whether the compact canonical lower of this model needs a comm sibling.
+
+    The plain canonical ABI carries no border exchange, so a message-passing
+    descriptor reuses the ghost features of its first block for every later
+    one. The with-comm sibling carries the eight comm tensors the descriptor's
+    ``border_op`` drives. A model with a long-range module qualifies as soon as
+    its module serves a decomposed frame: the module reads the same
+    communicator through the operator, and nothing else about the canonical
+    lower changes.
+    """
+    if lower_kind not in ("dpa1_canonical", "dpa4c_canonical"):
+        return False
+    atomic_model = model.atomic_model
+    if not atomic_model.has_message_passing_across_ranks():
+        return False
+    return bool(atomic_model.supports_edge_parallel())
+
+
 def check_graph_trace_torch_version(model: torch.nn.Module) -> None:
     """Fail fast when the graph trace needs unbacked-SymInt support torch lacks.
 
@@ -1065,6 +1084,55 @@ def _build_canonical_graph_dynamic_shapes(
     return (*shapes, *trailing)
 
 
+def _build_canonical_graph_dynamic_shapes_with_comm(
+    *sample_inputs: torch.Tensor | None,
+    has_long_range: bool,
+) -> tuple:
+    """Dynamic-shape specs for the compact canonical with-comm export.
+
+    The compact eight keep their dynamic node and edge axes, except that the
+    frame axis is static at one: the border exchange is driven one frame at a
+    time. A model with a long-range module adds its positions (extended node
+    axis) and its cells (one frame) after them. The eight comm tensors follow
+    and are all static — ``nswap`` and the send counts are baked in at the
+    trace value, as for the graph with-comm tail.
+
+    Parameters
+    ----------
+    *sample_inputs
+        The traced inputs, in the order
+        :meth:`~deepmd.pt_expt.model.ener_model.EnergyModel.forward_lower_canonical_graph_exportable_with_comm`
+        takes them.
+    has_long_range
+        Whether the positions and the cells are present after the compact
+        eight.
+
+    Returns
+    -------
+    tuple
+        One specification per input.
+    """
+    nframes_val = 1
+    node_dim = torch.export.Dim("n_node_total", min=1)
+    edge_storage_dim = torch.export.Dim("nedge_storage", min=2)
+    source_row_dim = torch.export.Dim("n_source_row", min=2)
+    source_order_dim = torch.export.Dim("n_source_order", min=2)
+    word_bytes_dim = torch.export.Dim("index_word_bytes", min=4, max=8)
+    shapes = (
+        {0: node_dim},
+        {0: nframes_val},
+        {0: nframes_val},
+        {0: edge_storage_dim, 1: word_bytes_dim},
+        {0: edge_storage_dim},
+        {0: node_dim + 1},
+        {0: source_row_dim},
+        {0: source_order_dim},
+    )
+    if has_long_range:
+        shapes = (*shapes, {0: node_dim}, {0: nframes_val})
+    return (*shapes, *(None,) * 8)
+
+
 def count_synthetic_graph_edges(
     model: torch.nn.Module,
     nframes: int,
@@ -1547,7 +1615,9 @@ def _collect_metadata(
     # Whether multi-rank LAMMPS needs a second "with-comm" AOTI artifact
     # (per-layer ghost-feature MPI exchange via deepmd_export::border_op).
     # The C++ DeepPotPTExpt / DeepSpinPTExpt loaders branch on this flag.
-    meta["has_comm_artifact"] = _needs_with_comm_artifact(model, lower_kind)
+    meta["has_comm_artifact"] = _needs_with_comm_artifact(
+        model, lower_kind
+    ) or _needs_canonical_with_comm(model, lower_kind)
 
     # Whether the model's regular .pt2 graph consumes the ``mapping``
     # tensor to gather per-layer ghost-atom features from local atoms.
@@ -1613,7 +1683,7 @@ def _collect_metadata(
         # multi-rank case instead of running it.
         single_rank_only = bool(
             meta["has_message_passing"]
-            and not _needs_with_comm_artifact(model, lower_kind)
+            and not _needs_canonical_with_comm(model, lower_kind)
         )
         meta["canonical_single_rank_only"] = single_rank_only
         if single_rank_only:
@@ -2581,13 +2651,52 @@ def _trace_and_export_impl(
                 want_spin=is_native_spin,
                 want_long_range=want_long_range,
             )
-            traced = model.forward_lower_canonical_graph_exportable(
-                *sample_inputs,
-                do_atomic_virial=do_atomic_virial,
-                tracing_mode="symbolic",
-                _allow_non_fake_inputs=True,
-            )
-            dynamic_shapes = _build_canonical_graph_dynamic_shapes(*sample_inputs)
+            if with_comm_dict:
+                from deepmd.pt_expt.utils.comm import (
+                    ensure_comm_registered,
+                )
+
+                ensure_comm_registered()
+                if not _needs_canonical_with_comm(model, lower_kind):
+                    raise ValueError(
+                        "with_comm_dict=True requested but the model's "
+                        "descriptor does not need cross-rank message passing "
+                        "— there's nothing to compile."
+                    )
+                if is_native_spin:
+                    raise NotImplementedError(
+                        "the compact canonical with-comm lower has no spin slot."
+                    )
+                # The comm payload's communicator serves the long-range module
+                # too, so the positions and the cells travel without the
+                # separate communicator slot of the plain canonical ABI.
+                tail = sample_inputs[8:]
+                compact_inputs = (*sample_inputs[:8], *(tail[:1] + tail[2:]))
+                nnode = int(sample_inputs[1].reshape(-1)[0])
+                nloc = int(sample_inputs[2].reshape(-1)[0])
+                comm_inputs = _make_comm_sample_inputs(
+                    nloc=nloc,
+                    nghost=nnode - nloc,
+                    device=torch.device("cpu"),
+                )
+                sample_inputs = (*compact_inputs, *comm_inputs)
+                traced = model.forward_lower_canonical_graph_exportable_with_comm(
+                    *sample_inputs,
+                    do_atomic_virial=do_atomic_virial,
+                    tracing_mode="symbolic",
+                    _allow_non_fake_inputs=True,
+                )
+                dynamic_shapes = _build_canonical_graph_dynamic_shapes_with_comm(
+                    *sample_inputs, has_long_range=want_long_range
+                )
+            else:
+                traced = model.forward_lower_canonical_graph_exportable(
+                    *sample_inputs,
+                    do_atomic_virial=do_atomic_virial,
+                    tracing_mode="symbolic",
+                    _allow_non_fake_inputs=True,
+                )
+                dynamic_shapes = _build_canonical_graph_dynamic_shapes(*sample_inputs)
         elif with_comm_dict:
             # Load libdeepmd_op_pt.so and register border_op fake/autograd
             # metadata now, mirroring the dense with-comm precedent below.
