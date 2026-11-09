@@ -46,6 +46,20 @@ exchange, so a frame decomposed over ranks reproduces the single-domain run.
 `|F|rms` of the frame is 1.404 eV/Å, so the force agreement is at the
 single-precision floor — the same 1e-5 the DPA4C control shows.
 
+Throughput (30 NVT steps, `timestep 0.0005`, one GPU per rank):
+
+| system | np = 1 | np = 2 | speed-up |
+|---|---|---|---|
+| 1 536 atoms | 15.8 steps/s | 14.2 steps/s | 0.90× |
+| 12 288 atoms | 1.97 steps/s | 2.64 steps/s | **1.34×** |
+
+Small systems lose, large ones gain: the reciprocal-space mesh is **replicated
+per rank**, so a decomposition splits the pair and descriptor work but not the
+long-range solve, and adds the border exchange on top. Scaling past that needs
+the distributed mesh the B-lineage validates (`SOG_MIDTOWN_DIST` / z-slab),
+not more ranks. Energy and temperature agree between ranks at both sizes
+(12 288: −1916597.6 eV both, pressure −2076.0414 vs −2076.0477 atm).
+
 ### What it took
 
 A message-passing descriptor refreshes its ghost features between blocks
