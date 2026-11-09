@@ -565,6 +565,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
         comm_dict: dict | None = None,
         topologies: dict[str, Any] | None = None,
         node_mask: Array | None = None,
+        long_range_op: dict[str, Any] | None = None,
     ) -> dict:
         """Graph analogue of :meth:`forward_common_atomic` on the flat node axis.
 
@@ -608,6 +609,10 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
             flat mask of the nodes an enclosing model counts (real, owned and
             not excluded there), combined with this model's own; ``None``
             imposes nothing further.
+        long_range_op
+            A fused-operator context for the long-range module, forwarded to
+            :meth:`forward_atomic_graph`; ``None`` evaluates the module on the
+            topologies instead (see that method).
 
         Returns
         -------
@@ -628,6 +633,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
             comm_dict=comm_dict,
             topologies=topologies,
             node_mask=output_mask,
+            **({} if long_range_op is None else {"long_range_op": long_range_op}),
         )
         return self._finalize_atomic_ret(ret_dict, output_mask, atype)
 

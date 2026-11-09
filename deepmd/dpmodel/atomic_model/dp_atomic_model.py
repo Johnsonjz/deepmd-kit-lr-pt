@@ -672,6 +672,7 @@ class DPAtomicModel(BaseAtomicModel):
         topologies: dict[str, Any] | None = None,
         node_mask: Array | None = None,
         return_atomic_feature: bool = False,
+        long_range_op: dict[str, Any] | None = None,
     ) -> dict[str, Array]:
         """Graph analogue of :meth:`forward_atomic` on the flat node axis.
 
@@ -714,6 +715,20 @@ class DPAtomicModel(BaseAtomicModel):
             whether the forward stops after the fitting network and returns
             the embeddings of the nodes instead of the fitting output; the
             long-range module is then not evaluated.
+        long_range_op
+            A fused-operator context for the long-range module, or ``None``
+            for the topology (autograd) path. The dict carries the node
+            positions ``coord`` ``(N, 3)`` float64, the ``communicator`` and
+            the cells ``box`` that
+            :meth:`~deepmd.pt_expt.long_range.latent_charge.LatentChargeLongRange.energy_force_from_coord`
+            takes, and optionally an ``out`` dict into which this method
+            writes the ``force`` ``(N, 3)``, ``virial`` ``(nf, 9)`` and
+            ``atom_virial`` ``(N, 9)`` the operator returns at fixed charges.
+            Those are values rather than derivatives of the returned energy,
+            so the caller adds them to its assembled force and virial. The
+            response of the charges joins the returned energy as a zero-valued
+            linear term in the descriptor, whose gradient carries it through
+            the caller's own backward.
 
         Returns
         -------
@@ -833,23 +848,102 @@ class DPAtomicModel(BaseAtomicModel):
         # The module reads the descriptor of the real nodes; the reference
         # nodes appended above take no part in it.
         if self.long_range is not None:
-            if topologies is None or node_mask is None:
-                raise ValueError(
-                    "the long-range module of this model reads the topologies "
-                    f"{self.required_topologies()} and the node mask, which were "
-                    "not given"
+            if long_range_op is not None:
+                self._long_range_from_op(
+                    ret,
+                    gg,
+                    atype,
+                    node_mask[:n_real] if graph_vacuum else node_mask,
+                    n_node,
+                    long_range_op,
                 )
-            ret["energy"] = ret["energy"] + self.long_range.call_graph(
-                gg,
+            else:
+                if topologies is None or node_mask is None:
+                    raise ValueError(
+                        "the long-range module of this model reads the topologies "
+                        f"{self.required_topologies()} and the node mask, which were "
+                        "not given"
+                    )
+                ret["energy"] = ret["energy"] + self.long_range.call_graph(
+                    gg,
+                    atype,
+                    node_mask,
+                    n_node,
+                    topologies,
+                    fparam=fparam,
+                    aparam=aparam_node,
+                    charge_spin=charge_spin_frame,
+                )
+        return ret
+
+    def _long_range_from_op(
+        self,
+        ret: dict[str, Array],
+        descriptor: Array,
+        atype: Array,
+        node_mask: Array,
+        n_node: Array,
+        long_range_op: dict[str, Any],
+    ) -> None:
+        r"""Add the fused-operator long-range term to the atomic energy in place.
+
+        The operator (``latent_charge_sum``) evaluates the reciprocal-space sum
+        of the charges, the force and the virial at fixed charges, and the
+        derivative of its energy with respect to the descriptor. Its mesh
+        follows the cells at run time inside the compiled program, so a traced
+        lower needs no topology tensors -- which is why a message-passing
+        descriptor can deploy its long-range module through the compact
+        canonical ABI, whose topology slots hold no reciprocal-space data.
+
+        The response of the charges enters the returned energy as a
+        zero-valued linear term in the descriptor,
+
+        .. math::
+
+            E \\leftarrow E + E_{lr} + g_{lr} \\cdot (g - \\mathrm{detach}(g)),
+
+        whose gradient with respect to the descriptor is :math:`g_{lr}`, so the
+        caller's own backward carries the response to the positions. The force
+        and the virial at fixed charges are values, written into
+        ``long_range_op["out"]`` for the caller to add after its backward.
+
+        Parameters
+        ----------
+        ret
+            The fitting output on the flat node axis, updated in place.
+        descriptor
+            Invariant node features of the real nodes with shape ``(N, d)``.
+        atype
+            Flat node types with shape ``(N,)``.
+        node_mask
+            Owned real nodes with shape ``(N,)``; they carry the charges.
+        n_node
+            Per-frame node counts with shape ``(nf,)``.
+        long_range_op
+            The operator context, with ``coord``, ``communicator``, ``box``
+            and an optional ``out`` dict.
+        """
+        lr_energy, lr_gradient, lr_force, lr_atom_virial, lr_virial = (
+            self.long_range.energy_force_from_coord(
+                descriptor,
                 atype,
                 node_mask,
                 n_node,
-                topologies,
-                fparam=fparam,
-                aparam=aparam_node,
-                charge_spin=charge_spin_frame,
+                long_range_op["coord"],
+                long_range_op.get("communicator"),
+                long_range_op.get("box"),
             )
-        return ret
+        )
+        energy = ret["energy"]
+        response = (
+            lr_gradient.to(descriptor.dtype) * (descriptor - descriptor.detach())
+        ).sum(-1, keepdim=True)
+        ret["energy"] = energy + lr_energy.to(energy.dtype) + response.to(energy.dtype)
+        sink = long_range_op.get("out")
+        if sink is not None:
+            sink["force"] = lr_force
+            sink["virial"] = lr_virial
+            sink["atom_virial"] = lr_atom_virial
 
     def forward_embedding_graph(
         self,

@@ -218,13 +218,24 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         from deepmd.pt_expt.kernels.dpa4c.canonical import (
             dpa4c_canonical_compress_energy_force,
         )
+        from deepmd.pt_expt.kernels.dpa4.canonical import (
+            canonical_model_eligible as sezm_canonical_eligible,
+        )
+        from deepmd.pt_expt.kernels.dpa4.canonical import (
+            canonical_long_range_op_eligible as sezm_long_range_eligible,
+        )
+        from deepmd.pt_expt.kernels.dpa4.canonical import (
+            sezm_canonical_energy_force,
+        )
         from deepmd.pt_expt.utils.canonical_graph import (
             CanonicalGraph,
             validate_canonical_graph_shapes,
         )
 
         use_dpa4c = dpa4c_canonical_eligible(self)
-        if not use_dpa4c and not dpa1_canonical_eligible(self):
+        use_sezm = sezm_canonical_eligible(self)
+        use_sezm_long_range = use_sezm and sezm_long_range_eligible(self)
+        if not use_dpa4c and not use_sezm and not dpa1_canonical_eligible(self):
             raise ValueError("model is not eligible for compact canonical deployment")
         graph = CanonicalGraph(
             n_node=n_node,
@@ -253,7 +264,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                 source_order=source_order.new_zeros(2),
             )
 
-        if learned.has_long_range():
+        if learned.has_long_range() and use_dpa4c:
             from deepmd.pt_expt.kernels.dpa4c.canonical_long_range import (
                 dpa4c_canonical_compress_long_range_energy_force,
                 dpa4c_canonical_long_range_energy_force,
@@ -310,6 +321,41 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                         do_atomic_virial,
                     )
                 )
+        elif use_sezm and (not learned.has_long_range() or use_sezm_long_range):
+            # The compact canonical ABI carries no reciprocal-space topology,
+            # so a long-range module of a SeZM model runs through the fused
+            # `latent_charge_sum` operator, which sizes the mesh of every
+            # frame from its cells inside the program.
+            if learned.has_long_range():
+                if coord is None:
+                    raise ValueError(
+                        "a model with a long-range module reads the node positions"
+                    )
+                check_owned_frames(n_node, n_local, communicator, box)
+            sezm_ret = sezm_canonical_energy_force(
+                self,
+                graph,
+                atype,
+                do_atomic_virial=do_atomic_virial,
+                spin=spin,
+                coord=coord if learned.has_long_range() else None,
+                communicator=communicator if learned.has_long_range() else None,
+                box=box if learned.has_long_range() else None,
+            )
+            energy = sezm_ret["energy"]
+            atom_energy = sezm_ret["atom_energy"]
+            force = sezm_ret["force"]
+            virial = sezm_ret["virial"]
+            mask = sezm_ret["mask"]
+            atom_virial = sezm_ret.get("atom_virial")
+            force_mag = None
+        elif learned.has_long_range():
+            raise NotImplementedError(
+                "the compact canonical lower of a DPA4/SeZM model with a "
+                "long-range module evaluates the module through the fused "
+                "`latent_charge_sum` operator, which does not serve this "
+                "module; use the graph lower for this model."
+            )
         elif use_dpa4c:
             # The fused operator derives the ownership mask from the frame
             # counts itself, so nothing runs on the node axis around it. The

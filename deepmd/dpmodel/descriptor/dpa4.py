@@ -2645,7 +2645,22 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         check_frequency
             The overflow check frequency
         """
-        raise NotImplementedError("Compression is unsupported for SeZM.")
+        # SeZM has no pair-tabulated descriptor to fold: every interaction is
+        # a learned SO(2)/SO(3) operator on the message-passing graph. The
+        # compact canonical lower of this descriptor is a graph adapter
+        # (deepmd.pt_expt.kernels.dpa4.canonical) that reconstructs the graph
+        # edge list from the canonical CSR; it needs no compression state.
+        # Keep this a no-op so `--compress` can select the canonical lower.
+        import logging
+
+        logging.getLogger(__name__).info(
+            "SeZM has no tabulated compression; `--compress` selects the "
+            "compact canonical graph adapter instead."
+        )
+
+    def compression_needs_min_nbor_dist(self) -> bool:
+        """SeZM tabulates nothing: its canonical lower is a graph adapter."""
+        return False
 
     def change_type_map(
         self, type_map: list[str], model_with_new_type_stat: Any | None = None

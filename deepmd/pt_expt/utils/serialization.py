@@ -118,6 +118,48 @@ def _strip_shape_assertions(graph_module: torch.nn.Module) -> None:
 _SOURCE_CSR_INPUTS = ("source_order", "source_row_ptr")
 
 
+@contextlib.contextmanager
+def _opaque_slice_backward() -> Iterator[None]:
+    """Keep ``aten.slice_backward`` an extern kernel while Inductor compiles.
+
+    Inductor decomposes ``aten.slice_backward`` into ``new_zeros`` plus
+    ``aten.slice_scatter`` carrying the ``end`` of the forward slice, and an
+    open-ended forward slice (``x[start:]``) carries ``end = sys.maxsize``.
+    ``ir.SliceView.normalize_start_end`` then has to clamp that against the
+    symbolic extent, and ``sizevars.evaluate_min`` cannot decide
+    ``min(sys.maxsize, s)`` for an unbacked symbol -- which every shape symbol
+    of an export with ``prefer_deferred_runtime_asserts_over_guards=True`` is,
+    since its guards become runtime asserts and leave no hint behind. The
+    lowering raises ``evaluate_min(...) with unbacked symints`` and the package
+    does not compile.
+
+    Dropping the decomposition for the duration of the compile keeps the
+    operator itself, which the compiled program calls through the proxy
+    executor; the numbers are identical. This affects the graphs whose
+    descriptor slices the flat node axis inside the traced program -- the
+    message-passing (DPA4/SeZM) compact canonical lower and its graph sibling.
+    """
+    try:
+        from torch._inductor.decomposition import (
+            decompositions,
+        )
+    except ImportError:  # pragma: no cover - older PyTorch
+        yield
+        return
+    removed = {
+        key: decompositions.pop(key)
+        for key in [
+            name
+            for name in decompositions
+            if str(name).startswith("aten.slice_backward")
+        ]
+    }
+    try:
+        yield
+    finally:
+        decompositions.update(removed)
+
+
 def _graph_reads_source_csr(exported: Any) -> bool:
     """Return whether an exported graph lower consumes the source CSR.
 
@@ -164,6 +206,15 @@ def _canonical_requires_source_csr(model: Any, lower_kind: str) -> bool:
     pass two-entry placeholders in its place.
     """
     if lower_kind == "dpa1_canonical":
+        return True
+    from deepmd.pt_expt.kernels.dpa4.canonical import (
+        canonical_model_eligible as sezm_canonical_eligible,
+    )
+
+    if sezm_canonical_eligible(model):
+        # The SeZM compact lower assembles the force from the edge cotangent by
+        # walking both CSRs -- the descriptor backward and the shared
+        # source-major scatter -- so the source CSR is never optional.
         return True
     decomposition = model.atomic_model.fused_decomposition()
     learned = None if decomposition is None else decomposition[0]
@@ -1766,6 +1817,49 @@ _DPA4_SERIALIZED_TYPES = frozenset(("dpa4", "SeZM"))
 _LEVEL_TWO_GRAPH_TYPES = frozenset(("dpa1", "dpa4c", "se_atten", "se_atten_v2"))
 
 
+@contextlib.contextmanager
+def _sezm_canonical_reference_kernels() -> Iterator[None]:
+    """Trace the compact canonical lower of the SeZM family on the reference kernels.
+
+    The accelerator levels are read when the model is built and baked into the
+    exported graph. For the SeZM family that baking is not faithful: a graph
+    that carries the ``sezm_triton::*`` operators does not reproduce the
+    model's own forward once it leaves the Python module -- the packed
+    non-persistent buffers of the SO(2) value path and the per-call scalars of
+    those operators are not lifted with it. Measured on
+    ``water_dpa4_sog/model.ckpt-30000.pt``: the exported program of a
+    ``DP_TRITON_INFER=2`` trace returns -29931.156 eV against the model's
+    -29925.230 eV even when run eagerly, with no AOTInductor involved, while a
+    ``DP_TRITON_INFER=0`` trace reproduces the model to 6e-8 eV/atom.
+
+    A compact canonical artifact is a long-lived deployment object, so it is
+    built on the reference kernels until the accelerator operators lift
+    faithfully.
+    """
+    levels = (
+        "DP_TRITON_INFER",
+        "DP_CUDA_INFER",
+        "DP_CUTILE_INFER",
+        "DP_CUTE_INFER",
+    )
+    saved = {name: os.environ.get(name) for name in levels}
+    for name in levels:
+        os.environ[name] = "0"
+    log.warning(
+        "Freezing the compact canonical lower of a DPA4/SeZM model on the "
+        "reference kernels (DP_*_INFER=0): the accelerator operators do not "
+        "survive export into a frozen graph yet."
+    )
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _serialized_model_types(value: Any) -> set[str]:
     """Collect exact ``type`` tags from a serialized model tree."""
     if isinstance(value, dict):
@@ -1907,8 +2001,13 @@ def _select_graph_lower_kind(data: dict, *, allow_canonical: bool) -> str | None
         from deepmd.pt_expt.kernels.dpa4c.canonical import (
             canonical_model_eligible as dpa4c_canonical_eligible,
         )
+        from deepmd.pt_expt.kernels.dpa4.canonical import (
+            canonical_model_eligible as sezm_canonical_eligible,
+        )
 
         if dpa4c_canonical_eligible(model):
+            return "dpa4c_canonical"
+        if sezm_canonical_eligible(model):
             return "dpa4c_canonical"
         if dpa1_canonical_eligible(model):
             return "dpa1_canonical"
@@ -2035,11 +2134,14 @@ def deserialize_to_file(
     # their level-two opaque pipeline; DPA4 .pt2 uses the same defaults as PT.
     if lower_kind in ("graph", "dpa1_canonical", "dpa4c_canonical"):
         do_atomic_virial = True
-        ctx: contextlib.AbstractContextManager = (
-            _dpa4_kernel_level_defaults()
-            if uses_dpa4_defaults
-            else _fused_operators_for_export()
-        )
+        if uses_dpa4_defaults and lower_kind == "dpa4c_canonical":
+            # A DPA4/SeZM compact canonical artifact is built on the reference
+            # kernels; see _sezm_canonical_reference_kernels.
+            ctx: contextlib.AbstractContextManager = _sezm_canonical_reference_kernels()
+        elif uses_dpa4_defaults:
+            ctx = _dpa4_kernel_level_defaults()
+        else:
+            ctx = _fused_operators_for_export()
     elif uses_dpa4_defaults:
         ctx = _dpa4_kernel_level_defaults()
     else:
@@ -2377,17 +2479,26 @@ def _trace_and_export_impl(
         if canonical:
             if lower_kind == "dpa4c_canonical":
                 from deepmd.pt_expt.kernels.dpa4c.canonical import (
-                    canonical_model_eligible,
+                    canonical_model_eligible as dpa4c_canonical_eligible,
                 )
-            else:
-                from deepmd.pt_expt.kernels.cuda.dpa1.canonical import (
-                    canonical_model_eligible,
+                from deepmd.pt_expt.kernels.dpa4.canonical import (
+                    canonical_model_eligible as sezm_canonical_eligible,
                 )
 
-            if not canonical_model_eligible(model):
+                canonical_eligible = dpa4c_canonical_eligible(
+                    model
+                ) or sezm_canonical_eligible(model)
+            else:
+                from deepmd.pt_expt.kernels.cuda.dpa1.canonical import (
+                    canonical_model_eligible as dpa1_canonical_eligible,
+                )
+
+                canonical_eligible = dpa1_canonical_eligible(model)
+
+            if not canonical_eligible:
                 raise NotImplementedError(
                     "compact canonical export requires an eligible compressed "
-                    "DPA1 or DPA4C energy model"
+                    "DPA1, DPA4C or DPA4/SeZM energy model"
                 )
 
         # Trace-time sizes must be pairwise-distinct AND avoid every static
@@ -3257,13 +3368,18 @@ def _deserialize_to_file_pt2(
     # shared options.
     lower_configs = dict(aoti_configs)
     if metadata.get("lower_input_kind") in ("dpa1_canonical", "dpa4c_canonical"):
-        lower_configs["aot_inductor.use_runtime_constant_folding"] = True
+        # The SeZM family is exempt: on its compact canonical lower the pass
+        # mis-evaluates the program (measured 6.3e-3 eV/atom against 1.7e-8
+        # with it off), and those artifacts carry no charge-state constants to
+        # fold in the first place.
+        if not _uses_dpa4_kernel_defaults(data["model"]):
+            lower_configs["aot_inductor.use_runtime_constant_folding"] = True
     log.info(
         "Compiling the AOTInductor package for %s (the slowest freeze stage; "
         "typically several minutes)...",
         _env.DEVICE,
     )
-    with _canonical_symbolic_shapes(lower_kind):
+    with _canonical_symbolic_shapes(lower_kind), _opaque_slice_backward():
         aoti_compile_and_package(
             exported, package_path=model_file, inductor_configs=lower_configs
         )
