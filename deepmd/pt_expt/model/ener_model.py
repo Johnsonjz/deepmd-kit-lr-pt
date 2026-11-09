@@ -153,6 +153,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         coord: torch.Tensor | None = None,
         communicator: torch.Tensor | None = None,
         box: torch.Tensor | None = None,
+        comm_dict: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Evaluate an eligible compressed canonical deployment graph.
 
@@ -341,6 +342,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                 coord=coord if learned.has_long_range() else None,
                 communicator=communicator if learned.has_long_range() else None,
                 box=box if learned.has_long_range() else None,
+                comm_dict=comm_dict,
             )
             energy = sezm_ret["energy"]
             atom_energy = sezm_ret["atom_energy"]
@@ -540,6 +542,221 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             destination_row_ptr,
             source_row_ptr,
             source_order,
+        )
+
+    def forward_lower_canonical_graph_exportable_with_comm(
+        self,
+        atype: torch.Tensor,
+        n_node: torch.Tensor,
+        n_local: torch.Tensor,
+        source: torch.Tensor,
+        edge_vec: torch.Tensor,
+        destination_row_ptr: torch.Tensor,
+        source_row_ptr: torch.Tensor,
+        source_order: torch.Tensor,
+        coord: torch.Tensor | None,
+        box: torch.Tensor | None,
+        send_list: torch.Tensor,
+        send_proc: torch.Tensor,
+        recv_proc: torch.Tensor,
+        send_num: torch.Tensor,
+        recv_num: torch.Tensor,
+        communicator: torch.Tensor,
+        nlocal: torch.Tensor,
+        nghost: torch.Tensor,
+        *,
+        do_atomic_virial: bool,
+        **make_fx_kwargs: Any,
+    ) -> torch.nn.Module:
+        """Trace the compact canonical lower with the cross-rank comm payload.
+
+        The with-comm counterpart of
+        :meth:`forward_lower_canonical_graph_exportable`, for a message-passing
+        descriptor whose ghost features have to be refreshed between blocks.
+        The eight comm tensors travel as additional positional inputs and are
+        packed into ``comm_dict`` inside the traced function, exactly as
+        :meth:`forward_lower_graph_exportable_with_comm` does for the graph
+        lower.
+
+        A model with a long-range module passes its node positions and its
+        cells in the two slots that follow the canonical eight; the comm
+        payload's ``communicator`` then serves that module too, so the compact
+        ABI carries one MPI handle rather than two. ``coord`` and ``box`` are
+        ``None`` for a model without one, and are then left out of the traced
+        input list.
+
+        Parameters
+        ----------
+        atype, n_node, n_local, source, edge_vec
+            Compact graph node and edge tensors.
+        destination_row_ptr, source_row_ptr, source_order
+            Compact dual-CSR topology.
+        coord, box
+            Node positions ``(N, 3)`` float64 and cells ``(nf, 9)`` float64 for
+            a model with a long-range module, else ``None``.
+        send_list, send_proc, recv_proc, send_num, recv_num, communicator, nlocal, nghost
+            The comm payload, as :meth:`forward_lower_graph_exportable_with_comm`
+            takes it.
+        do_atomic_virial
+            Whether the traced output includes the per-node virial.
+        **make_fx_kwargs
+            Additional arguments passed to :func:`make_fx`.
+
+        Returns
+        -------
+        torch.nn.Module
+            Traced compact deployment module: sixteen inputs, or eighteen with
+            the positions and the cells of a model with a long-range module.
+        """
+        model = self
+        has_long_range = coord is not None
+
+        def pack_comm(
+            send_list: torch.Tensor,
+            send_proc: torch.Tensor,
+            recv_proc: torch.Tensor,
+            send_num: torch.Tensor,
+            recv_num: torch.Tensor,
+            communicator: torch.Tensor,
+            nlocal: torch.Tensor,
+            nghost: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            return {
+                "send_list": send_list,
+                "send_proc": send_proc,
+                "recv_proc": recv_proc,
+                "send_num": send_num,
+                "recv_num": recv_num,
+                "communicator": communicator,
+                "nlocal": nlocal,
+                "nghost": nghost,
+            }
+
+        if has_long_range:
+
+            def fn_long_range(
+                atype: torch.Tensor,
+                n_node: torch.Tensor,
+                n_local: torch.Tensor,
+                source: torch.Tensor,
+                edge_vec: torch.Tensor,
+                destination_row_ptr: torch.Tensor,
+                source_row_ptr: torch.Tensor,
+                source_order: torch.Tensor,
+                coord: torch.Tensor,
+                box: torch.Tensor,
+                send_list: torch.Tensor,
+                send_proc: torch.Tensor,
+                recv_proc: torch.Tensor,
+                send_num: torch.Tensor,
+                recv_num: torch.Tensor,
+                communicator: torch.Tensor,
+                nlocal: torch.Tensor,
+                nghost: torch.Tensor,
+            ) -> dict[str, torch.Tensor]:
+                return model.forward_lower_canonical_graph(
+                    atype,
+                    n_node,
+                    n_local,
+                    source,
+                    edge_vec,
+                    destination_row_ptr,
+                    source_row_ptr,
+                    source_order,
+                    do_atomic_virial=do_atomic_virial,
+                    coord=coord,
+                    communicator=communicator,
+                    box=box,
+                    comm_dict=pack_comm(
+                        send_list,
+                        send_proc,
+                        recv_proc,
+                        send_num,
+                        recv_num,
+                        communicator,
+                        nlocal,
+                        nghost,
+                    ),
+                )
+
+            return make_fx(fn_long_range, **make_fx_kwargs)(
+                atype,
+                n_node,
+                n_local,
+                source,
+                edge_vec,
+                destination_row_ptr,
+                source_row_ptr,
+                source_order,
+                coord,
+                box,
+                send_list,
+                send_proc,
+                recv_proc,
+                send_num,
+                recv_num,
+                communicator,
+                nlocal,
+                nghost,
+            )
+
+        def fn(
+            atype: torch.Tensor,
+            n_node: torch.Tensor,
+            n_local: torch.Tensor,
+            source: torch.Tensor,
+            edge_vec: torch.Tensor,
+            destination_row_ptr: torch.Tensor,
+            source_row_ptr: torch.Tensor,
+            source_order: torch.Tensor,
+            send_list: torch.Tensor,
+            send_proc: torch.Tensor,
+            recv_proc: torch.Tensor,
+            send_num: torch.Tensor,
+            recv_num: torch.Tensor,
+            communicator: torch.Tensor,
+            nlocal: torch.Tensor,
+            nghost: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            return model.forward_lower_canonical_graph(
+                atype,
+                n_node,
+                n_local,
+                source,
+                edge_vec,
+                destination_row_ptr,
+                source_row_ptr,
+                source_order,
+                do_atomic_virial=do_atomic_virial,
+                comm_dict=pack_comm(
+                    send_list,
+                    send_proc,
+                    recv_proc,
+                    send_num,
+                    recv_num,
+                    communicator,
+                    nlocal,
+                    nghost,
+                ),
+            )
+
+        return make_fx(fn, **make_fx_kwargs)(
+            atype,
+            n_node,
+            n_local,
+            source,
+            edge_vec,
+            destination_row_ptr,
+            source_row_ptr,
+            source_order,
+            send_list,
+            send_proc,
+            recv_proc,
+            send_num,
+            recv_num,
+            communicator,
+            nlocal,
+            nghost,
         )
 
     def forward(

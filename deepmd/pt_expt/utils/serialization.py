@@ -316,6 +316,13 @@ def _needs_with_comm_artifact(
         and atomic_model.supports_edge_parallel()
     ):
         return False
+    if atomic_model.has_long_range():
+        # Neither with-comm lower carries the reciprocal-space topologies of a
+        # long-range module: the graph with-comm trace raises in the atomic
+        # model for want of them, and the compact canonical route has no comm
+        # slots at all. A model with a module therefore gets no with-comm
+        # sibling, whatever its descriptor could do on its own.
+        return False
     if lower_kind == "graph":
         return True
     # Non-graph kinds trace the DENSE with-comm wrapper; a model whose dense

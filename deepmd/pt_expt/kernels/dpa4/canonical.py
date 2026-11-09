@@ -170,6 +170,7 @@ def sezm_canonical_energy_force(
     coord: torch.Tensor | None = None,
     communicator: torch.Tensor | None = None,
     box: torch.Tensor | None = None,
+    comm_dict: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Evaluate a SeZM energy model on the compact canonical graph.
 
@@ -182,6 +183,11 @@ def sezm_canonical_energy_force(
     operator of the module evaluates the reciprocal-space sum; the canonical
     ABI then needs no topology tensors, whose mesh sizing detaches to NumPy
     and does not trace.
+
+    ``comm_dict`` carries the cross-rank ghost-feature exchange of a
+    message-passing descriptor. Without it the descriptor keeps the ghost
+    features of its first block for every later one, which is right on a
+    single domain and wrong as soon as a frame is decomposed over ranks.
     """
     atomic_model = model.atomic_model
     has_long_range = atomic_model.has_long_range()
@@ -225,6 +231,7 @@ def sezm_canonical_energy_force(
         topologies=topologies,
         spin=spin,
         long_range_op=long_range_op,
+        **({} if comm_dict is None else {"comm_dict": comm_dict}),
     )
     public = model._to_public_keys(ret, do_atomic_virial)
     _, output_mask = atomic_model._prepare_graph_nodes(

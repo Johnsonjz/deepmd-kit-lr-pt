@@ -93,6 +93,17 @@ def make_base_long_range(t_tensor: Any) -> type:
         def uses_charge_spin(self) -> bool:
             """Whether the module reads the frame-level charge/spin condition."""
 
+        def supports_multi_rank(self) -> bool:
+            """Whether the module sums a frame decomposed over several ranks.
+
+            A module that answers ``True`` reads the domains of a frame through
+            the communicator its evaluation takes, so the model it belongs to
+            keeps the cross-rank capability of its descriptor. ``False`` (the
+            default) means the module needs the whole frame on one domain, and
+            a model carrying it is single rank whatever its descriptor can do.
+            """
+            return False
+
         @abstractmethod
         def call_graph(
             self,

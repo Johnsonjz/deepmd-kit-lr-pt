@@ -296,20 +296,23 @@ class DPAtomicModel(BaseAtomicModel):
         return bool(self.descriptor.has_message_passing_across_ranks())
 
     def supports_edge_parallel(self) -> bool:
-        """Delegates to this model's own descriptor.
+        """Delegates to this model's own descriptor, unless the module cannot follow.
 
-        A long-range module sums over complete systems, so a model carrying
-        one does not run under domain decomposition.
+        A long-range module is admitted under domain decomposition only when it
+        sums a frame through the communicator of its domains
+        (:meth:`~deepmd.dpmodel.long_range.base_long_range.BaseLongRange.supports_multi_rank`);
+        a module that needs the whole frame on one domain keeps the model
+        single rank.
         """
-        return self.long_range is None and bool(
-            self.descriptor.supports_edge_parallel()
-        )
+        if self.long_range is not None and not self.long_range.supports_multi_rank():
+            return False
+        return bool(self.descriptor.supports_edge_parallel())
 
     def dense_lower_supports_comm(self) -> bool:
         """Delegates to this model's own descriptor; a long-range module has no dense lower."""
-        return self.long_range is None and bool(
-            self.descriptor.dense_lower_supports_comm()
-        )
+        if self.long_range is not None and not self.long_range.supports_multi_rank():
+            return False
+        return bool(self.descriptor.dense_lower_supports_comm())
 
     def uses_compact_edge_pairs(self) -> bool:
         """Delegates to this model's own descriptor."""
