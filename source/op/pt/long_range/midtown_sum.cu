@@ -584,6 +584,26 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                 nz, int(tilted), amp.size());
       }
       std::vector<double> ge, gf, gv;
+      // Refuse before the host-side green build: at a large box the replicated
+      // mesh costs several GiB per rank, and a bare `cudaMalloc: out of memory`
+      // arrives only after tens of GB of host tables and about a minute of
+      // single-threaded work.  `setup_replicated` allocates f_gp (8 B), f_rho_r
+      // (4 B) and f_rho_fx (8 B) per grid point; keep 10% headroom for the
+      // cuFFT work area.
+      {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const double ng = static_cast<double>(nx) * ny * nz;
+        const double need = ng * 20.0;
+        TORCH_CHECK(static_cast<double>(free_b) >= need * 1.10,
+                    "midtown: the replicated mesh needs ",
+                    need / 1073741824.0, " GiB of device memory for a ", nx,
+                    "x", ny, "x", nz, " grid, but only ",
+                    static_cast<double>(free_b) / 1073741824.0,
+                    " GiB is free. Use a coarser mesh (a larger `pme_spacing` "
+                    "or a less demanding `pme_accuracy`), a smaller box, or a "
+                    "distributed backend where the force mode allows one.");
+      }
       if (tilted) {
         sog_green::build_green_metric(nx, ny, nz, W, amp, bw, spline, ge, gf,
                                       gv);
