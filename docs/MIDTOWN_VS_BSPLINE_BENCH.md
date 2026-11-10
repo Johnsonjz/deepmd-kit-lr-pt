@@ -250,6 +250,9 @@ B 链 LAMMPS kspace 的 CubeS₂ 是 AD 力（无 ik）；以下是**纯求解�
 4. **`ik` 的力不是 `E_mesh` 的精确梯度**（非变分），NVE 长期能量漂移需另行核查；能量/力精度见 `IK_MODE_ACCURACY.md`。
 5. 等精度常数是**实测拟合**，换核（σ_min 变化 >2×）或换体系需重标定。
 6. 跨链绝对时间不可比；只比链内比值。
+7. 上面第 3 条那个 `flatten_canonical_atom_virial` 的 None 崩溃，机制已经查清：
+   AOTI proxy executor 把算子异常吞成"输出未定义"，真正的错误只在 stderr 的
+   `[E... shim_common.cpp]` 行里。诊断与复现见 `SLAB_IK_FAILURE_DIAGNOSIS.md`。
 
 ---
 

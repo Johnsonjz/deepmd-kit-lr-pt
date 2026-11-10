@@ -12,8 +12,11 @@
 - 第二部分**没有** `sog.cpp` / `sog_kokkos.cpp` / `fix_sog_response.cpp`，它的
   `pair_deepmd*` 里**没有** `full_lr`、`latent_charge_to_q` 这两个关键字（`grep` 为零）。
   它冻结的模型把长程**整段放进图**，由 `pair deepmd` 直接调用。
-- 第一部分**没有** `deepmd/dpmodel/long_range/`（`grid_rule.py`、`latent_charge.py` 所在），
-  也没有 `deepmd/pt_expt/long_range/`；它不做训练，也不做冻结。
+- 第一部分（`deepmd-kit-LR`）**没有** `deepmd/dpmodel/long_range/`（`grid_rule.py`、
+  `latent_charge.py` 所在），也没有 `deepmd/pt_expt/long_range/`；它不做训练，也不做冻结。
+- 这两者都在第二部分：`deepmd-kit-LR-lr-pt/deepmd/pt_expt/long_range/`
+  （`base_long_range.py`、`kernel.py`、`latent_charge.py`）与
+  `deepmd-kit-LR-lr-pt/deepmd/dpmodel/long_range/`。
 
 两棵树唯一共享的东西是 **`deepmd/lib/libdeepmd_cc.so` + `libdeepmd_backend_ptexpt.so`**
 这两个模型加载库（两棵树各自都会编译），LAMMPS 通过 `DP_BACKEND_PLUGIN_PATH` 选一个。
