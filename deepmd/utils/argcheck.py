@@ -5167,6 +5167,32 @@ def optimizer_adam() -> list[Argument]:
             "rate ramps from `long_range_kernel_lr_scale_start` to "
             "`long_range_kernel_lr_scale` (geometric, in decades). 0 disables it.",
         ),
+        Argument(
+            "long_range_kernel_lr_ramp_steps",
+            [int, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Absolute number of steps over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). Takes precedence "
+            "over `long_range_kernel_lr_ramp_frac` when set; unset falls back to the "
+            "fraction of the total step budget.",
+        ),
+        Argument(
+            "long_range_kernel_train_start_step",
+            int,
+            optional=True,
+            default=0,
+            doc=supported_backends("pt_expt")
+            + "Absolute step index at which the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths) become trainable; before "
+            "this step they are held fixed. Combined with "
+            "`long_range_kernel_lr_ramp_steps` the kernel first freezes, then warms "
+            "its learning rate up from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale`. 0 (the default) trains the kernel from "
+            "the first step.",
+        ),
     ]
 
 
@@ -5250,6 +5276,30 @@ def optimizer_adamw() -> list[Argument]:
             doc="Fraction of the training over which the long-range kernel learning "
             "rate ramps from `long_range_kernel_lr_scale_start` to "
             "`long_range_kernel_lr_scale` (geometric, in decades). 0 disables it.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_steps",
+            [int, type(None)],
+            optional=True,
+            default=None,
+            doc="Absolute number of steps over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). Takes precedence "
+            "over `long_range_kernel_lr_ramp_frac` when set; unset falls back to the "
+            "fraction of the total step budget.",
+        ),
+        Argument(
+            "long_range_kernel_train_start_step",
+            int,
+            optional=True,
+            default=0,
+            doc="Absolute step index at which the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths) become trainable; before "
+            "this step they are held fixed. Combined with "
+            "`long_range_kernel_lr_ramp_steps` the kernel first freezes, then warms "
+            "its learning rate up from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale`. 0 (the default) trains the kernel from "
+            "the first step.",
         ),
     ]
 
@@ -5477,6 +5527,85 @@ def optimizer_hybrid_muon() -> list[Argument]:
             "When enabled, HybridMuon computes momentum-gradient alignment "
             "per Muon block, applies EMA smoothing, and rescales Muon updates "
             "to improve stability. Adam/AdamW routes are unchanged.",
+        ),
+        Argument(
+            "long_range_kernel_lr_scale",
+            float,
+            optional=True,
+            default=1.0,
+            doc=supported_backends("pt_expt")
+            + "Multiplier on the learning rate of the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths). 1.0 keeps the global rate; "
+            "0.3 trains the kernel three times slower than the rest of the model.",
+        ),
+        Argument(
+            "long_range_kernel_amp_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Lower bound applied to the SOG amplitudes after every optimizer step. "
+            "The default leaves them unconstrained; a small positive value keeps the "
+            "kernel a positive sum of Gaussians.",
+        ),
+        Argument(
+            "long_range_kernel_width_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Lower bound (in Angstrom) applied to the SOG widths after every "
+            "optimizer step. The narrowest width sets the wave-number cutoff, so a "
+            "floor here keeps the k grid from being outgrown while the kernel "
+            "trains. 0 leaves the widths unconstrained.",
+        ),
+        Argument(
+            "long_range_kernel_lr_scale_start",
+            [float, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Initial multiplier on the long-range kernel learning rate, ramped "
+            "geometrically to `long_range_kernel_lr_scale`. Unset keeps the scale "
+            "constant. Changing a learning rate leaves the compiled graph untouched, "
+            "so this is how the kernel is switched from effectively frozen to "
+            "trainable without changing `torch.compile`.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_frac",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Fraction of the training over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). 0 disables it.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_steps",
+            [int, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Absolute number of steps over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). Takes precedence "
+            "over `long_range_kernel_lr_ramp_frac` when set; unset falls back to the "
+            "fraction of the total step budget.",
+        ),
+        Argument(
+            "long_range_kernel_train_start_step",
+            int,
+            optional=True,
+            default=0,
+            doc=supported_backends("pt_expt")
+            + "Absolute step index at which the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths) become trainable; before "
+            "this step they are held fixed. Combined with "
+            "`long_range_kernel_lr_ramp_steps` the kernel first freezes, then warms "
+            "its learning rate up from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale`. 0 (the default) trains the kernel from "
+            "the first step.",
         ),
     ]
 
