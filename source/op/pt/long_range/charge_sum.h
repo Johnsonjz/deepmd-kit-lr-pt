@@ -92,7 +92,9 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              double spacing,
                              int owner_begin,
                              int owner_count,
-                             const torch::Tensor* communicator);
+                             const torch::Tensor* communicator,
+                             int64_t force_mode,
+                             bool quads = false);
 
 // The distributed midtown solve: every rank spreads its own atoms into the
 // full mesh, the meshes are summed over the ranks, and each rank gathers its
@@ -104,7 +106,7 @@ ChargeSumOutputs midtown_sum_slab(
     const torch::Tensor& total_charge, const torch::Tensor& box,
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
-    const torch::Tensor* communicator);
+    const torch::Tensor* communicator, bool quads = false);
 
 ChargeSumOutputs midtown_sum_local(const torch::Tensor& coord,
                                    const torch::Tensor& charge,
@@ -136,7 +138,8 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                                    double prefactor,
                                    int64_t order,
                                    double spacing,
-                                   int64_t mesh_backend);
+                                   int64_t mesh_backend,
+                                   int64_t force_mode);
 
 }  // namespace long_range
 }  // namespace deepmd

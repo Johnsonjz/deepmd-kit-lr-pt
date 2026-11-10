@@ -104,17 +104,38 @@ std::mutex& midtown_mutex() {
   return mutex;
 }
 
-int midtown_spline(int64_t order) {
+int midtown_spline(int64_t order, bool quads = false) {
   TORCH_CHECK(order == 4 || order == 6,
               "midtown mesh backend supports spline order 4 or 6, got ",
               order);
+  if (quads) return order == 6 ? SOG_QUADS_6 : SOG_QUADS_4;
   return order == 6 ? SOG_CUBES2_6 : SOG_CUBES2_4;
+}
+
+// Whether n factors over 2, 3 and 5.
+//
+// 7 is deliberately EXCLUDED even though cuFFT can transform it and the
+// B-spline backend sizes its mesh over 2-3-5-7 (mesh_sum.cu even_fft_size):
+// the plans are not equal in cost.  At L = 122.31 A and spacing 0.5 the
+// requested extent is 245 points, which a 2-3-5 mesh rounds to 250 (2 * 5^3)
+// but a 2-3-5-7 mesh accepts as 245 = 5 * 7^2.  Measured, the 245^3 plan runs
+// regular_fft_factor<49> + regular_fft_factor<5> + vector_fft (1.42 ms of
+// transforms plus 0.39 ms of pre/post processing) against 0.59 ms for 250^3 --
+// the radix-7 pass makes the smaller mesh 3x more expensive.  A finer grid is
+// cheaper than a factor-7 one.
+bool factorable_235(int n) {
+  for (const int p : {2, 3, 5}) {
+    while (n % p == 0) {
+      n /= p;
+    }
+  }
+  return n == 1;
 }
 
 int next_factorable(int n) {
   const int minimum = 4;
   n = std::max(n, minimum);
-  while (!sog_green::factorable_235(n)) {
+  while (!factorable_235(n)) {
     ++n;
   }
   return n;
@@ -122,16 +143,22 @@ int next_factorable(int n) {
 
 // The per-axis grid. The operator contract is a mesh of spacing at most
 // `spacing`, and the same rule serves both backends so that one call means the
-// same grid whichever mesh backend evaluates it. The midtown accuracy rule
-// only sizes the grid of a caller that passes no spacing.
-int midtown_axis(double length,
-                 const std::vector<double>& bw,
-                 int spline,
-                 double spacing) {
-  if (spacing > 0.0) {
-    return next_factorable(static_cast<int>(std::ceil(length / spacing)));
-  }
-  return sog_green::grid_axis(length, bw, 1.0, spline, 0.0);
+// same grid whichever mesh backend evaluates it.
+//
+// The spacing itself is NOT derived here: it comes from the caller, which is
+// deepmd/dpmodel/long_range/grid_rule.py inverting the measured error law for a
+// target force-relative accuracy.  The operator only rounds the extent up to a
+// size cuFFT transforms well.  A non-positive spacing is rejected rather than
+// silently sized by a second copy of the accuracy rule: the B-spline backend
+// rejects it too (mesh_sum.cu), so accepting it here would make the same call
+// mean different things per backend.
+int midtown_axis(double length, double spacing) {
+  TORCH_CHECK(spacing > 0.0,
+              "the midtown mesh backend takes a positive mesh spacing, got ",
+              spacing,
+              "; the grid of a target accuracy comes from "
+              "deepmd.dpmodel.long_range.grid_rule.spacing()");
+  return next_factorable(static_cast<int>(std::ceil(length / spacing)));
 }
 
 }  // namespace
@@ -339,7 +366,9 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              double spacing,
                              int owner_begin,
                              int owner_count,
-                             const torch::Tensor* communicator) {
+                             const torch::Tensor* communicator,
+                             int64_t force_mode,
+                             bool quads) {
   CpuTimer::cycle();
   TORCH_CHECK(kernel == kSog,
               "the midtown mesh backend evaluates the SOG kernel only");
@@ -362,7 +391,8 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
               "the midtown mesh backend needs amplitude and rate pairs, got ",
               coefficient.size(0), " coefficients");
 
-  const int spline = midtown_spline(order);
+  const int spline = midtown_spline(order, quads);
+  const bool is_quads = (spline == SOG_QUADS_4 || spline == SOG_QUADS_6);
   const int64_t bands = coefficient.size(0) / 2;
 
   // The coefficients are metadata: the caller passes them on the host, so no
@@ -445,6 +475,8 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     const bool tilted = std::fabs(c[1]) >= 1e-12 || std::fabs(c[2]) >= 1e-12 ||
                         std::fabs(c[3]) >= 1e-12 || std::fabs(c[5]) >= 1e-12 ||
                         std::fabs(c[6]) >= 1e-12 || std::fabs(c[7]) >= 1e-12;
+    TORCH_CHECK(!(is_quads && tilted),
+                "the QuadS backend supports orthogonal cells only");
     const double lx = c[0], ly = c[4], lz = c[8];
 
     // The metric of a triclinic cell: W = A^{-1} A^{-T} with A the rows.  The
@@ -510,9 +542,9 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     auto c_f = coord.narrow(0, begin, count);
 
     // ── grid, green tables and device state ──
-    const int nx = midtown_axis(lens[0], bw, spline, spacing);
-    const int ny = midtown_axis(lens[1], bw, spline, spacing);
-    const int nz = midtown_axis(lens[2], bw, spline, spacing);
+    const int nx = midtown_axis(lens[0], spacing);
+    const int ny = midtown_axis(lens[1], spacing);
+    const int nz = midtown_axis(lens[2], spacing);
     // The green tables and the metric depend on the cell, but an NPT step
     // changes it by ~1e-4: rebuilding them every step costs milliseconds.
     // Rebuild only when the cell drifts past a tolerance (the box_tol idea of
@@ -524,9 +556,22 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         cell_drift = std::max(cell_drift, std::fabs(local.cell[k] - c[k]) / scale);
       }
     }
+    // Must mirror the default chosen at the rebuild below, or a rebuild in one
+    // form would be reported as satisfying a request for the other.
+    //
+    // Default: Form A on for every non-tilted midtown mesh, at both CubeS2
+    // orders.  `SOG_MIDTOWN_FORM_A=0/1` overrides either way; tilted cells have
+    // no measured window symbol and stay on Form B.
     const char* fa_env_want = std::getenv("SOG_MIDTOWN_FORM_A");
+    // QuadS builds the exact window inverse directly (sog_green.h), so its
+    // table is Form A by construction; the env switch below only governs the
+    // CubeS2 variance subtraction.
     const int want_form =
-        (fa_env_want != nullptr && std::atoi(fa_env_want) != 0 && !tilted) ? 1 : 0;
+        (is_quads || (!tilted &&
+                      (fa_env_want != nullptr ? std::atoi(fa_env_want) != 0
+                                              : true)))
+            ? 1
+            : 0;
     const bool same = local.ready && !local.slab && local.form == want_form &&
                       local.nx == nx && local.ny == ny && local.nz == nz &&
                       local.spline == spline && local.amp == amp &&
@@ -551,13 +596,20 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
       sog_gpu_setup_f32(local.state, nx, ny, nz, ge.data(), gf.data(),
                         gv.data());
       // Form A: replace the Form-B variance subtraction by the exact measured
-      // assignment-window symbol.  Off by default so the two can be measured
-      // against each other on identical inputs; see docs/LONG_RANGE_PORT.md.
-      // Value-parsed like SOG_MIDTOWN_SLAB / SOG_MIDTOWN_DIST: a bare presence
-      // test made `SOG_MIDTOWN_FORM_A=0` turn Form A ON.
+      // assignment-window symbol (see docs/MESH_ERROR_MODEL_AND_FORM_A.md).
+      //
+      // Default: ON at both CubeS2 orders, for every non-tilted mesh.  The
+      // variance-subtraction residual dominates the order-4 energy error
+      // (18-78x on the same grid) and is small but nonzero at order 6; exact
+      // inversion is the reference form and `SOG_MIDTOWN_FORM_A=0/1` overrides.
       const char* fa_env = std::getenv("SOG_MIDTOWN_FORM_A");
-      if (fa_env != nullptr && std::atoi(fa_env) != 0 && !tilted) {
-        const int nord = (spline == SOG_CUBES2_6) ? 6 : 4;
+      const int nord = (spline == SOG_CUBES2_6) ? 6 : 4;
+      // QuadS is already the exact window inverse; converting it again with
+      // the CubeS2 symbol would apply the wrong deconvolution.
+      const bool form_a =
+          !tilted && !is_quads &&
+          (fa_env != nullptr ? std::atoi(fa_env) != 0 : true);
+      if (form_a) {
         // nth must be >= 1: with 0 the theta loops never run, acc stays zero
         // and w = 0 * inf is NaN, which the floor test then silently swallows
         // while zeroing the whole reciprocal interaction.
@@ -607,7 +659,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         uy, uz, q.data_ptr<double>(), prefactor, spline,
         /*want_potential=*/1, d_force.data_ptr<double>(),
         d_vpot.data_ptr<double>(), /*self_coeff=*/0.0, /*qsqsum=*/0.0,
-        /*remove_self=*/0);
+        /*remove_self=*/0, static_cast<int>(force_mode));
     // The 20 reduction sums stay on the device: the finish kernels read them
     // in place, so no scalar and no copy crosses to the host.
     const double* red = sog_gpu_red_device_ptr(local.state);
@@ -750,9 +802,9 @@ ChargeSumOutputs midtown_sum_local(
     local.state = sog_gpu_create();
     TORCH_CHECK(local.state != nullptr, "midtown: sog_gpu_create failed");
   }
-  const int nx = midtown_axis(lx, bw, spline, spacing);
-  const int ny = midtown_axis(ly, bw, spline, spacing);
-  const int nz = midtown_axis(lz, bw, spline, spacing);
+  const int nx = midtown_axis(lx, spacing);
+  const int ny = midtown_axis(ly, spacing);
+  const int nz = midtown_axis(lz, spacing);
   // The green tables depend on the cell, and an MD barostat moves it by ~1e-4
   // per step: rebuilding them every call cost 11 ms at a 100^3 mesh, which is
   // more than the whole solve.  Rebuild only when the cell drifts past the
@@ -929,7 +981,7 @@ ChargeSumOutputs midtown_sum_slab(
     const torch::Tensor& total_charge, const torch::Tensor& box,
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
-    const torch::Tensor* communicator) {
+    const torch::Tensor* communicator, bool quads) {
   TORCH_CHECK(!form_a_requested(),
               "midtown: SOG_MIDTOWN_FORM_A is implemented on the replicated "
               "solve only; unset it for the slab path");
@@ -964,7 +1016,7 @@ ChargeSumOutputs midtown_sum_slab(
   TORCH_CHECK(!tilted, "the slab midtown backend supports orthogonal cells only");
   const double lx = c[0], ly = c[4], lz = c[8];
   const double volume = lx * ly * lz;
-  const int spline = midtown_spline(order);
+  const int spline = midtown_spline(order, quads);
 
   const int np = deepmd::long_range::domain_count(*communicator);
   const int me = deepmd::long_range::domain_rank(*communicator);
@@ -982,13 +1034,16 @@ ChargeSumOutputs midtown_sum_slab(
                 "(libnccl.so.2, or the CUDA wheel's nvidia/nccl)");
   }
 
-  const int nx = midtown_axis(lx, bw, spline, spacing);
-  const int ny = midtown_axis(ly, bw, spline, spacing);
-  const int nz = midtown_axis(lz, bw, spline, spacing);
+  const int nx = midtown_axis(lx, spacing);
+  const int ny = midtown_axis(ly, spacing);
+  const int nz = midtown_axis(lz, spacing);
   const int zlo = me * nz / np, zhi = (me + 1) * nz / np - 1;
   const int ZL = zhi - zlo + 1;
   const int ylo = me * ny / np, YL = (me + 1) * ny / np - ylo;
-  const int gh = (spline == 6) ? 6 : 4;
+  // Ghost margin = the stencil width = the spline order (CubeS2 and QuadS both
+  // reach `order` points per axis: offsets -1..2 for 4, -2..3 for 6).  This is
+  // the order, not the raw SogSpline code -- QuadS encodes it as 100 + order.
+  const int gh = (order == 6) ? 6 : 4;
   TORCH_CHECK(ZL >= gh, "midtown slab: nz/np = ", ZL,
               " is thinner than the stencil (", gh,
               "); use fewer ranks or a finer grid");
