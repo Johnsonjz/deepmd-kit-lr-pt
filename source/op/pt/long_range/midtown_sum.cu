@@ -1126,8 +1126,8 @@ ChargeSumOutputs midtown_sum_slab(
                                      ylo, YL, sge, sgf, sgv, window_ptr);
     const size_t gn = (size_t)(nx / 2 + 1) * YL * nz;
     TORCH_CHECK(sge.size() == gn, "midtown slab: green table size mismatch");
-    sog_gpu_setup_slab(local.state, nx, ny, nz, YL, ZL, sge.data(), sgf.data(),
-                       sgv.data(), gn);
+    sog_gpu_setup_slab(local.state, nx, ny, nz, YL, ZL, sge.data(), sgv.data(),
+                       gn);
     local.nx = nx;
     local.ny = ny;
     local.nz = nz;
@@ -1281,8 +1281,7 @@ ChargeSumOutputs midtown_sum_slab(
   mark(3);  // forward all-to-all
   if (TR()) fprintf(stderr, "[slab] alltoall fwd done\n");
   TORCH_CHECK(sog_gpu_slab_unpack_green_izpack_dev(
-                  local.state, nx, ny, nz, ylo, YL, lx, ly, lz, nullptr,
-                  nullptr, nullptr, scaleinv, np) == 0,
+                  local.state, nx, ny, nz, ylo, YL, lx, ly, lz, scaleinv, np) == 0,
               "midtown slab: unpack / z FFT / green failed");
   mark(4);  // unpack + z FFT + green + inverse
   if (TR()) fprintf(stderr, "[slab] zfft+green done\n");

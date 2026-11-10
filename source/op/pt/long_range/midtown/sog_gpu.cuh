@@ -29,8 +29,7 @@ void sog_gpu_destroy(SogGpuState *s);
 // (The bare K / K_v "self" tables are gone: the self-energy term is closed-form
 //  and needs no per-mode table, see sog_gpu_solve_dev.)
 void sog_gpu_setup_slab(SogGpuState *s, int nx, int ny, int nz, int YL,
-                        int ZL, const double *ge, const double *gf,
-                        const double *gv, size_t gn);
+                        int ZL, const double *ge, const double *gv, size_t gn);
 void sog_gpu_setup(SogGpuState *s, int nx, int ny, int nz,
                    const double *green_energy, const double *green_force,
                    const double *green_virial);
@@ -78,9 +77,7 @@ double sog_gpu_compute(SogGpuState *s, int nlocal,
 int sog_gpu_slab_setup(SogGpuState *s, int nx, int ny, int nz, int ZL, int YL);
 int sog_gpu_slab_unpack_green_izpack(SogGpuState *s, int nx, int ny, int nz,
                                      int ylo, int YL, double lx, double ly,
-                                     double lz, const double *ge,
-                                     const double *gf, const double *gv,
-                                     double scaleinv, int np,
+                                     double lz, double scaleinv, int np,
                                      const double *host_rcv,
                                      double *host_snd_back, double *red7);
 
@@ -165,9 +162,7 @@ int sog_gpu_slab_xyfft_pack_brick_dev(SogGpuState *s, int nx, int ny, int nz,
                                       int ZL, int np, int zoff);
 int sog_gpu_slab_unpack_green_izpack_dev(SogGpuState *s, int nx, int ny, int nz,
                                          int ylo, int YL, double lx, double ly,
-                                         double lz, const double *ge,
-                                         const double *gf, const double *gv,
-                                         double scaleinv, int np);
+                                         double lz, double scaleinv, int np);
 int sog_gpu_slab_unpack_ixyfft_to_brick_dev(SogGpuState *s, int nx, int ny,
                                             int nz, int ZL, int np, int zoff,
                                             int ZB);

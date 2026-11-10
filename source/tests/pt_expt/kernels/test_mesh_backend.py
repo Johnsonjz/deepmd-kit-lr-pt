@@ -299,12 +299,15 @@ def test_slab_solve_matches_replicated(monkeypatch, mesh_backend, order) -> None
     The slab backend carries the CubeS2, QuadS and cardinal-B-spline stencils.
     At a single rank it skips NCCL (the two all-to-alls are the identity), so
     this exercises the spline-specific compact half-spectrum green table
-    (`build_green_slab_half`) and the two-transpose FFT without MPI.  The
-    replicated CubeS2 path defaults to Form A while the slab solves in Form B,
-    so the CubeS2 reference is forced to Form B; QuadS inverts the window
-    exactly and B-spline inverts its assignment factor, both on either side.
-    Any spline-dependent slip in the green table -- the one silent failure mode
-    of this path -- shows up as a mismatch here.
+    (`build_green_slab_half`) and the two-transpose FFT without MPI.  Both
+    sides run the same single-precision pipeline (float32 mesh, 64-bit
+    fixed-point spread, packed `float2` green table) now that the slab shares
+    the replicated solve's precision contract; the CubeS2 case pins BOTH sides
+    to Form B so the comparison isolates the spline machinery rather than the
+    Form-A window measurement (which has its own parity run).  QuadS inverts
+    the window exactly and B-spline inverts its assignment factor, both on
+    either side.  Any spline-dependent slip in the green table -- the one silent
+    failure mode of this path -- shows up as a mismatch here.
     """
     coord, charge, mask, n_node, total, box = _system()
     common = {
