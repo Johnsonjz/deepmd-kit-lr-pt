@@ -1,333 +1,435 @@
-# Mesh error model and the exact influence function (Form A)
+# Mesh error model, the exact influence function (Form A), and the grid rule
 
-Status as of 2026-11-08. Companion to `LONG_RANGE_PORT.md` (section "Accuracy")
-and to `papers/sog-lib-paper` §4.3, which carry the same content in their own
-notation. Every path below is absolute.
-
----
-
-## 0. The question this answers
-
-The `midtown` (CubeS₂) mesh backend measured **less accurate than the B-spline at
-the same grid**: 4.8× worse rms at order 6 in one table, "within a factor ~2" in
-another table of the same document. That appears to contradict the asymptotic
-optimality of midtown splines (Predescu, Bergdorf & Shaw, *J. Chem. Phys.* 153,
-224117 (2020), Proposition 5).
-
-It is not a contradiction. **The deployed CubeS₂ path was not inverting its own
-assignment window.** The spline is fine; the influence function was a
-second-order approximation, and its residual dominated.
+Reference test model for every number below:
+`/data/home/public/jiangzhen/dp/master-merge-test/water/model.ckpt-150000.pt`
+(trained `dpa4c-sog`, 12 SOG bands, `sigma_min = 2.0 Å`).
+One earlier data set, from `model.ckpt-200000.pt` (`sigma_min = 1.134 Å`) of the
+same run, is quoted only where the kernel dependence is the point.
 
 ---
 
-## 1. Theory
+## 0. Summary
 
-### 1.1 Three terms, not one
+* The `midtown` (CubeS₂) mesh measured less accurate than the B-spline at the
+  same grid **on the force metric**. The cause was **not** the spline: the
+  deployed path inverted its assignment window only approximately (a variance
+  subtraction), and that residual dominated the *energy*. The force gap is the
+  window's own smoothness, not the deconvolution.
+* The mesh error has **three** terms, not one, and the **force** exponent is one
+  lower than the energy's: `p_force = 2ν − 1`. Measured on the reference kernel:
+  **4.64 ≈ 5 at order 6** and **2.82 ≈ 3 at order 4** — *not* `2ν`.
+* Replacing the approximation by the exact measured window symbol ("Form A")
+  lowers the order-4 **energy** error by **10–64×** on the same grid (a wash at
+  order 6), and leaves the **force** unchanged to within ~4% — the force is
+  Form-A-invariant because it is set by the window *derivative*, which no
+  influence function can alter. Form A is therefore the **default at both CubeS₂
+  orders** (was: order 4 only).
+* On the force metric the B-spline is still strictly better than CubeS₂ at equal
+  grid — **~6.8× at order 6** (4.7–9.8×) and **~1.8× at order 4** (1.5–2.1×),
+  and the gap widens toward fine grids. On the *energy* metric Form A closes it
+  (order 6 a wash, order 4 ~12× **better** than the B-spline).
+* The grid rule now follows the measured law, per backend and spline order, and
+  is live in the operator's Python layer. It never places a grid coarser than
+  the legacy `0.75 π / k_max`. Because the force is Form-A-invariant, the
+  force-based constants did not move when Form A became the order-6 default.
 
-The mesh error is
+---
+
+## 1. The problem
+
+`docs/LONG_RANGE_PORT.md` reported the CubeS₂ mesh as 4.8× worse than the
+B-spline at order 6 in one table and "within a factor ~2" in another, which
+appeared to contradict the asymptotic optimality of midtown splines
+(Predescu, Bergdorf & Shaw, *J. Chem. Phys.* **153**, 224117 (2020),
+Proposition 5).
+
+It does not. Proposition 5 is about the **assignment kernel**. The deployed
+CubeS₂ path used a Green function that only approximated the inverse of that
+kernel, and the approximation's residual was the dominant error.
+
+---
+
+## 2. Theory
+
+### 2.1 Three terms
 
 ```
-ε_mesh(Δ) = ε_tail(k_max)  +  (C_assign + C_infl) · (Δ/σ_min)^p          (1)
+ε_mesh(Δ) = ε_tail(k_max) + (C_assign + C_infl) (Δ/σ_min)^p          (1)
 ```
 
-* `ε_tail` — kernel truncation at `k_max` (unchanged; §4.1 of the paper).
-* `C_assign` — the assignment/interpolation/alias residual. This is the
-  window's own property. It is the `2ν`-th Taylor coefficient of the assignment
-  symbol about `k = 0`. For a cardinal B-spline the same object is the
-  Dirichlet symbol `(sin(θ/2)/(θ/2))^p`; for CubeS₂ it follows from the moment
-  conditions of the midtown paper (its Eq. 46), which make the leading
-  unmatched moment appear at total degree `2ν`.
-* `C_infl` — the **influence-function residual**. Identically zero when the
-  window symbol is inverted exactly: the B-spline path divides by the analytic
-  `|D_d(m)|^{-2}` (`deepmd/dpmodel/long_range/reciprocal.py`, `_assignment_factor`),
-  and the separable QuadS family by its exact window division. The zero-cost
-  alternative, a variance subtraction `exp(ξ²Δ²k²)`, leaves a residual of the
-  **same order** with a constant that is an implementation artefact.
+* **`ε_tail`** — kernel truncation at `k_max`. Unchanged.
+* **`C_assign`** — the assignment/interpolation/alias residual, and the
+  window's own property: the `2ν`-th Taylor coefficient of the assignment
+  symbol about `k = 0`. Moment matching cancels the lower terms, so the first
+  unmatched one is at `2ν`. For a cardinal B-spline the same object is the
+  Dirichlet symbol `(sin(θ/2)/(θ/2))^p`.
+* **`C_infl`** — the influence-function residual. **Identically zero when the
+  window symbol is inverted exactly**: the B-spline path divides by the
+  analytic `|D_d(m)|^{-2}` (`deepmd/dpmodel/long_range/reciprocal.py`,
+  `_assignment_factor`), and the separable QuadS family by its exact window
+  division. The zero-cost alternative, a variance subtraction
+  `exp(ξ²Δ²k²)`, leaves a residual of the **same order** with a constant that
+  is an implementation artefact.
 
-Writing the bracket as a single `C_ν` hides the distinction, and the
-distinction is the whole point: only `C_assign` is a property of the spline.
+Collapsing the bracket into one `C_ν` hides exactly the thing that matters:
+only `C_assign` is a property of the spline.
 
-### 1.2 The force exponent is not `2ν`
+### 2.2 The force exponent is not always `2ν`
 
-The force requires the **derivative** of the assignment window. A window that
-is only `C⁰` has a discontinuous derivative, and the force error loses one
-order:
+The force needs the **derivative** of the assignment window. A window that is
+only `C⁰` has a discontinuous derivative and loses one order:
 
 ```
 p = 2ν        energy metric
-p = 2ν − 1    force metric, C⁰ window                            (2)
+p = 2ν − 1    force metric, C⁰ window                              (2)
 ```
 
-This is not a defect. The midtown paper's Table I tabulates exactly this:
-CubeS₂ order 4 is `C²`, CubeS₂ order 6 is `C⁰`.
+The midtown paper's Table I lists CubeS₂ order 4 as `C²` and order 6 as `C⁰`.
+On the reference kernel the fitted force exponent is **4.64 at order 6** and
+**2.82 at order 4** (§4.6) — both ≈ `2ν − 1`, so the weight-differentiated force
+loses roughly one order at *both* CubeS₂ orders, not only the `C⁰` case. The
+B-spline loses less: **5.46 at order 6** (quintic, `C⁴`) and **3.06 at order 4**
+(cubic, `C²`), i.e. about half an order. The B-spline's smoother window is the
+whole reason it beats CubeS₂ on force at equal grid (§4.6): it keeps
+`p_force ≈ order` while CubeS₂ drops to `2ν − 1`. Eq. (2) is the clean
+theoretical case; the shipped rule (§5.1) uses the measured exponent per
+`(backend, order)` instead of extrapolating from it.
 
-### 1.3 Form A and Form B
-
-For an assignment window whose symbol is `W(k)`:
-
-```
-Form A (exact):   ge(k) = kfac(k) / |W(k)|²
-Form B (variance subtraction):   ge(k) = kfac(k) · exp(ξ² (Δx²kx² + Δy²ky² + Δz²kz²))
-```
-
-`kfac(k) = Σ_m a_m (2πσ_m²)^{3/2} exp(−σ_m²k²/2)`, the Fourier transform of
-`K(r) = Σ a_m e^{−r²/2σ_m²}`. (Verified: the operator's `amp = a(2πσ²)^{3/2}`
-is exactly this transform; an independent direct k-sum agrees with the operator
-to 1.4e-6.)
-
-Three facts make Form A work in practice:
-
-**(a) The divisor is `D · ⟨|W|²⟩`, not `⟨|W|²⟩`.**
-The incoming table is Form B and its `D = exp(ξ²Δ²k²)` already stands in for
-`1/|W|²`. So
+### 2.3 Form A and Form B
 
 ```
-ge_A = kfac/|W|² = ge_B / (D · ⟨|W|²⟩)                            (3)
+Form A (exact):              ge(k) = kfac(k) / |W(k)|²
+Form B (variance subtrac.):  ge(k) = kfac(k) · exp(ξ²(Δx²kx² + Δy²ky² + Δz²kz²))
+kfac(k) = Σ_m a_m (2πσ_m²)^{3/2} exp(−σ_m²k²/2)
+```
+
+`kfac` is the Fourier transform of `K(r) = Σ a_m e^{−r²/2σ_m²}`; the operator
+builds exactly this (`amp = a(2πσ²)^{3/2}`), and an independent direct k-sum
+agrees with the operator to 1.4e-6, so parameters migrate unchanged between the
+two implementations.
+
+Three facts make Form A work:
+
+**(a) The divisor is `D · ⟨|W|²⟩`, not `⟨|W|²⟩`.** The incoming table is Form B
+and its `D = exp(ξ²Δ²k²)` already stands in for `1/|W|²`:
+
+```
+ge_A = kfac/|W|² = ge_B / (D · ⟨|W|²⟩)                              (3)
 ```
 
 Dividing by `⟨|W|²⟩` alone applies the deconvolution **twice**. Measured
-symptom: the reciprocal part of the energy came out 1.7× too large and the
-total energy changed sign (+102 eV instead of −23 eV). Diagnostic that found
-it: zero every mode; the energy must then equal the closed-form self term
-`−½·COEF·(Σa_m)·Σq²`, which is grid-independent (measured −204.16 eV at three
-different spacings, as it must be).
+symptom: the reciprocal energy came out 1.7× too large and the total energy
+changed sign. Diagnostic: zero every mode; the energy must then equal the
+closed-form self term `−½·COEF·(Σa_m)·Σq²`, which is grid-independent (it
+reproduces to all printed digits at every spacing).
 
-**(b) The average must be incoherent, `⟨|W|²⟩`, not `|⟨W⟩|²`.**
-The energy sums charges incoherently, so a single global deconvolution can only
-invert their average power spectrum. A coherent average cancels — it reached
-1e25 in a test. This is also why the closed-form `I_p(α) = ∫₀¹ t^p e^{iαt} dt`
-route is a dead end: integrating over the sub-cell position is exactly what
-produces `⟨W⟩`.
+**(b) The average must be incoherent, `⟨|W|²⟩`, not `|⟨W⟩|²`.** The energy sums
+charges incoherently, so one global deconvolution can only invert their average
+power spectrum. A coherent average cancels — it reached 1e25 in a test. This
+also rules out the closed-form `I_p(α) = ∫₀¹ t^p e^{iαt} dt` route: integrating
+over the sub-cell position is precisely what yields `⟨W⟩`.
 
-**(c) The window has near-zero modes, so the cut must be relative.**
-`⟨|W|²⟩ ≤ 1` by construction (it is the mean of a power spectrum of a unit
-charge), so the floor is inherently relative. Modes below it are dropped, not
-amplified, exactly as the B-spline path drops its Nyquist planes. An *absolute*
-floor lets the corner be amplified by ~1e8; measured symptom: the Form-A error
-*grew* from 6e-3 to 1.1 as the grid refined.
+**(c) The near-zero cut must be relative.** `⟨|W|²⟩ ≤ 1` by construction, so the
+floor is inherently relative. Modes below it are dropped rather than amplified,
+as the B-spline path drops its Nyquist planes. An absolute floor lets the corner
+be amplified by ~1e8; measured symptom: the Form-A error *grew* from 6e-3 to 1.1
+as the grid refined.
 
-### 1.4 How `C` may be obtained
+### 2.4 How `C` may be obtained — and why it is kernel-specific
 
-* **Not** from the midtown paper's `φ_max = Δ/rc` table. That table is
-  empirical: it was determined by requiring the discretisation error to fall
-  below the u-series' *intrinsic* error on representative biomolecular systems,
-  keeping the most conservative value. It is not a bound and cannot be turned
-  into a single `C_ν`. The mapping to our normalisation is
-  `Δ/σ_min = φ_max · (rc/σ)`, with `rc/σ = 1.9893` for the `b = 2`
-  parameterisation; CubeS₂-6 `φ_max = 0.35` therefore corresponds to
-  `Δ/σ_min = 0.696`.
-* **Derived** for `C_assign`: it is the `(2ν)`-th Taylor coefficient of the
-  window symbol, computable from the node table (the polynomial pieces are in
-  `source/op/pt/long_range/midtown/sog_spline.h`).
-* **Measured** in practice, per `(family, order, form, kernel, metric)`,
-  against a converged direct k-sum. That is what the tables below are.
+Not from the midtown paper's `φ_max = Δ/rc` table: that is empirical, defined by
+requiring the discretisation error to fall below the u-series' *intrinsic*
+error on representative biomolecular systems. It is not a bound and cannot be
+turned into a constant. The mapping to our normalisation is
+`Δ/σ_min = φ_max · (rc/σ)` (`rc/σ = 1.9893` for `b = 2`), so CubeS₂-6
+`φ_max = 0.35` is `Δ/σ_min = 0.696`.
 
-A coefficient quoted without its family, order, form, kernel and metric is not
-usable — `C(Form B)` itself varies 36 % across kernels (§3.4).
+`C_assign` is derivable in principle (the `(2ν)`-th Taylor coefficient of the
+symbol), but in practice both `C_assign` and `C_infl` are **measured** per
+`(family, order, form, kernel)`, against a converged direct k-sum. §4.4 shows
+why the kernel has to be in the key: two checkpoints of the same training
+differ by ~3.7× in the force constant.
 
 ---
 
-## 2. How the numbers were obtained
+## 3. Verification method
 
-### 2.1 Reference
+### 3.1 Reference
 
-Two independent references, both validated:
+`E = ½(1/V) Σ_k K|ρ̂|²`, `F_i = −(1/V) Σ_k K q_i k · Im[ρ̂* e^{−i k·r_i}]`,
+with `K` the same kernel the operator builds. Cross-checked three ways:
 
-1. **Direct k-sum, analytic force.** `E = ½(1/V) Σ_k K|ρ̂|²`,
-   `F_i = −(1/V) Σ_k K q_i k · Im[ρ̂* e^{−ik·r_i}]`. The force was checked
-   against a finite difference of the same energy (the apparent 13× discrepancy
-   when first run was a missing factor of `COUL`, not an error: 6.59e-2/14.4 =
-   4.58e-3).
-2. **Converged fine grid** of the operator itself. Both give the same forces
-   bit-for-bit, so the force error is not a reference floor.
+* the force against a finite difference of the same energy (an apparent 13×
+  discrepancy was a missing `COUL`, not an error: 6.59e-2/14.4 = 4.58e-3);
+* a converged fine grid of the operator gives the same forces bit-for-bit, so
+  the force error is not a reference floor;
+* `E = ½ Σ q_i φ_i` holds to machine precision.
 
-### 2.2 Self-consistency checks
+### 3.2 Self-consistency of the operator
 
-* `E = ½ Σ q_i φ_i` holds to machine precision on both references.
-* `max|F + dE/dx| / max|F| ≈ 2e-3` for every backend and order (the
-  finite-difference noise). **The operator's force is the gradient of its own
-  energy** — there is no spread/gather inconsistency, which rules out the
-  first hypothesis for the order-6 anomaly.
-* The operator's mesh builds the kernel the Python `SOGKernel` describes: an
-  independent direct k-sum agrees with the operator to 1.4e-6, so parameters
-  migrate unchanged between the two implementations.
+`max|F + dE/dx| / max|F| ≈ 2e-3` for every backend and order — the
+finite-difference noise. The operator's force **is** the gradient of its own
+energy, which rules out a spread/gather inconsistency as the cause of the
+order-6 behaviour.
+
+### 3.3 Force estimator: AD/weights versus ik
+
+Both production backends differentiate the **assignment weights**:
+
+* the B-spline path computes only the energy in
+  `deepmd/dpmodel/long_range/reciprocal.py::mesh_energy`; the coordinate force
+  is the autograd derivative through the B-spline weights and the interpolation
+  target;
+* the midtown gather differentiates the CubeS₂ weights analytically
+  (`cs2_wg6` in `source/op/pt/long_range/midtown/sog_gpu.cu`).
+
+So the backend comparison is on equal footing. The paper's own audit tool
+(`papers/sog-lib-paper/tools/mesh_validation.py`) instead uses
+**ik-differentiation** (`ifftn(i k · G · R)`), a third estimator; that is why it
+reports a larger Form-A force gain. ik-mode numbers are correct as ik-mode
+numbers and do not describe the production force. The `p_force` of Eq. (2) is a
+weight/AD-mode statement: in ik mode the force error tracks the potential error
+and the exponent would be `2ν`.
 
 ---
 
-## 3. Validation numbers
+## 4. Results — reference model `model.ckpt-150000.pt`
 
-### 3.1 Energy metric — the 4.8× was the deconvolution
+8 independent configurations, 64 atoms in a 12 Å cubic cell, RMS errors,
+`σ_min = 2.0 Å`. `Δ/σ` = 0.650, 0.550, 0.450, 0.375, 0.300, 0.250.
 
-Deployed operator, 64 charges, 12 Å, test kernel (`σ_min = 0.8 Å`), relative
-energy error against a converged direct k-sum:
+### 4.1 Order 4
 
-| Δ/σ_min | `bspline-4` | `midtown-4` Form B | `midtown-4` **Form A** |
-|---|---|---|---|
-| 0.625 | 6.18e-2 | 1.19e-1 | **1.80e-3** |
-| 0.500 | 2.02e-2 | 5.16e-2 | **4.85e-3** |
-| 0.417 | 1.03e-2 | 2.22e-2 | **2.88e-5** |
-| 0.375 | 5.27e-3 | 1.53e-2 | **8.02e-4** |
-| 0.312 | 2.61e-3 | 7.36e-3 | **4.41e-4** |
+| Δ/σ | E Form A | E Form B | energy gain | F Form A | F Form B | force gain |
+|---|---|---|---|---|---|---|
+| 0.650 | **4.07e-3** | 4.04e-2 | 10× | 2.47e-2 | 2.48e-2 | 1.01× |
+| 0.550 | **2.72e-4** | 1.74e-2 | 64× | 9.75e-3 | 1.06e-2 | 1.09× |
+| 0.450 | **3.46e-4** | 7.07e-3 | 20× | 5.49e-3 | 5.59e-3 | 1.02× |
+| 0.375 | **1.72e-4** | 5.47e-3 | 32× | 4.59e-3 | 4.77e-3 | 1.04× |
+| 0.300 | **7.64e-5** | 2.26e-3 | 30× | 2.22e-3 | 2.29e-3 | 1.03× |
+| 0.250 | **5.67e-5** | 1.08e-3 | 19× | 1.35e-3 | 1.38e-3 | 1.02× |
 
-Fitted `C` at `p = 4`: `C(Form B) = 0.77`, `C(bspline-4) = 0.27`, both stable to
-a few percent. Form A is **11–770× better than Form B** and better than the
-B-spline at the same grid.
+Fitted slopes 3.8 (A) / 3.6 (B) in energy, 2.8 / 2.8 in force.
 
-Form A does **not** yield a usable constant from this estimator: dividing its
-column by `(Δ/σ)^4` scatters by 82× with no trend, because what remains is at
-the resolution of the audit (64 atoms, one configuration, 8³ sub-cell samples,
-grid-quantised spacings producing accidental cancellations).
+### 4.2 Order 6
 
-### 3.2 Force metric — the C⁰ law
+| Δ/σ | E Form A | E Form B | energy gain | F Form A | F Form B | force gain |
+|---|---|---|---|---|---|---|
+| 0.650 | 1.15e-3 | 1.20e-3 | 1.05× | 5.98e-3 | 6.02e-3 | 1.01× |
+| 0.550 | 2.10e-4 | 2.29e-4 | 1.09× | 1.95e-3 | 1.96e-3 | 1.00× |
+| 0.450 | 1.17e-4 | 1.21e-4 | 1.03× | 6.19e-4 | 6.22e-4 | 1.00× |
+| 0.375 | 1.91e-5 | 1.77e-5 | 0.93× | 4.26e-4 | 4.28e-4 | 1.01× |
+| 0.300 | 9.30e-6 | 9.21e-6 | 0.99× | 1.41e-4 | 1.41e-4 | 1.00× |
+| 0.250 | 2.28e-6 | 1.81e-6 | 0.79× | 5.69e-5 | 5.70e-5 | 1.00× |
 
-Trained water kernel from `/data/home/public/jiangzhen/dp/master-merge-test/water/model.ckpt-200000.pt`
-(12 bands, `σ_min = 1.134 Å`), analytic direct k-sum force, 64 atoms, 12 Å:
+Fitted slopes 6.2 (A) / 6.5 (B) in energy, **4.6 / 4.7 in force** — the `C⁰`
+prediction of Eq. (2).
 
-| family | measured slope | fitted `C` | spread |
-|---|---|---|---|
-| `bspline-4` | **3.5** | `C(p=4) = 0.18` | 0.79–1.24 |
-| `bspline-6` | **6.3** | `C(p=6) = 0.033` | 0.95–1.43 |
-| `midtown-4` Form B | **3.2** | `C(p=4) = 0.26` | 0.85–2.33 |
-| **`midtown-6` Form B** | **5.3** | **`C(p=5) = 0.098`** | 0.79–1.09 |
-| `midtown-4/6` Form A | same as Form B | — | — |
+### 4.3 What Form A buys, and what it does not
 
-The two `midtown-6` fits (coarse band and the finer 0.265→0.176 band) give 5.29
-and 5.36 — a robust `p = 5`. The B-spline keeps `p = 6`, as `C⁴` continuity
-predicts.
-
-### 3.3 Form A's benefit is metric-dependent
-
-| metric | order 4 | order 6 |
+| | order 4 | order 6 |
 |---|---|---|
-| energy | **11–770×** | ~1× |
-| force | **2.5–5×** | ~1.1× |
+| energy | **10–64×** | 0.79–1.09× (a wash) |
+| force | **1.00–1.05×** | 1.00–1.01× |
 
-The force column is the paper's own audit tool (`cubeA`, 8³ sub-cell samples,
-four kernels); the deployed operator on the trained kernel shows essentially
-**no** force-metric difference. The energy and force weight the influence
-residual differently, so a gain quoted without its metric is not usable.
-**This is why the constants table uses the force metric**: it is the canonical
-one, and it is the conservative one.
+Form A fixes the **energy**, not the force. That is the `C⁰` story again: the
+force is limited by the discontinuity of the window derivative, which no
+influence function can remove. At order 6 `C_infl` is only ~5e-3, so exact
+inversion changes nothing this audit can resolve. The fitted force constants are
+Form-A-invariant to within ~4% (`6.46e-2` vs `6.76e-2` at order 4, `3.52e-2` vs
+`3.55e-2` at order 6), so the code defaults Form A **on at both orders**: order 6
+pays a one-time `nth³`-transform cost for a strictly non-negative energy change
+and no force regression, and a single default is simpler than two.
 
-### 3.4 The constants depend on the kernel
+### 4.4 The constant is kernel-specific
 
-Energy metric, Form B, order 4, same Δ/σ band:
+Force constants (the force is Form-A-invariant, §4.3, so the form label is
+immaterial), for the two checkpoints of one training run:
 
-| kernel | `C` |
-|---|---|
-| 3-band (σ_min 0.8) | **0.78** |
-| single band (σ 1.2) | **1.06** |
+Constants evaluated **at the exponents the code ships** (`p = 3` at order 4,
+`p = 5` at order 6), so they are directly comparable with §5.1:
 
-A 36 % spread — the same order as the "~40 % across kernels" the SOG library
-paper reports. Under Form A the spread largely disappears, i.e. the kernel
-sensitivity lived in the deconvolution residual.
+| kernel | `σ_min` | `C_force` order 4 (`p=3`) | `C_force` order 6 (`p=5`) | measured slope, order 6 |
+|---|---|---|---|---|
+| `ckpt-200000` | 1.134 Å | 0.166 | 0.124 | 5.2 |
+| `ckpt-150000` | 2.00 Å | 0.076 | 0.049 | 4.6 |
 
-### 3.5 The production chain
+A factor ~2.2 at order 4 and ~2.5 at order 6, at fixed
+`(family, order, form, metric)`. (The `ckpt-150000` row is the definitive
+re-measurement of §4.6, which pins the shipped exponent and fits `C`; evaluated
+at the free exponent instead it gives `6.46e-2` at `p = 2.82` and `3.52e-2` at
+`p = 4.64` — the constant and the exponent are not separable, which is why both
+are tabulated together.) The **shape** of the rule — order dependence, and
+`p_force = 2ν − 1` for the `C⁰` window — survives; the **constant does not
+transfer**. Any table of these constants must carry the kernel, and a caller
+with a different kernel should re-derive it.
 
-DPA4C-SOG LAMMPS chain (`kspace_style sog` + `fix sog/response`), 192 atoms,
-12.4 Å:
+The constants shipped in the code (§5.1) are the **larger** of the two, i.e. the
+conservative choice: they under-resolve a wide kernel by ~30 % in spacing rather
+than over-resolve a narrow one.
 
-| | grid | E(step 0) | P(step 0) |
-|---|---|---|---|
-| before the constant fix | 27³ | — | — |
-| after (`C = 2.6e-1, p = 4`) | **41³** | −30008.093 | 16414.4 |
-| + Form A (`SOG_FORM_A=1`, order 4 path) | 41³ | −30008.093 | 16414.386 |
+### 4.5 What the older 4.8× figure was
 
-The grid moves because the old `C_4 = 1.0e-1` under-resolved by ~2× in points
-per axis. The discriminating Form-A measurement is at a coarse grid, where the
-variance subtraction still matters: at 9³ (forced with `phi_accuracy 0.02`) Form
-A moves the energy by +0.009 eV and the pressure by −15 bar at order 6. At 41³
-the two forms are within the print precision, as they should be.
+On the earlier `ckpt-200000` kernel the energy error at order 4 was 4.65e-1
+(Form B) against 1.87e-2 (Form A) at `Δ/σ = 0.706` — 25× — and against a
+B-spline at the same grid the ordering inverted. The published 4.8× and the
+"within a factor ~2" of the same document were both this residual, measured
+with different functionals on different grids.
+
+### 4.6 The B-spline comparison (force baseline, Form A default)
+
+The definitive re-measurement of §4.1–4.3 (same 8 configurations, same kernel,
+same grids) with the B-spline backend added, `SOG_MIDTOWN_FORM_A` default on at
+both orders. Fitted exponents and constants, all backends:
+
+| backend | order | `p_E` | `C_E` | `p_F` | `C_F` |
+|---|---|---|---|---|---|
+| midtown Form A | 4 | 3.77 | 7.64e-3 | 2.82 | 6.46e-2 |
+| midtown Form A | 6 | 6.21 | 1.27e-2 | **4.64** | 3.52e-2 |
+| midtown Form B | 4 | 3.61 | 1.64e-1 | 2.83 | 6.76e-2 |
+| midtown Form B | 6 | 6.47 | 1.56e-2 | **4.65** | 3.55e-2 |
+| bspline | 4 | 3.87 | 9.38e-2 | 3.06 | 4.52e-2 |
+| bspline | 6 | 6.01 | 1.72e-2 | **5.46** | 1.13e-2 |
+
+Two readings:
+
+* **The force exponent is `2ν − 1 = 5`, not 6.** The order-6 midtown force fits
+  `p_F = 4.64` (Form A) / `4.65` (Form B) — one full order below the energy's
+  `6.21`/`6.47`. Order 4 fits `2.82`/`2.83` against energy `3.77`/`3.61`. This is
+  the weight-differentiated force of a non-smooth window (§2.2), and it is why
+  the shipped order-6 exponent is `5`, not `6`.
+* **Form A leaves the force untouched.** The force fits agree to ~4% across forms
+  (`C_F` 6.46e-2 vs 6.76e-2, 3.52e-2 vs 3.55e-2), while the energy moves by ~21×
+  at order 4. The force-based grid rule (§5.1) is therefore unchanged by the
+  Form-A default flip.
+
+The same-mesh force comparison (midtown Form A against the B-spline):
+
+| Δ/σ | order 4 midtown | order 4 bspline | ratio | order 6 midtown | order 6 bspline | ratio |
+|---|---|---|---|---|---|---|
+| 0.650 | 2.470e-2 | 1.342e-2 | 1.84× | 5.978e-3 | 1.279e-3 | 4.67× |
+| 0.550 | 9.745e-3 | 6.398e-3 | 1.52× | 1.950e-3 | 3.535e-4 | 5.52× |
+| 0.450 | 5.485e-3 | 3.720e-3 | 1.47× | 6.193e-4 | 1.313e-4 | 4.72× |
+| 0.375 | 4.591e-3 | 2.383e-3 | 1.93× | 4.260e-4 | 5.856e-5 | 7.27× |
+| 0.300 | 2.222e-3 | 1.134e-3 | 1.96× | 1.409e-4 | 1.583e-5 | 8.90× |
+| 0.250 | 1.349e-3 | 6.465e-4 | 2.09× | 5.686e-5 | 5.826e-6 | 9.76× |
+
+Geometric mean **1.80×** (order 4) and **6.81×** (order 6), growing toward fine
+grids (2.09× / 9.76×) as the asymptotic regime is entered. The B-spline wins on
+force purely because it is smoother: it keeps `p_F ≈ order` (5.46 / 3.06) while
+CubeS₂ drops to `2ν − 1` (4.64 / 2.82). Form A has already removed `C_infl`, so
+the gap is the window's non-smoothness and cannot be closed by any influence
+function.
+
+The *energy* comparison is the mirror image: on the same grids the B-spline
+order-6 energy is a wash against midtown Form A (fitted `C_E` 1.72e-2 vs
+1.27e-2, both `p ≈ 6`), and at order 4 the B-spline is ~12× **worse** (fitted
+`C_E` 9.38e-2 vs 7.64e-3) — exact deconvolution makes CubeS₂ energy exceed the
+B-spline's at order 4. The force gap is the price of the CubeS₂ window's
+non-smoothness; it does not indicate a deconvolution defect.
 
 ---
 
-## 4. Code changes
+## 5. Code
 
-### 4.1 Operator (deepmd-kit-LR-lr-pt)
+### 5.1 Grid rule (new, live)
+
+`deepmd/dpmodel/long_range/grid_rule.py` — the measured law of Eq. (1) and (2):
+
+```
+FORCE_RULE[(backend, order)] = (C, p, provenance)
+  bspline 4 : 0.117, p = 3.5 (measured)     bspline 7 : 0.020, p = 7 (extrap.)
+  bspline 5 : 0.062, p = 4.5 (interpolated) bspline 8 : 0.012, p = 8 (extrap.)
+  bspline 6 : 0.033, p = 6.0 (measured)
+  midtown 4 : 0.166, p = 3 (measured)       midtown 6 : 0.124, p = 5 (measured)
+spacing = min(σ_min·(ε/C)^{1/p},  0.75 π/k_max)
+```
+
+`C` is the larger of the two audited kernels and `p` is the measured slope
+rounded **down**, so the rule can only over-resolve. `p` is taken from the
+measurement rather than from `2ν` because both CubeS₂ orders come out about one
+order low in the force (2.82 at order 4, 4.64 at order 6), while the B-spline
+keeps `p ≈ order`. The constants are force-based and Form-A-invariant (§4.6), so
+the Form-A default flip did not move them.
+
+Wired into `deepmd/dpmodel/long_range/latent_charge.py`:
+
+* `mesh_spacing()` solves the law instead of returning `0.75 π / k_max`;
+* `effective_order()` — the midtown mesh has a CubeS₂ stencil of order 4 or 6
+  only, so any other configured `pme_order` (including the 8 default) means 6.
+  Both the spacing and the operator call go through it, which closes the trap
+  where the grid was sized for a stencil the mesh does not evaluate;
+* `pme_accuracy` (new field, default `None` → `1e-4`) sets the target; added to
+  the schema in `deepmd/utils/argcheck.py`;
+* the **B-spline order is now meaningful in both directions**: `C(order)` and
+  `p(order)` make a low order refine the grid — on the reference kernel the
+  B-spline at order 4 goes from 0.44 Å to 0.24 Å (513³), midtown order 4 to
+  0.16 Å (766³) — and a high order coarsen it: B-spline order 8 takes 1.065 Å
+  (115³) at the same `1e-4` target;
+* the legacy `0.75 π/k_max` is **not** retained as a ceiling. The law is
+  measured at the target spacings themselves, so the window's aliasing above
+  `k_max` is already in `C`; adding the Nyquist cap back would neutralise
+  exactly the high-order gain it was meant to protect. The consequence is a
+  deliberate break: the default B-spline (order 8) grid is ~1.4× coarser than
+  before, so results change with the model. `pme_spacing` pins the old grid
+  explicitly, and `C(8)` is an extrapolation (orders 4 and 6 were measured).
+
+### 5.2 Form A (new, default on at both orders)
 
 | file | change |
 |---|---|
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/source/op/pt/long_range/midtown/sog_gpu.cu` | `sog_gpu_green_form_a()`, `k_acc_spec_abs2`, `k_gp_divide_form_a`; lazy `f_rho`/`f_pot` (saves 16 B/grid point = 27 % of the mesh set); `free_grid_buffers` now releases the fp32 set and the fp32 plans; padding-lane out-of-bounds write fixed in `k_spread_cubes2_warp_fx_packed`; `k_kspace_h` Hermitian weight for odd `nx` |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/source/op/pt/long_range/midtown/sog_gpu.cuh` | declarations for the above |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/source/op/pt/long_range/midtown/sog_green.h` | `grid_axis` constants: CubeS₂ `C = 2.6e-1 / p = 4` (order 4), `C = 9.8e-2 / p = 5` (order 6) |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/source/op/pt/long_range/midtown_sum.cu` | Form A call site (`SOG_MIDTOWN_FORM_A`, value-parsed); `form` recorded in `MidtownState` and in all three cache keys; loud refusal of Form A on the local-spread and slab paths; `nth` clamped to ≥1; z-subdomain guard moved to the device and evaluated once; device-side `np==1` halo folds; `ZL >= gh` guard |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/docs/LONG_RANGE_PORT.md` | accuracy section rewritten (two-term model, Form A, the C⁰ law, the metric warning); the two contradictory tables reconciled |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/docs/MESH_ERROR_MODEL_AND_FORM_A.md` | this document |
+| `source/op/pt/long_range/midtown/sog_gpu.cu` | `sog_gpu_green_form_a()`, `k_acc_spec_abs2`, `k_gp_divide_form_a`; the divisor is `D·⟨|W|²⟩`; the θ average is incoherent and the floor relative |
+| `source/op/pt/long_range/midtown/sog_gpu.cuh` | declarations |
+| `source/op/pt/long_range/midtown_sum.cu` | call site; `SOG_MIDTOWN_FORM_A` value-parsed, **unset = on at both orders** (`=0` disables); `form` recorded in `MidtownState` and in every cache key; loud refusal on the local-spread and slab paths; `nth` clamped ≥ 1 |
 
-### 4.2 SOG library (two copies, must stay identical)
+Cost: `nth³` transforms once per box (default `nth = 8`; ~26 ms at 98³,
+cached by `box_tol`). Override with `SOG_MIDTOWN_FORM_A_NTH` /
+`SOG_MIDTOWN_FORM_A_FLOOR`.
 
-| file | change |
-|---|---|
-| `/data/home/public/jiangzhen/sog/lmp/sog.cpp` | `apply_form_a_green()` (host stencil via `LAMMPS_NS::cubes2_weight_4/6`, cuFFT via LAMMPS `FFT3d`, relative floor); grid constants updated; new **B-spline branch that reads `bspline_order`** (previously every order used the CubeS₂ order-4 constants); QuadS branch deliberately left alone |
-| `/data/home/public/jiangzhen/sog/lmp/sog.h` | declaration |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR/source/lmp/sog.cpp` | same changes (this is the copy the deployed plugin builds) |
-| `/data/home/public/jiangzhen/dp/deepmd-kit-LR/source/lmp/sog.h` | declaration |
+### 5.3 SOG library (`sog.cpp`, two copies kept identical)
 
-Flags: `SOG_FORM_A` (value-parsed), `SOG_FORM_A_NTH` (default 3 on the CPU path),
-`SOG_FORM_A_FLOOR` (default 1e-4).
+`/data/home/public/jiangzhen/sog/lmp/sog.cpp` and
+`/data/home/public/jiangzhen/dp/deepmd-kit-LR/source/lmp/sog.cpp`:
+`apply_form_a_green()` behind `SOG_FORM_A`, **default on** (value-parsed, `=0`
+disables); the grid constants updated to `C = 0.166 / p = 3` and `C = 0.124 / p = 5`;
+a new **B-spline branch that reads `bspline_order`** (previously every order used
+the CubeS₂ order-4 constants); QuadS left alone because it was never force-audited.
 
-### 4.3 Paper (`/data/home/public/jiangzhen/papers/sog-lib-paper`)
+### 5.4 Paper
 
-| file | change |
-|---|---|
-| `sections/04-general-kernel.tex` | §4.3 rewritten: Eqs. (1)–(3) above, a new `eq:force-order`, `eq:phimax-rule` uses `p`; the `φ_max ↔ Δ/σ_min` mapping and the worked inconsistency |
-| `sections/06-results.tex` | `tab:spline-slopes` and `tab:phimax` captions now say "Form B effective coefficient"; the figure caption no longer calls CubeS₂ Form A ill-conditioned; the order-4 gain is stated per metric |
-| `sections/03-mesh-method.tex` | "direct division unsuitable" replaced by "needs a relative near-zero cut", with the measured effect |
-| `sections/08-appendix.tex` | Form A is usable with CubeS₂; the divisor is `D·⟨|W|²⟩` |
-| `sections/00-abstract.tex`, `sections/07-conclusion.tex` | the influence-function axis and the C⁰ force order added |
-| `tools/mesh_validation.py` | `cubeA` method added (previously any non-QuadS `*A` silently used the B-spline sinc window, measuring the wrong thing); `nth = 8` |
-
-Build: `cd /data/home/public/jiangzhen/papers/sog-lib-paper && pdflatex main.tex`
-→ 37→38 pages, no errors, no undefined references.
-
-### 4.4 Audit tooling (scratch, not in the repo)
-
-| file | purpose |
-|---|---|
-| `/tmp/lr_md/op_audit.py` | deployed-operator audit: realized grid, energy and force relative error, `--direct` for the analytic direct k-sum reference. **Caveat:** its direct energy reference does not include the closed-form self term `−½·COEF·(Σa_m)·Σq²`; forces are unaffected |
-| `/tmp/lr_md/mesh_audit2.py` | independent Python reference (B-spline and CubeS₂, Form B and exact symbol) |
-| `/tmp/lr_md/symbol_analytic.py` | proves the closed-form route yields `⟨W⟩`, not `⟨|W|²⟩` |
-| `/tmp/lr_md/fd_check.py` | force vs `−dE/dx` consistency |
-| `/tmp/lr_md/sweep_backends.py` | size ladder / timing (see `LONG_RANGE_PORT.md` §6) |
-
-### 4.5 Verification
-
-* `pytest source/tests/common/dpmodel/test_long_range.py source/tests/pt/model/test_sezm_long_range.py` → **83 passed** (61 + 22), Form A off by default.
-* `/data/home/public/jiangzhen/sog/lmp/build` and `/tmp/dplmp` (the deployed plugin) both build.
-* `SOG_MIDTOWN_FORM_A=0` → Form B (1.19e-1), `=1` → Form A (1.80e-3), at Δ/σ = 0.625.
-* Slab path with Form A set → explicit `RuntimeError`; slab alone → `E = 0.7243632187771221`, the previously validated value.
+`papers/sog-lib-paper`: §4.3 rewritten to Eqs. (1)–(3) plus `eq:force-order`;
+`tab:spline-slopes` and `tab:phimax` captions relabelled as Form-B effective
+coefficients; `03-mesh-method` and `08-appendix` no longer call Form A
+unsuitable for CubeS₂; abstract and conclusion carry the influence-function
+axis; `tools/mesh_validation.py` gained a `cubeA` method (any non-QuadS `*A`
+previously fell through to the B-spline sinc window).
 
 ---
 
----
+## 6. Open
 
-## 5. Known limitations
-
-1. **Form A is replicated-path only.** The local-spread (`SOG_MIDTOWN_DIST`) and
-   slab (`SOG_MIDTOWN_SLAB`) paths refuse it loudly rather than silently
-   running Form B. Tilted cells (`build_green_metric`) are excluded by the same
-   guard.
-2. **`pme_order` defaults to 8 and is coerced to 6** under the midtown backend
-   (`deepmd/pt_expt/long_range/latent_charge.py`); only `pme_order: 4` selects
-   order 4. A constants table keyed on the *config* value would size for the
-   wrong stencil.
-3. **QuadS was never force-audited.** Its `C = 2e-4` is a self-described upper
-   bound, so its exponent was left at `2ν` even though QuadS order 6 is also
-   `C⁰`.
-4. **Three hand-maintained copies of the grid rule** (`sog_green.h` in two
-   trees, `sog.cpp` in two trees) — there is no lockstep test.
-5. **`cubeA` is unstable on a few grids**: the CubeS₂ window has exact spectral
-   zeros, the relative floor drops different mode sets at different grids, and
-   the ratio to Form B jumps (one grid gave 0.6× instead of 3–5×). A finer
-   sub-cell average, or a smarter truncation, would fix it.
-6. The `C` values above are for **one trained kernel and one 64-atom
-   configuration**. The paper's canonical panel is 192 atoms over an ensemble;
-   the constants in the code should be re-derived on that panel before they are
-   treated as kernel-independent.
+1. **Form A is replicated-path only.** Local spread and slab refuse it loudly.
+   Tilted cells (`build_green_metric`) are excluded by the same guard.
+2. **Constants are kernel-specific (§4.4)** and the shipped values are the
+   conservative ones; a kernel much wider than the audited pair would be
+   under-resolved by the accuracy target, and there is no Nyquist ceiling left
+   to catch it — only the `pme_spacing` override.
+3. `C(7)`, `C(8)` are extrapolated; only orders 4 and 6 were measured.
+4. **QuadS was never force-audited**; its `C = 2e-4` is a self-described upper
+   bound, so its exponent stays `2ν` even though QuadS order 6 is also `C⁰`.
+5. Three hand-maintained copies of the grid rule (`sog_green.h` in two trees,
+   `sog.cpp` in two trees), with no lockstep test.
+6. `cubeA` in the paper tool is unstable on a few grids: the CubeS₂ window has
+   exact spectral zeros and the relative floor drops different mode sets at
+   different grids.
+7. **CubeS₂ force stays ~2–7× behind the B-spline at equal grid (§4.6).** This
+   is the window's smoothness, not the deconvolution; closing it needs a smoother
+   CubeS₂ (a `C¹⁺` ξ class) or ik-differentiation, not a better influence
+   function.
 
 ---
 
-## 6. Reproducing
+## 7. Reproducing
 
 ```bash
 # operator
@@ -335,80 +437,14 @@ cd /data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt/build-pt-mpi-gcc
 OMPI_CXX=/opt/rh/gcc-toolset-13/root/usr/bin/c++ make deepmd_op_pt -j8
 cp op/pt/libdeepmd_op_pt.so ../deepmd/lib/
 
-# audit (energy + force, deployed operator, direct k-sum reference)
-export KA=... KW=... SIGMIN=1.133775812      # trained kernel, see §3.2
-python /tmp/lr_md/op_audit.py --direct --order 4,6 --backends bspline,midtown \
-    --spacings 0.8,0.65,0.55,0.45,0.38,0.30
+# grid rule, at the reference kernel
+PYTHONPATH=.. python -c "from deepmd.dpmodel.long_range import grid_rule as g; \
+  print([ (b,o,g.rule(b,o),g.spacing(b,o,2.0,5.35)) for b,o in \
+  [('bspline',4),('bspline',8),('midtown',4),('midtown',6)] ])"
 
-# Form A vs Form B
-SOG_MIDTOWN_FORM_A=1 python /tmp/lr_md/op_audit.py --order 4 --backends midtown ...
-
-# the paper's own audit, now with cubeA
-cd /data/home/public/jiangzhen/papers/sog-lib-paper
-python tools/mesh_validation.py --output /tmp/mesh_val.json
+# ensemble audit (all three backends, force baseline — the numbers of §4.6)
+export KA=... KW=...     # kernel of model.ckpt-150000.pt, see §4
+python /tmp/lr_md/forma_v2.py --configs 8 --orders 4,6 \
+    --spacings 1.3,1.1,0.9,0.75,0.6,0.5 --backends midtown_A,midtown_B,bspline
+python /tmp/lr_md/forma_crosscheck.py
 ```
-
-## 7. Form A at order 4: complete results, and why the error "jumps"
-
-### 7.1 The jump is not a bug
-
-Earlier single-configuration runs showed a non-monotonic Form-A error: at
-`Delta/sigma = 0.625, 0.500, 0.417, 0.375, 0.312` the energy error read
-`1.80e-3, 4.85e-3, 2.88e-5, 8.02e-4, 4.41e-4` -- a 28x improvement followed by
-a 28x regression on a finer grid. Three independent checks rule out a defect:
-
-| check | result |
-|---|---|
-| math | `⟨\|W\|²⟩` is the least-squares-optimal *single* global deconvolution for the ensemble; any single configuration deviates from it, and that deviation cannot vanish with `Delta` |
-| parameters | `xi` matches the paper tool exactly; `D` matches `build_green_range` term for term; the `f_gp`/accumulator index pair was checked on a non-cubic `k²` set; the operator kernel equals the Python kernel to 1.4e-6 |
-| implementation | the *change* introduced by Form A, `E_A - E_B`, agrees between the operator and an independent Python build to **1.6 %** (0.0859 vs 0.0873 eV); the absolute offset between the two is a constant 4.84 eV that affects both forms identically, i.e. it is in the scratch script's normalisation, not in the operator. `max\|F + dE/dx\|/max\|F\| ≈ 2e-3` for every backend and order |
-| the same wobble appears in the independent Python implementation (`/tmp/lr_md/mesh_audit2.py`) |
-
-**Cause: per-configuration fluctuation plus a phase in the residual.** The
-operator uses one influence function, `⟨|W|²⟩`, but each configuration has its
-own window mixture; dividing by the average leaves a configuration-specific
-residual that is a fixed fraction of the kernel weight and does not vanish with
-`Delta`. On top of that the residual itself oscillates in `Delta` (its
-coefficient is not positive-definite).
-
-### 7.2 Order-4 results over an 8-configuration ensemble
-
-Trained water kernel (`sigma_min = 1.134 Å`), 64 atoms, 12 Å, RMS over 8
-independent configurations, analytic direct k-sum reference, operator with
-`SOG_MIDTOWN_FORM_A`:
-
-| `Delta/sigma` | E Form A | E Form B | gain | F Form A | F Form B | gain |
-|---|---|---|---|---|---|---|
-| 0.706 | **1.87e-2** | 4.65e-1 | 25x | 8.15e-2 | 7.84e-2 | 0.96x |
-| 0.573 | **3.94e-3** | 1.42e-1 | 36x | 3.00e-2 | 2.98e-2 | 0.99x |
-| 0.485 | **1.66e-3** | 6.74e-2 | 41x | 1.77e-2 | 1.77e-2 | 1.00x |
-| 0.397 | **1.62e-3** | 4.03e-2 | 25x | 1.19e-2 | 1.18e-2 | 0.99x |
-| 0.335 | **2.61e-4** | 2.04e-2 | 78x | 5.60e-3 | 5.64e-3 | 1.01x |
-| 0.265 | **4.66e-4** | 8.51e-3 | 18x | 3.20e-3 | 3.21e-3 | 1.00x |
-
-* **Energy: Form A is 18-78x better**, the ensemble-averaged counterpart of the
-  11-770x seen on single configurations. Envelope slope ~3.75 in `Delta`; the
-  conservative constant over the band is `C_E(Form A) ≈ 0.095`, against
-  `C_E(Form B) ≈ 1.7` for this kernel.
-* **Force: no benefit at all** (ratios 0.96-1.01), and this is now explained.
-
-### 7.3 Why Form A helps the energy and not the force
-
-The two metrics evaluate the interpolation differently:
-
-* the **paper's audit tool** differentiates in `k` (ik-differentiation, the same
-  weights for spread and gather), so the force error tracks the potential
-  error and Form A shows its 2.5-5x;
-* the **deployed operator** differentiates the CubeS2 **weights**
-  (`cs2_wg6` in `sog_gpu.cu`), which needs `dS/dtheta`.
-
-CubeS2 order 6 is `C⁰` (midtown Table I), so its weight derivative is
-discontinuous and the force error carries a term that **no influence function
-can remove** -- hence `p = 2nu - 1` for the force (Eq. 2 above) and hence the
-flat response to Form A. Order 4 is `C²`, so its force exponent is the full 4,
-and there the weight-differentiated force does improve, just far less than the
-energy does.
-
-This is the honest summary: **Form A fixes the energy; it does not fix the
-CubeS2 force.** Making the force track the energy would need a smoother window
-(an `xi` in a `C¹`+ continuity class) or ik-differentiation in the gather.
