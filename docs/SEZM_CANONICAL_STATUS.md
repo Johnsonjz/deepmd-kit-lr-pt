@@ -46,61 +46,32 @@ exchange, so a frame decomposed over ranks reproduces the single-domain run.
 `|F|rms` of the frame is 1.404 eV/Å, so the force agreement is at the
 single-precision floor — the same 1e-5 the DPA4C control shows.
 
-Throughput (30 NVT steps, `timestep 0.0005`, one GPU per rank):
+Throughput (30 NVT steps, `timestep 0.0005`, one GPU per rank, 12 288 atoms):
 
-| system | np = 1 | np = 2 | speed-up |
+| stage | np = 1 | np = 2 | np = 4 |
 |---|---|---|---|
-| 1 536 atoms | 15.8 steps/s | 14.2 steps/s | 0.90× |
-| 12 288 atoms | 1.97 steps/s | 2.64 steps/s | **1.34×** |
+| canonical artifacts first working | 1.97 steps/s | 2.64 | 4.23 |
+| + accelerator kernels (default) | 1.97 | 2.69 | 4.40 |
+| + pinned border staging | **2.17** | **3.41** | **4.93** |
 
-Where the time actually goes: an eager step at 1536 atoms takes 0.080 s and
-the compiled canonical artifact 0.063 s, while **DPA4C needs 0.078 s at 12288
-atoms** — the SeZM descriptor costs roughly eight times more per atom. That gap
-does not move with the kernel level, so it is the generic graph-lower autograd
-adapter, not a missing fast kernel; a fused SeZM operator (the B-lineage route)
-is the lever that would close it. The exchange and the replicated mesh are
-costs stacked on top of that baseline.
+The border exchange was the one multi-rank cost DPA4 pays and DPA4C does not.
+It is gone: at two ranks the step costs 8.80 s against the 8.75 s of an
+artifact that performs no exchange at all. It was never the bytes — a
+row-only staging that moved 5–10× fewer bytes bought nothing; the pageable
+host buffer was forcing a slow, synchronizing round trip four times per step.
 
-Small systems lose, large ones gain: the reciprocal-space mesh is **replicated
-per rank**, so a decomposition splits the pair and descriptor work but not the
-long-range solve, and adds the border exchange on top. Scaling past that needs
-the distributed mesh the B-lineage validates (`SOG_MIDTOWN_DIST` / z-slab),
-not more ranks. Energy and temperature agree between ranks at both sizes
-(12 288: −1916597.6 eV both, pressure −2076.0414 vs −2076.0477 atm).
+Where the remaining time goes: an eager step at 1536 atoms takes 0.080 s and
+the compiled canonical artifact 0.063 s, while **DPA4C needs 0.078 s at
+12288 atoms**. The SeZM descriptor costs several times more per atom and that
+gap does not move with the kernel level — it is the message-passing stack
+itself, not a missing fast kernel. Closing it needs a fused SeZM operator
+(the B-lineage route), which is a project of its own.
 
-### What it took
+The reciprocal-space mesh is **not** worth distributing: on the DPA4C model at
+12 288 atoms the whole long-range term costs 1.9 ms/step (2.5 % of the pair
+time; 4.6 % at two ranks), and on SeZM it is below the noise of the run.
 
-A message-passing descriptor refreshes its ghost features between blocks
-through `deepmd_export::border_op`; a rank cannot compute a ghost's feature
-locally, because LAMMPS never makes a ghost a neighbour-list centre. Widening
-the ghost region (a 13 Å neighbour list with `comm_modify cutoff 13.5`) changes
-nothing, which rules that route out for good.
-
-* **Freeze** — `if canonical:` now honours `with_comm_dict`:
-  `forward_lower_canonical_graph_exportable_with_comm` traces the compact ABI
-  with the eight comm tensors after it, one frame at a time (the exchange is
-  per frame and its frame axis is static). A model with a long-range module
-  keeps the positions, **its own** communicator and the cells between the two
-  groups. `_needs_canonical_with_comm` drives `has_comm_artifact` and
-  `canonical_single_rank_only`.
-* **C++** — `DeepPotPTExpt::compute` no longer hands a compact canonical
-  artifact to the generic with-comm chain (which fed it the dense input list);
-  the canonical branch builds the payload with
-  `build_comm_tensors_positional` and calls
-  `run_model_canonical_graph_with_comm`. The long-range module gets the
-  caller's `world` handle rather than the payload's communicator, which is not
-  always populated here (that mismatch segfaulted in `MPI_Comm_size`).
-* **Kernels** — the reference-kernel pinning of the family is gone:
-  a `DP_TRITON_INFER=2` canonical trace is faithful (parity 1.0e-7 eV/atom,
-  1.7e-5 eV/Å) and LAMMPS gives −29946.758 eV at np = 1 and np = 2 alike. It
-  bought only 2–4 % of the step time, so it stays behind
-  `DP_SEZM_CANONICAL_REFERENCE_KERNELS=1` as a bisection aid.
-* **Capability** — `DPAtomicModel.supports_edge_parallel()` now keeps the
-  descriptor's answer instead of turning False for every model carrying a
-  module, as the pt backend already did; `BaseLongRange.supports_multi_rank()`
-  says whether the module can follow a decomposed frame.
-
-### Known limitation
+## Known limitation
 
 A rank that owns no atom still takes the empty-subdomain early return and never
 joins the artefact's collectives, so a decomposition that empties a rank would
