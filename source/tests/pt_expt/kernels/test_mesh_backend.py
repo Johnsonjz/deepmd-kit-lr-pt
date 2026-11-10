@@ -290,20 +290,21 @@ def test_unknown_force_mode_is_rejected() -> None:
         )
 
 
-@pytest.mark.parametrize("mesh_backend", ["midtown", "quads"])
+@pytest.mark.parametrize("mesh_backend", ["midtown", "quads", "bspline"])
 @pytest.mark.parametrize("order", [4, 6])
 def test_slab_solve_matches_replicated(monkeypatch, mesh_backend, order) -> None:
     """The z-slab distributed solve reproduces the replicated solve in every
     spline mode.
 
-    The slab backend carries the CubeS2 and QuadS stencils of orders 4 and 6.
+    The slab backend carries the CubeS2, QuadS and cardinal-B-spline stencils.
     At a single rank it skips NCCL (the two all-to-alls are the identity), so
     this exercises the spline-specific compact half-spectrum green table
     (`build_green_slab_half`) and the two-transpose FFT without MPI.  The
     replicated CubeS2 path defaults to Form A while the slab solves in Form B,
     so the CubeS2 reference is forced to Form B; QuadS inverts the window
-    exactly on both sides.  Any spline-dependent slip in the green table -- the
-    one silent failure mode of this path -- shows up as a mismatch here.
+    exactly and B-spline inverts its assignment factor, both on either side.
+    Any spline-dependent slip in the green table -- the one silent failure mode
+    of this path -- shows up as a mismatch here.
     """
     coord, charge, mask, n_node, total, box = _system()
     common = {

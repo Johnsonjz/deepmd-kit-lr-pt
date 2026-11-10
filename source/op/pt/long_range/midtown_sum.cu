@@ -849,7 +849,8 @@ ChargeSumOutputs midtown_sum_local(
   const double boxlo[3] = {0.0, 0.0, 0.0};
   sog_gpu_spread_f(local.state, static_cast<int>(count),
                    c_f.data_ptr<double>(), boxlo, lx, ly, lz,
-                   q.data_ptr<double>(), (double)(nx * ny * nz) / volume);
+                   q.data_ptr<double>(), (double)(nx * ny * nz) / volume,
+                   spline);
   sog_gpu_fx_to_real(local.state);
   {
     const int64_t ng = int64_t{nx} * ny * nz;
@@ -871,7 +872,7 @@ ChargeSumOutputs midtown_sum_local(
   sog_gpu_solve_f(local.state, static_cast<int>(count), c_f.data_ptr<double>(),
                   boxlo, lx, ly, lz, q.data_ptr<double>(), prefactor,
                   /*want_pot=*/1, /*density_ready=*/1, d_force.data_ptr<double>(),
-                  d_vpot.data_ptr<double>());
+                  d_vpot.data_ptr<double>(), spline);
   // red[0..6] comes from the k-space pass over the SUMMED density, so it is
   // already the whole frame's energy and virial; summing it again would double
   // it (it is a mode sum, not an atom sum).
@@ -981,10 +982,7 @@ ChargeSumOutputs midtown_sum_slab(
     const torch::Tensor& total_charge, const torch::Tensor& box,
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
-    const torch::Tensor* communicator, bool quads) {
-  TORCH_CHECK(!form_a_requested(),
-              "midtown: SOG_MIDTOWN_FORM_A is implemented on the replicated "
-              "solve only; unset it for the slab path");
+    const torch::Tensor* communicator, bool quads, bool bspline) {
   TORCH_CHECK(kernel == kSog, "the slab midtown backend evaluates the SOG kernel only");
   TORCH_CHECK(charge.size(1) == 1, "the slab midtown backend supports one channel");
   TORCH_CHECK(channel == -1 || channel == 0,
@@ -1016,7 +1014,12 @@ ChargeSumOutputs midtown_sum_slab(
   TORCH_CHECK(!tilted, "the slab midtown backend supports orthogonal cells only");
   const double lx = c[0], ly = c[4], lz = c[8];
   const double volume = lx * ly * lz;
-  const int spline = midtown_spline(order, quads);
+  TORCH_CHECK(!bspline || (order == 4 || order == 5 || order == 6),
+              "the slab B-spline backend supports order 4, 5 or 6, got ", order);
+  const int spline =
+      bspline ? (order == 6 ? SOG_BSPLINE_6
+                            : (order == 5 ? SOG_BSPLINE_5 : SOG_BSPLINE_4))
+              : midtown_spline(order, quads);
 
   const int np = deepmd::long_range::domain_count(*communicator);
   const int me = deepmd::long_range::domain_rank(*communicator);
@@ -1040,10 +1043,10 @@ ChargeSumOutputs midtown_sum_slab(
   const int zlo = me * nz / np, zhi = (me + 1) * nz / np - 1;
   const int ZL = zhi - zlo + 1;
   const int ylo = me * ny / np, YL = (me + 1) * ny / np - ylo;
-  // Ghost margin = the stencil width = the spline order (CubeS2 and QuadS both
-  // reach `order` points per axis: offsets -1..2 for 4, -2..3 for 6).  This is
-  // the order, not the raw SogSpline code -- QuadS encodes it as 100 + order.
-  const int gh = (order == 6) ? 6 : 4;
+  // Ghost margin = the stencil width.  CubeS2/QuadS reach `order` points per
+  // axis (offsets -1..2 for 4, -2..3 for 6); B-spline of order p reaches
+  // p points from floor(p-1)/2 to the left, so p covers it too.
+  const int gh = bspline ? static_cast<int>(order) : ((order == 6) ? 6 : 4);
   TORCH_CHECK(ZL >= gh, "midtown slab: nz/np = ", ZL,
               " is thinner than the stencil (", gh,
               "); use fewer ranks or a finer grid");
@@ -1075,7 +1078,19 @@ ChargeSumOutputs midtown_sum_slab(
       cell_drift = std::max(cell_drift, std::fabs(local.cell[k] - c[k]) / scale);
     }
   }
-  const bool same = local.ready && local.slab && local.form == 0 &&
+  const bool is_quads = (spline == SOG_QUADS_4 || spline == SOG_QUADS_6);
+  const bool is_bspline = (spline >= 200);
+  const char* fa_env_slab = std::getenv("SOG_MIDTOWN_FORM_A");
+  const int want_form =
+      (is_quads || is_bspline ||
+       (fa_env_slab != nullptr ? std::atoi(fa_env_slab) != 0 : true))
+          ? 1
+          : 0;
+  // Only the CubeS2 Form A needs the measured window; QuadS inverts its window
+  // exactly and B-spline inverts its assignment factor exactly, both inside
+  // build_green_slab_half.
+  const bool use_window = (!is_quads && !is_bspline && want_form == 1);
+  const bool same = local.ready && local.slab && local.form == want_form &&
                     local.nx == nx &&
                     local.ny == ny && local.nz == nz &&
                     local.spline == spline && local.amp == amp &&
@@ -1087,9 +1102,28 @@ ChargeSumOutputs midtown_sum_slab(
     // k_green_pencil reads.  Building the full x table and slicing it with an
     // x-stride of nx instead makes the kernel read a value belonging to another
     // (kh, iy, iz) cell, which silently produces a plausible but wrong solve.
+    //
+    // Form A (CubeS2): measure the assignment window <|W|^2> on the full grid
+    // (self-contained, temporary full-grid plan) and hand it to the builder,
+    // which then divides the Form-B slice by D*<|W|^2>.  The window is a global
+    // property, identical on every rank, so no communication is needed.
+    std::vector<double> window;
+    const double* window_ptr = nullptr;
+    if (use_window) {
+      const size_t nw = (size_t)(nx / 2 + 1) * ny * nz;
+      window.resize(nw);
+      const int nord = (spline == SOG_CUBES2_6) ? 6 : 4;
+      const char* nth_env = std::getenv("SOG_MIDTOWN_FORM_A_NTH");
+      const int nth = std::max(1, nth_env ? std::atoi(nth_env) : 8);
+      const int rc = sog_gpu_measure_window(nx, ny, nz, nord, nth, lx, ly, lz,
+                                            window.data());
+      TORCH_CHECK(rc == 0, "midtown slab: Form-A window measurement failed rc=",
+                  rc);
+      window_ptr = window.data();
+    }
     std::vector<double> sge, sgf, sgv;
     sog_green::build_green_slab_half(nx, ny, nz, lx, ly, lz, amp, bw, spline,
-                                     ylo, YL, sge, sgf, sgv);
+                                     ylo, YL, sge, sgf, sgv, window_ptr);
     const size_t gn = (size_t)(nx / 2 + 1) * YL * nz;
     TORCH_CHECK(sge.size() == gn, "midtown slab: green table size mismatch");
     sog_gpu_setup_slab(local.state, nx, ny, nz, YL, ZL, sge.data(), sgf.data(),
@@ -1101,6 +1135,7 @@ ChargeSumOutputs midtown_sum_slab(
     local.amp = amp;
     local.bw = bw;
     local.slab = true;
+    local.form = want_form;
     local.slab_ylo = ylo;
     local.slab_YL = YL;
     for (int k = 0; k < 9; ++k) {

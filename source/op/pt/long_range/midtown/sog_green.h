@@ -39,6 +39,27 @@ namespace sog_green {
 constexpr double kCubes2Xi4 = 0.5773502691896258;   // sog_spline.h:46
 constexpr double kCubes2Xi6 = 0.6503998764035732;   // sog_spline.h:48
 
+// The integer weights M_p(1), ..., M_p(p-1) of the cardinal-B-spline assignment
+// factor (identical to mesh_sum.cu's integer_bspline_weights): the B-spline
+// value at the integer points, from the truncated-power form
+//   M_p(x) = 1/(p-1)! sum_j (-1)^j C(p,j) (x-j)_+^{p-1}.
+// The B-spline deconvolution is |D_d(m)|^-2 with D_d(m) = sum_l w_l e^{i theta l}.
+inline void integer_bspline_weights(int order, double *w) {
+  for (int l = 0; l < order - 1; ++l) {
+    const double x = l + 1.0;
+    double value = 0.0, binomial = 1.0;
+    for (int j = 0; j <= order; ++j) {
+      if (j > 0) binomial = binomial * (order - j + 1) / j;
+      const double base = std::max(x - static_cast<double>(j), 0.0);
+      value += (j % 2 == 0 ? 1.0 : -1.0) * binomial *
+               std::pow(base, order - 1);
+    }
+    double factorial = 1.0;
+    for (int k = 2; k < order; ++k) factorial *= k;
+    w[l] = value / factorial;
+  }
+}
+
 // SOGKSpace::precompute_green_functions, CubeS₂ branch (sog.cpp:1413-1565).
 // Fills the five tables flat in mesh_index(ix,iy,iz) = ix + nx*(iy + ny*iz).
 // Only the three deconvolved tables are produced.  The bare K and K_v "self"
@@ -70,7 +91,7 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
   // QuadS is spline = 100 + order: its separable window is inverted exactly
   // (Form A), so D_alpha is 1/|W_alpha|^2 instead of the Gaussian variance
   // subtraction.  sog.cpp:1559-1600 is the deployed reference.
-  const bool is_quads = spline >= 100;
+  const bool is_quads = spline >= 100 && spline < 200;
   const int nord = is_quads ? spline - 100 : (spline == 6 ? 6 : 4);
   const double xi_q = is_quads ? LAMMPS_NS::quads_xi(nord) : 0.0;
   const double xi = (spline == 6) ? kCubes2Xi6 : kCubes2Xi4;
@@ -160,7 +181,9 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
                                   int spline, int ylo, int YL,
                                   std::vector<double> &ge,
                                   std::vector<double> &gf,
-                                  std::vector<double> &gv) {
+                                  std::vector<double> &gv,
+                                  const double *window = nullptr,
+                                  double window_floor = 1e-4) {
   const int Nh = nx / 2 + 1;
   const size_t ng = static_cast<size_t>(Nh) * YL * nz;
   ge.assign(ng, 0.0);
@@ -175,18 +198,40 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
   // (Form A), like build_green_range.  The x axis is stored as the compact
   // half-spectrum, whose representative kh has |kx| = |mode| and the influence
   // is even in the mode, so quads_influence_1d(kh, nx) is the table entry.
-  const bool is_quads = spline >= 100;
-  const int nord = is_quads ? spline - 100 : (spline == 6 ? 6 : 4);
+  //
+  // B-spline is spline = 200 + order; its deconvolution is the inverse squared
+  // cardinal-B-spline assignment factor |D_d(m)|^-2 (the same factor mesh_sum
+  // inverts), so the slab solve reproduces the replicated SPME.
+  const bool is_quads = spline >= 100 && spline < 200;
+  const bool is_bspline = spline >= 200;
+  const int nord = is_quads ? spline - 100
+                            : (is_bspline ? spline - 200 : (spline == 6 ? 6 : 4));
   const double xi_q = is_quads ? LAMMPS_NS::quads_xi(nord) : 0.0;
   const double xi = (spline == 6) ? kCubes2Xi6 : kCubes2Xi4;
   const double sig_y2 = (xi * dy) * (xi * dy);
   const double sig_z2 = (xi * dz) * (xi * dz);
+  // The B-spline integer weights M_p(1..p-1) and the per-mode |D(m)|^-2.
+  double iw[16];
+  if (is_bspline) integer_bspline_weights(nord, iw);
+  auto bspline_d = [&](int m, int n) -> double {
+    const double theta = 2.0 * M_PI * static_cast<double>(m) /
+                         static_cast<double>(n);
+    double re = 0.0, im = 0.0;
+    for (int l = 0; l < nord - 1; ++l) {
+      re += iw[l] * std::cos(theta * l);
+      im += iw[l] * std::sin(theta * l);
+    }
+    const double d2 = re * re + im * im;
+    return d2 > 1e-30 ? 1.0 / d2 : 0.0;
+  };
   const size_t M = amp.size();
   std::vector<double> Bx(M * Nh), By(M * ny), Bz(M * nz);
   std::vector<double> Dx(Nh), Dy(ny), Dz(nz);
   for (int kh = 0; kh < Nh; ++kh) {
     const double k = tx * kh, k2 = k * k;   // +kx representative
-    if (is_quads) {
+    if (is_bspline) {
+      Dx[kh] = bspline_d(kh, nx);
+    } else if (is_quads) {
       const double I = LAMMPS_NS::quads_influence_1d(kh, nx, xi_q, nord);
       Dx[kh] = I > 1e-30 ? 1.0 / I : 0.0;
     } else {
@@ -197,7 +242,9 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
   for (int iy = 0; iy < ny; ++iy) {
     const int mode = iy - ny * (2 * iy / ny);
     const double k = ty * mode, k2 = k * k;
-    if (is_quads) {
+    if (is_bspline) {
+      Dy[iy] = bspline_d(mode, ny);
+    } else if (is_quads) {
       const double I = LAMMPS_NS::quads_influence_1d(mode, ny, xi_q, nord);
       Dy[iy] = I > 1e-30 ? 1.0 / I : 0.0;
     } else {
@@ -208,7 +255,9 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
   for (int iz = 0; iz < nz; ++iz) {
     const int mode = iz - nz * (2 * iz / nz);
     const double k = tz * mode, k2 = k * k;
-    if (is_quads) {
+    if (is_bspline) {
+      Dz[iz] = bspline_d(mode, nz);
+    } else if (is_quads) {
       const double I = LAMMPS_NS::quads_influence_1d(mode, nz, xi_q, nord);
       Dz[iz] = I > 1e-30 ? 1.0 / I : 0.0;
     } else {
@@ -238,10 +287,28 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
           kfac += amp[m] * p;
           kfacv += amp[m] * bandwidth[m] * p;
         }
-        const double dc = Dx[kh] * Dy[iy] * Dz[iz];
-        ge[idx] = kfac * dc;
-        gf[idx] = kfac * dc;
-        gv[idx] = kfacv * dc;
+        if (window != nullptr) {
+          // Form A: replace the variance-subtraction deconvolution D by the
+          // exact measured window <|W|^2>, so ge = kfac / <|W|^2>.  The slab
+          // entry (kh, iyl, iz) maps to the global compact index
+          // kh + nh*(iy + ny*iz) of the measured window (iy = ylo + iyl).
+          const size_t gi = static_cast<size_t>(kh) +
+                            static_cast<size_t>(Nh) *
+                                (static_cast<size_t>(iy) +
+                                 static_cast<size_t>(ny) * static_cast<size_t>(iz));
+          const double w = window[gi];
+          if (!(w > window_floor)) {
+            continue;   // near-zero window at the Nyquist corner: drop the mode
+          }
+          ge[idx] = kfac / w;
+          gf[idx] = kfac / w;
+          gv[idx] = kfacv / w;
+        } else {
+          const double dc = Dx[kh] * Dy[iy] * Dz[iz];
+          ge[idx] = kfac * dc;
+          gf[idx] = kfac * dc;
+          gv[idx] = kfacv * dc;
+        }
       }
     }
   }

@@ -265,24 +265,29 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                               prefactor, order,        spacing, periodic,
                               mesh_backend, force_mode};
   const int64_t ranks = deepmd::long_range::domain_count(communicator);
-  // The distributed midtown solve (local spread + rank sum of the mesh) runs
-  // behind an opt-in switch: it is implemented but not yet numerically
-  // validated against the replicated path, and a silently wrong multi-rank
-  // result is the one failure mode worth avoiding.
+  // The z-slab distributed solve runs behind an opt-in switch.  It now serves
+  // every mesh backend: CubeS2 (1), QuadS (2) and the cardinal B-spline (0),
+  // all through the same two-transpose FFT pipeline, each with its own
+  // deconvolution (variance subtraction, exact separable window, or the
+  // B-spline assignment factor) built by build_green_slab_half.
   const char* slab_env = std::getenv("SOG_MIDTOWN_SLAB");
-  if ((mesh_backend == 1 || mesh_backend == 2) && slab_env != nullptr &&
-      std::atoi(slab_env) != 0) {
-    TORCH_CHECK(periodic,
-                "the slab midtown backend needs periodic frames");
+  if (slab_env != nullptr && std::atoi(slab_env) != 0 &&
+      (mesh_backend == 0 || mesh_backend == 1 || mesh_backend == 2)) {
+    TORCH_CHECK(periodic, "the slab backend needs periodic frames");
     // The slab and distributed solves carry the AD gather only; running them
     // under an ik request would silently return a different force law.
     TORCH_CHECK(force_mode == 0,
                 "latent_charge_sum: force_mode != 0 (ik) is implemented on the "
                 "replicated midtown solve only; unset SOG_MIDTOWN_SLAB");
+    // The B-spline slab builds its green table from the SOG bands, so it serves
+    // the SOG kernel only (the replicated mesh_sum carries both LES and SOG).
+    TORCH_CHECK(mesh_backend != 0 || kernel == kSog,
+                "the slab B-spline backend evaluates the SOG kernel only");
     return deepmd::long_range::midtown_sum_slab(
         coord, charge, node_mask, n_node_per_frame, total_charge, cells,
         coefficient, kernel, channel, prefactor, order, spacing,
-        &communicator, /*quads=*/mesh_backend == 2);
+        &communicator, /*quads=*/mesh_backend == 2,
+        /*bspline=*/mesh_backend == 0);
   }
   const char* dist_env = std::getenv("SOG_MIDTOWN_DIST");
   const bool want_dist = dist_env != nullptr && std::atoi(dist_env) != 0;

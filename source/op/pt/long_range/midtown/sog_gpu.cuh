@@ -7,8 +7,18 @@
 
 struct SogGpuState;  // opaque device state (buffers + cuFFT plans + green tables)
 
-// Spline selector for the GPU spread/gather.
-enum SogSpline { SOG_CUBES2_4 = 4, SOG_CUBES2_6 = 6, SOG_QUADS_4 = 104, SOG_QUADS_6 = 106 };
+// Spline selector for the GPU spread/gather.  CubeS2 keeps its legacy 4/6
+// codes; every other family is 100 + order (QuadS) or 200 + order (B-spline),
+// so the order is `code - family_base` and the family is the hundreds digit.
+enum SogSpline {
+  SOG_CUBES2_4 = 4,
+  SOG_CUBES2_6 = 6,
+  SOG_QUADS_4 = 104,
+  SOG_QUADS_6 = 106,
+  SOG_BSPLINE_4 = 204,
+  SOG_BSPLINE_5 = 205,
+  SOG_BSPLINE_6 = 206,
+};
 
 extern "C" {
 SogGpuState *sog_gpu_create();
@@ -37,6 +47,13 @@ void sog_gpu_setup_f32(SogGpuState *s, int nx, int ny, int nz,
 // sub-cell samples per axis.  Returns 0 on success.  Once per box.
 int sog_gpu_green_form_a(SogGpuState *s, int nord, int nth, double lx,
                          double ly, double lz);
+
+// Measure the CubeS2 assignment-window symbol <|W(k)|^2> on the full grid into
+// a host buffer of the compact half spectrum (kh + nh*(iy + ny*iz), nh =
+// nx/2+1), for the z-slab Form-A conversion.  Self-contained (own full-grid
+// R2C plan + buffers), so it runs in slab mode.  Returns 0 on success.
+int sog_gpu_measure_window(int nx, int ny, int nz, int nord, int nth, double lx,
+                           double ly, double lz, double *out);
 
 // One SOG kspace step, entirely on device:
 //   spread(q@x) -> cuFFT fwd -> green-multiply (grad meshes + potential + energy/virial reductions)
@@ -77,25 +94,28 @@ double sog_gpu_compute_dev(SogGpuState *s, int nlocal,
 
 // Deferred-reduction variant: identical pipeline, but the 20 reduction sums
 // stay in the device buffer (sog_gpu_red_device_ptr) and no host copy runs.
+// `force_mode` 0 is the AD gather (weight derivatives); 1 is the ik path
+// (three inverse transforms of i·k_a·φ̂ and a value-only gather).
 void sog_gpu_compute_dev_defer(SogGpuState *s, int nlocal, const double *d_x,
                                const double *boxlo, double lx, double ly,
                                double lz, const double *d_q, double qscale,
                                int spline, int want_pot, double *d_force,
                                double *d_vpot, double self_coeff,
-                               double qsqsum, int remove_self);
+                               double qsqsum, int remove_self, int force_mode);
 double *sog_gpu_red_device_ptr(SogGpuState *s);
 // Distributed split: spread this rank's atoms into the full mesh, expose the
 // fixed-point mesh for a rank sum, then solve with the summed mesh.
 void sog_gpu_spread_f(SogGpuState *s, int nlocal, const double *x,
                       const double *boxlo, double lx, double ly, double lz,
-                      const double *q, double rho_scale);
+                      const double *q, double rho_scale, int spline);
 unsigned long long *sog_gpu_fx_device_ptr(SogGpuState *s);
 void sog_gpu_fx_to_real(SogGpuState *s);
 float *sog_gpu_real_device_ptr(SogGpuState *s);
 void sog_gpu_solve_f(SogGpuState *s, int nlocal, const double *x,
                      const double *boxlo, double lx, double ly, double lz,
                      const double *q, double qscale, int want_pot,
-                     int density_ready, double *d_force, double *d_vpot);
+                     int density_ready, double *d_force, double *d_vpot,
+                     int spline);
 // Triclinic: fractional coordinates on a unit cell + metric k vectors.
 void sog_gpu_set_metric(SogGpuState *s, const double *hinv, double volume, int on);
 
