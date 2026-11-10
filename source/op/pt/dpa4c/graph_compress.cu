@@ -2138,7 +2138,8 @@ dpa4c_canonical_compress_long_range_energy_force(
     double spacing,
     std::optional<std::vector<int64_t>> fitting_routes,
     std::optional<std::vector<int64_t>> charge_fitting_routes,
-    int64_t mesh_backend) {
+    int64_t mesh_backend,
+    int64_t force_mode) {
   constexpr const char* kOp =
       "dpa4c_canonical_compress_long_range_energy_force";
   const bool atom_virial = check_energy_force_inputs(
@@ -2305,7 +2306,7 @@ dpa4c_canonical_compress_long_range_energy_force(
   const auto long_range = deepmd::long_range::latent_charge_sum(
       coord, raw_charge.to(torch::kFloat32).unsqueeze(1), charged, n_node,
       total_charge, box, coefficient, communicator, kernel, channel, prefactor,
-      order, spacing, mesh_backend);
+      order, spacing, mesh_backend, force_mode);
   const torch::Tensor& long_range_energy = std::get<0>(long_range);
   const torch::Tensor& charge_gradient = std::get<1>(long_range);
   const torch::Tensor& long_range_force = std::get<2>(long_range);

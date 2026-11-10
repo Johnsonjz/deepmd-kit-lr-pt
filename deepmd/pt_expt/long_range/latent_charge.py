@@ -170,10 +170,9 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
         with torch.enable_grad():
             charge = self.charge_net.call_graph(leaf, atype)["latent_charge"]
         total_charge, channel = self.operator_constraint(n_node.shape[0], coord)
-        # The midtown mesh carries the CubeS2 spline: the 88-node stencil of
-        # order 6, or the 32-node stencil of order 4 when the configuration
-        # asks for it.  Never the B-spline default of 8.
-        if self.mesh_backend == "midtown":
+        # Both midtown families have a fixed order-4 or order-6 stencil, never
+        # the B-spline default of 8.
+        if self.mesh_backend in ("midtown", "quads"):
             order = 4 if self.pme_order == 4 else 6
         else:
             order = self.pme_order
@@ -193,6 +192,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
             order,
             self.mesh_spacing() if self.periodic else 1.0,
             self.mesh_backend,
+            self.force_mode,
         )
         (descriptor_gradient,) = torch.autograd.grad(
             charge, leaf, charge_gradient.to(charge.dtype)

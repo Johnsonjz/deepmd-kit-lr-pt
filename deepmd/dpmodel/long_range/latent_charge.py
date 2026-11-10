@@ -110,7 +110,11 @@ PME_ORDER = 8
 """Default order of the B-splines that spread the charges to the mesh."""
 
 PME_SPACING_FRACTION = 0.75
-"""Default mesh spacing, as a fraction of the Nyquist spacing of the wave-number cutoff.
+"""Fallback mesh spacing, as a fraction of the Nyquist spacing of the wave-number cutoff.
+
+Only used when the kernel's width is unknown to the error law of
+:mod:`deepmd.dpmodel.long_range.grid_rule`; a known width is sized by that law
+instead, with no Nyquist ceiling.
 
 At order 8 the mesh evaluation of a periodic frame then stays within a few
 parts in a million of the sum over the wave numbers, in the reciprocal energy
@@ -206,9 +210,11 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         live parameters. The frozen cutoff is serialized with the model.
         Requires ``periodic=True``.
     pme_spacing
-        The largest spacing of the mesh of a periodic frame, in Å; the
-        default is three quarters of the Nyquist spacing of the wave-number
-        cutoff, :math:`0.75 \pi / k_{max}`. Requires ``periodic=True``.
+        The largest spacing of the mesh of a periodic frame, in Å; overrides
+        ``pme_accuracy``. The default is the spacing the measured error law of
+        :mod:`deepmd.dpmodel.long_range.grid_rule` gives at that target (and
+        three quarters of the Nyquist spacing of the wave-number cutoff when
+        the kernel's width is unknown to the rule). Requires ``periodic=True``.
     pme_order
         The order of the B-splines that spread the charges to the mesh.
         Requires ``periodic=True``.
@@ -342,9 +348,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                 "`pme_spacing`, `pme_order` and `pme_accuracy` require `periodic=True`"
             )
         self.mesh_backend = str(mesh_backend)
-        if self.mesh_backend not in ("bspline", "midtown"):
+        if self.mesh_backend not in ("bspline", "midtown", "quads"):
             raise ValueError(
-                "`mesh_backend` must be 'bspline' or 'midtown', got "
+                "`mesh_backend` must be 'bspline', 'midtown' or 'quads', got "
                 f"{self.mesh_backend!r}"
             )
         self.force_mode = str(force_mode)
@@ -352,10 +358,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             raise ValueError(
                 f"`force_mode` must be 'ad' or 'ik', got {self.force_mode!r}"
             )
-        if self.force_mode != "ad" and self.mesh_backend != "midtown":
+        if self.force_mode != "ad" and self.mesh_backend not in (
+            "midtown",
+            "quads",
+        ):
             raise ValueError(
                 "`force_mode='ik'` (Fourier differentiation) requires "
-                "`mesh_backend='midtown'`"
+                "`mesh_backend='midtown'` or `'quads'`"
             )
         self.pme_order = PME_ORDER if pme_order is None else int(pme_order)
         if self.pme_order < 2:
@@ -512,8 +521,10 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
 
         The configured ``pme_spacing``; otherwise the spacing that reaches the
         target force-relative accuracy under the measured error law of
-        :mod:`deepmd.dpmodel.long_range.grid_rule`, never coarser than
-        :data:`PME_SPACING_FRACTION` of the Nyquist spacing of the cutoff.
+        :mod:`deepmd.dpmodel.long_range.grid_rule`.  The law alone sizes the
+        grid; there is no extra Nyquist ceiling (the fitted law is measured at
+        1e-4 spacings well inside its band).  A kernel whose width the rule
+        does not know falls back to ``PME_SPACING_FRACTION * pi / k_max``.
         """
         if self.pme_spacing is not None:
             return self.pme_spacing
@@ -541,7 +552,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         Sizing the grid from the *configured* value would size it for the wrong
         stencil, so every consumer goes through this.
         """
-        if self.mesh_backend == "midtown":
+        if self.mesh_backend in ("midtown", "quads"):
             return 4 if self.pme_order == 4 else 6
         return int(self.pme_order)
 

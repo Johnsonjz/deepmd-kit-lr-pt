@@ -156,7 +156,7 @@ TORCH_LIBRARY_FRAGMENT(deepmd, library) {
       "Tensor coefficient, Tensor communicator, int kernel, int channel, "
       "float prefactor, int order, float spacing, "
       "int[]? fitting_routes=None, int[]? charge_fitting_routes=None, "
-      "int mesh_backend=0) "
+      "int mesh_backend=0, int force_mode=0) "
       "-> (Tensor energy, Tensor atom_energy, Tensor force, Tensor virial, "
       "Tensor atom_virial, Tensor mask)");
 }

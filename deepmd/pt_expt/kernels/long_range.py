@@ -282,8 +282,20 @@ def _reference(
     prefactor: float,
     order: int,
     spacing: float,
+    mesh_backend: int = 0,
+    force_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate the operator in float64, over the explicit pairs or the meshes."""
+    if mesh_backend != 0:
+        raise NotImplementedError(
+            "the CPU reference evaluates the B-spline mesh; the midtown mesh "
+            "backend is CUDA only"
+        )
+    if force_mode != 0:
+        raise NotImplementedError(
+            "the CPU reference differentiates by the assignment weights "
+            "(`force_mode='ad'`); the Fourier (`ik`) force is CUDA only"
+        )
     if int(communicator.reshape(-1)[0]) != 0:
         raise NotImplementedError(
             "the CPU reference of latent_charge_sum evaluates a single domain; "
@@ -349,6 +361,8 @@ def _fake(
     prefactor: float,
     order: int,
     spacing: float,
+    mesh_backend: int = 0,
+    force_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n = coord.shape[0]
     return (
@@ -378,8 +392,12 @@ def ensure_registered() -> None:
         _register()
 
 
-_MESH_BACKEND_CODES = {"bspline": 0, "midtown": 1}
+_MESH_BACKEND_CODES = {"bspline": 0, "midtown": 1, "quads": 2}
 """The mesh backend of a periodic call, as the operator's integer code."""
+
+_FORCE_MODE_CODES = {"ad": 0, "ik": 1}
+"""How the periodic force is differentiated, as the operator's integer code:
+``ad`` gathers the weight derivatives, ``ik`` differentiates in Fourier space."""
 
 
 def _kernel_version(kernel: Any) -> tuple:
@@ -418,6 +436,7 @@ def latent_charge_sum(
     order: int = 8,
     spacing: float = 1.0,
     mesh_backend: str = "bspline",
+    force_mode: str = "ad",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Energy, charge gradient, force and virial of the charges of complete frames.
 
@@ -472,6 +491,12 @@ def latent_charge_sum(
         ``"midtown"`` for the CubeS2 splines and cuFFT of the SOG library,
         which serves the SOG kernel, one channel, orthogonal cells and a
         single rank.
+    force_mode
+        ``"ad"`` (default) gathers the weight derivatives on the mesh, whose
+        force equals ``-dE_mesh/dr`` exactly; ``"ik"`` differentiates in
+        Fourier space instead (three inverse transforms of ``i·k·φ̂``), one
+        order more accurate in the mesh spacing but not the exact mesh
+        gradient.  ``"ik"`` requires ``mesh_backend="midtown"``.
 
     Returns
     -------
@@ -519,8 +544,20 @@ def latent_charge_sum(
         backend_code = _MESH_BACKEND_CODES[mesh_backend]
     except KeyError as exc:
         raise ValueError(
-            f"unknown mesh backend {mesh_backend!r}; expected 'bspline' or 'midtown'"
+            f"unknown mesh backend {mesh_backend!r}; "
+            "expected 'bspline', 'midtown' or 'quads'"
         ) from exc
+    try:
+        force_code = _FORCE_MODE_CODES[force_mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown force mode {force_mode!r}; expected 'ad' or 'ik'"
+        ) from exc
+    if force_code != 0 and backend_code == 0:
+        raise ValueError(
+            "force_mode='ik' (Fourier differentiation) needs a midtown or quads "
+            "mesh backend"
+        )
     if communicator is None:
         communicator = torch.zeros(1, dtype=torch.int64, device="cpu")
     if backend_code != 0:
@@ -566,4 +603,9 @@ def latent_charge_sum(
         # a custom op does not survive the AOTInductor freeze.  The default
         # backend stays implicit so a frozen graph keeps its argument count.
         args.append(backend_code)
+    if force_code != 0:
+        # The default force mode stays implicit too; it is only ever non-zero
+        # together with backend_code, so the argument lands in the force_mode
+        # slot.
+        args.append(force_code)
     return torch.ops.deepmd.latent_charge_sum(*args)

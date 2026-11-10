@@ -969,8 +969,20 @@ def test_pme_mesh_follows_the_cells_of_the_batch() -> None:
         long_range, coord, np.array([4, 5]), 2.0 * _cells(), atype
     )
     spacing = long_range.mesh_spacing()
+    # The module sizes the mesh from the measured error law of its own backend
+    # and spline order, not from the legacy ``0.75 pi / k_max`` fraction: assert
+    # it is exactly that law evaluated at the module's own parameters.
+    from deepmd.dpmodel.long_range import grid_rule
+
     assert spacing == pytest.approx(
-        0.75 * np.pi / long_range.kernel.kspace_cutoff(long_range.kspace_tolerance)
+        grid_rule.spacing(
+            long_range.mesh_backend,
+            long_range.effective_order(),
+            long_range._sigma_min(),
+            long_range._k_max(),
+            grid_rule.DEFAULT_ACCURACY,
+            force_mode=long_range.force_mode,
+        )
     )
     for topologies, box in ((small, _cells()[:1]), (large, 2.0 * _cells())):
         mesh = topologies["pme_mesh"]
@@ -1020,6 +1032,29 @@ def test_pme_round_trip() -> None:
     assert restored.pme_spacing == 1.0
     # the default order is recorded too, so that it survives a change of default
     assert _periodic_long_range().serialize()["pme_order"] == 8
+
+
+def test_mesh_spacing_threads_the_force_mode() -> None:
+    """The mesh spacing rule reads the force mode: an ik grid is never finer.
+
+    In ik mode the force keeps the energy exponent, so the same accuracy target
+    admits a coarser mesh than the weight-differentiated (AD) force; the
+    module must pass its ``force_mode`` through to :mod:`grid_rule`.
+    """
+    from deepmd.dpmodel.long_range import grid_rule
+
+    ik = _pme_long_range(mesh_backend="midtown", force_mode="ik")
+    expected = grid_rule.spacing(
+        "midtown",
+        ik.effective_order(),
+        ik._sigma_min(),
+        ik._k_max(),
+        grid_rule.DEFAULT_ACCURACY,
+        force_mode="ik",
+    )
+    assert ik.mesh_spacing() == pytest.approx(expected)
+    ad = _pme_long_range(mesh_backend="midtown", force_mode="ad")
+    assert ik.mesh_spacing() >= ad.mesh_spacing()
 
 
 @pytest.mark.parametrize("n", [6, 10, 20])
