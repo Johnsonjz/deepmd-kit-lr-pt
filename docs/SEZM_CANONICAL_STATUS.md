@@ -67,9 +67,38 @@ gap does not move with the kernel level — it is the message-passing stack
 itself, not a missing fast kernel. Closing it needs a fused SeZM operator
 (the B-lineage route), which is a project of its own.
 
-The reciprocal-space mesh is **not** worth distributing: on the DPA4C model at
-12 288 atoms the whole long-range term costs 1.9 ms/step (2.5 % of the pair
-time; 4.6 % at two ranks), and on SeZM it is below the noise of the run.
+### Memory at extreme sizes (331 776 atoms, 149.3 Å, 24 GB card)
+
+The mesh is **replicated** on every rank, so it is a per-rank cost that rank
+count does not divide. Measured peak per rank, with the same model frozen once
+with the long-range module and once without:
+
+| DPA4C (`lr_bs6` vs `lr_sr`) | np = 1 | np = 2 | np = 4 |
+|---|---|---|---|
+| with the module | 4452 MB | 3110 MB | 2852 MB |
+| without | 3174 MB | 2128 MB | 2182 MB |
+| **long-range delta** | **1278 MB** | **982 MB** | **670 MB** |
+
+The replicated mesh is 216³ points = 80 MB of complex64 by itself; the rest is
+the operator's work arrays and cuFFT workspace. A z-slab distributed mesh would
+divide it, saving up to (np−1)/np of that delta — of order 0.5–1 GB per rank at
+np = 4, about 20 % of that run's peak. **It is a memory lever, not a speed one**
+(time-wise it is 2.5 %), and only for a fine mesh.
+
+For SeZM+SOG the mesh is 40³ = 0.5 MB (spacing 3.98 Å), so distributed and
+replicated differ by 0.4 MB: pointless.
+
+What does limit SeZM is elsewhere. Canonical peak per rank at 12 288 atoms:
+
+| np = 1 | np = 2 | np = 4 |
+|---|---|---|
+| 20.3 GB | 15.8 GB | 10.3 GB |
+
+A run at 20 736 atoms fails with `aoti_torch_empty_strided` running out of
+memory on a 24 GB card, so this artifact tops out between 12 288 and 20 736
+atoms. Most of that is a per-rank floor of about 7 GB (context, runtime,
+AOTI/allocator pools) that ranks do not divide; the split part is roughly
+13 GB at np = 1.
 
 ## Known limitation
 
