@@ -3051,6 +3051,14 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
     cudaEventCreate(&s->evt_fftinv_start); cudaEventCreate(&s->evt_fftinv_stop);
     cudaEventCreate(&s->evt_gather_start); cudaEventCreate(&s->evt_gather_stop);
   }
+  // Record one stage boundary.  EVERY event the accumulation below reads must be
+  // recorded on this call: cudaEventElapsedTime on an event that was created but
+  // never recorded returns an error and leaves its output untouched, so the
+  // accumulator would sum uninitialised memory and report garbage.  That is
+  // exactly what happened while the marks were unwired -- all ten events were
+  // created, only gather_stop was ever recorded, and SOG_GPU_TIMING printed
+  // nonsense.  These are host-side enqueues: with timing off they cost nothing.
+  auto mark = [&](cudaEvent_t e) { if (timing) cudaEventRecord(e, 0); };
   bool quads = (spline==SOG_QUADS_4||spline==SOG_QUADS_6);
   int nord = (spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
   const int gw=(nlocal+(tb/32)-1)/(tb/32);
@@ -3059,11 +3067,18 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
     // spreads and gathers the (2nu)^3 separable stencil, R2C/C2R carry the
     // mesh.  This halves the transform work and the density/potential buffers
     // relative to the original full-complex path.
+    // The zeroing of the density mesh is a grid-sized pass, so it is counted
+    // with the spread, exactly as k_zero_fx is in the CubeS2 branch.
+    mark(s->evt_spread_start);
     CK(cudaMemsetAsync(s->f_rho_r,0,ng*sizeof(float),0));
     if(nord==4) k_spread_quads_warp_r<4><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_r);
     else        k_spread_quads_warp_r<6><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_r);
+    mark(s->evt_spread_stop);
     ensure_spec(s);
+    mark(s->evt_fftfwd_start);
     cufftExecR2C(s->f_plan_r2c,s->f_rho_r,s->f_spec);
+    mark(s->evt_fftfwd_stop);
+    mark(s->evt_kspace_start);
     {
       const int nh=s->nx/2+1;
       const int npw=(nh+2)/3;
@@ -3074,6 +3089,8 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
                                      s->metric,s->f_gp,s->f_spec,want_pot,
                                      scaleinv,s->d_red);
     }
+    mark(s->evt_kspace_stop);
+    mark(s->evt_fftinv_start);
     if(force_mode==1){
       // Fourier differentiation on the half spectrum: three C2R gradients of
       // i*k_a*phi_hat, then a value-only warp gather.
@@ -3085,16 +3102,21 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
       k_mul_ik<<<gg,tb>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->f_spec,s->f_grad_spec,2);
       cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_gradz_r);
       cufftExecC2R(s->f_plan_c2r,s->f_spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
       if(nord==4) k_gather_quads_warp_r_ik<4><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
       else        k_gather_quads_warp_r_ik<6><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
     } else {
       cufftExecC2R(s->f_plan_c2r,s->f_spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
       if(nord==4) k_gather_quads_warp_r<4><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
       else        k_gather_quads_warp_r<6><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
     }
   } else {
     // CubeS2: real meshes and a half spectrum.
     // The fractional coordinate of every atom, once, one thread per atom.
+    mark(s->evt_spread_start);
     FracNode* frac = ensure_frac(s,nlocal);
     if(nlocal>0)
       k_midtown_frac<<<ga,tb>>>(nlocal,d_x,d_boxlo,1.0/lx,1.0/ly,1.0/lz,
@@ -3106,8 +3128,12 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
       k_spread_cubes2_warp_fx_packed<6><<<gwp,tb>>>(nlocal,frac,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
     }
     k_fx_to_float<<<gg,tb>>>(ng,s->f_rho_fx,s->f_rho_r,1.0/kFxScale);
+    mark(s->evt_spread_stop);
     cufftComplex *spec = reinterpret_cast<cufftComplex*>(s->f_rho_fx);
+    mark(s->evt_fftfwd_start);
     cufftExecR2C(s->f_plan_r2c,s->f_rho_r,spec);
+    mark(s->evt_fftfwd_stop);
+    mark(s->evt_kspace_start);
     {
       const int nh=s->nx/2+1;
       const int npw=(nh+2)/3;
@@ -3123,6 +3149,8 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
                                      s->metric,s->f_gp,spec,want_pot,
                                      scaleinv,s->d_red);
     }
+    mark(s->evt_kspace_stop);
+    mark(s->evt_fftinv_start);
     // f_rho_r is free here (the density went into f_spec), so the potential
     // mesh replaces it instead of taking a buffer of its own.
     if(force_mode==1){
@@ -3142,22 +3170,48 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
       k_mul_ik<<<gg,tb>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,spec,s->f_grad_spec,2);
       cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_gradz_r);
       cufftExecC2R(s->f_plan_c2r,spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
       if(nord==4) k_gather_cubes2_warp_r_ik<4><<<gw,tb>>>(nlocal,frac,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
       else        k_gather_cubes2_warp_r_ik<6><<<gw,tb>>>(nlocal,frac,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
     } else {
       cufftExecC2R(s->f_plan_c2r,spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
       if(nord==4) k_gather_cubes2_warp_r<4><<<gw,tb>>>(nlocal,frac,1.0/lx,1.0/ly,1.0/lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
       else        k_gather_cubes2_warp_r<6><<<gw,tb>>>(nlocal,frac,1.0/lx,1.0/ly,1.0/lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
     }
   }
-  if (timing) cudaEventRecord(s->evt_gather_stop, 0);
+  mark(s->evt_gather_stop);
   // ── Accumulate timing ──
-  if (timing) { float ms;
-    cudaEventSynchronize(s->evt_spread_stop); cudaEventElapsedTime(&ms,s->evt_spread_start,s->evt_spread_stop); s->acc_spread += ms;
-    cudaEventSynchronize(s->evt_fftfwd_stop); cudaEventElapsedTime(&ms,s->evt_fftfwd_start,s->evt_fftfwd_stop); s->acc_fftfwd += ms;
-    cudaEventSynchronize(s->evt_kspace_stop); cudaEventElapsedTime(&ms,s->evt_kspace_start,s->evt_kspace_stop); s->acc_kspace += ms;
-    cudaEventSynchronize(s->evt_fftinv_stop); cudaEventElapsedTime(&ms,s->evt_fftinv_start,s->evt_fftinv_stop); s->acc_fftinv += ms;
-    cudaEventSynchronize(s->evt_gather_stop); cudaEventElapsedTime(&ms,s->evt_gather_start,s->evt_gather_stop); s->acc_gather += ms;
+  // Each stage is read only if its stop event actually completed; an event that
+  // was never recorded (a path that skips a stage) must not contribute a stale
+  // or uninitialised millisecond count to the average.
+  //
+  // cudaGetLastError() after a failure is NOT cosmetic: a failed
+  // cudaEventElapsedTime latches cudaErrorInvalidResourceHandle into the
+  // thread's sticky error state, and C10's launch checks read it with
+  // cudaGetLastError() -- so the first later torch op throws "CUDA error:
+  // invalid resource handle".  That is the reported SOG_GPU_TIMING crash.
+  // Swallowing the code here keeps a diagnostics switch from poisoning the run.
+  if (timing) {
+    auto stage = [](cudaEvent_t a, cudaEvent_t b, double& acc) {
+      if (cudaEventSynchronize(b) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+      }
+      float ms = 0.0f;
+      if (cudaEventElapsedTime(&ms, a, b) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+      }
+      acc += ms;
+    };
+    stage(s->evt_spread_start, s->evt_spread_stop, s->acc_spread);
+    stage(s->evt_fftfwd_start, s->evt_fftfwd_stop, s->acc_fftfwd);
+    stage(s->evt_kspace_start, s->evt_kspace_stop, s->acc_kspace);
+    stage(s->evt_fftinv_start, s->evt_fftinv_stop, s->acc_fftinv);
+    stage(s->evt_gather_start, s->evt_gather_stop, s->acc_gather);
   }
   if (timing) ++s->timing_count;
   if (timing && s->timing_count >= s->timing_interval && s->timing_count > 0) {

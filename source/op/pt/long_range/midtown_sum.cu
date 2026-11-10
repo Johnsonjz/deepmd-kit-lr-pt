@@ -721,8 +721,13 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
   }
   tm.mark("postloop");
   // The caller keeps only the nodes this rank owns.
+  //
+  // The flush is NOT part of the ownership branch: with np > 1 every rank owns a
+  // slice, so gating the report on "this rank owns the whole frame" meant the
+  // timer printed nothing exactly where the per-step cost matters.  flush()
+  // itself already throttles to one report per 50 calls.
+  CpuTimer::flush();
   if (owner_begin == 0 && owner_count == n) {
-    CpuTimer::flush();
   return {atom_energy, charge_gradient, force, atom_virial, virial};
   }
   auto cut = [&](const torch::Tensor& t) {
