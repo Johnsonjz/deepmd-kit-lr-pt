@@ -976,6 +976,51 @@ inline void remap_graph_outputs_to_dense_keys(
 }
 
 /**
+ * @brief Refuse an output map that holds an undefined tensor.
+ *
+ * A custom operator inside an exported graph runs through the AOTI proxy
+ * executor, which **catches** a C++ exception thrown by the operator, prints it
+ * to stderr as a single ``[E...] shim_common.cpp`` line, and leaves that
+ * operator's output tensors undefined.  The graph then "succeeds" and the
+ * failure surfaces much later, as ``Expected a proper Tensor but got None ...
+ * for argument #0 'self'`` from the first reshape/index on that slot -- a
+ * message that names neither the operator nor the reason (a mesh that does not
+ * fit the card and a force mode the backend refuses look identical).
+ *
+ * Call this right after the forward, so the error is reported here, naming the
+ * undefined slots.
+ *
+ * @param[in] output_map Output tensor map to inspect.
+ * @param[in] where Caller name, used as the message prefix.
+ * @throws deepmd::deepmd_exception when any value is undefined.
+ */
+inline void require_defined_outputs(
+    const std::map<std::string, torch::Tensor>& output_map,
+    const char* where) {
+  std::string bad;
+  for (const auto& entry : output_map) {
+    if (!entry.second.defined()) {
+      if (!bad.empty()) {
+        bad += ", ";
+      }
+      bad += "'" + entry.first + "'";
+    }
+  }
+  if (bad.empty()) {
+    return;
+  }
+  throw deepmd::deepmd_exception(
+      std::string(where) + ": the exported graph returned undefined output(s) " +
+      bad +
+      ". A custom operator inside the graph threw and the AOTI proxy executor "
+      "caught it instead of propagating it, so the model still 'returned' its "
+      "outputs with those slots unset. The operator's own message is the "
+      "'[E...] ... shim_common.cpp' line on stderr -- look there for the real "
+      "cause (mesh too large for the device, an unsupported force mode, "
+      "invalid arguments, ...).");
+}
+
+/**
  * @brief Flatten the per-atom virial emitted by a compact canonical lower.
  *
  * The compact lower emits the per-atom virial as a three-by-three tensor,
@@ -990,6 +1035,11 @@ inline void flatten_canonical_atom_virial(
   const auto entry = output_map.find("atom_virial");
   if (entry == output_map.end()) {
     return;
+  }
+  if (!entry->second.defined()) {
+    // Never reshape a slot the proxy executor left unset: that is where this
+    // used to die with a message about 'self', hiding the real operator error.
+    require_defined_outputs(output_map, "flatten_canonical_atom_virial");
   }
   entry->second = entry->second.reshape({entry->second.size(0), 9});
 }

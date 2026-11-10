@@ -1597,6 +1597,10 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
   // Map flat outputs to internal keys
   std::map<std::string, torch::Tensor> output_map;
   extract_outputs(output_map, flat_outputs);
+  // The proxy executor turns an operator exception into an undefined output
+  // instead of propagating it; report it here, by name, before the dense-key
+  // remap trips over a None with a message about 'self'.
+  deepmd::require_defined_outputs(output_map, "DeepPotPTExpt::compute");
 
   if (lower_input_is_graph_ || lower_input_is_canonical_) {
     // The graph forward emits flat-N PUBLIC keys (atom_energy/energy/force/
@@ -1990,6 +1994,9 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
   // 6. Map flat outputs to internal keys
   std::map<std::string, torch::Tensor> output_map;
   extract_outputs(output_map, flat_outputs);
+  // Same guard as the main compute: an operator exception inside the graph
+  // leaves an undefined slot, and every later reshape would only report 'self'.
+  deepmd::require_defined_outputs(output_map, "DeepPotPTExpt::compute");
 
   if (lower_input_is_graph_ || lower_input_is_canonical_) {
     // The graph forward emits LOCAL public keys; rewrite them into the dense
@@ -2767,6 +2774,8 @@ void DeepPotPTExpt::compute_edges_gpu_impl(double* d_atom_energy,
               graph_pack.source_order, graph_pack.source_row_ptr, fparam_tensor,
               graph_aparam, charge_spin_tensor, coord_t.reshape({nloc, 3}),
               /*box=*/{}));
+      deepmd::require_defined_outputs(
+          out, "DeepPotPTExpt::compute_charge_response");
       ae = out["atom_energy"].reshape({nnode}).slice(0, 0, nloc).contiguous();
       force_t = out["force"].reshape({nnode, 3}).contiguous();
       av = out["atom_virial"].reshape({nnode, 9}).contiguous();
@@ -2795,6 +2804,8 @@ void DeepPotPTExpt::compute_edges_gpu_impl(double* d_atom_energy,
               padded_coord, local_atype, padded_atype, phantom_edge_index,
               phantom_edge_vec, phantom_edge_index, phantom_edge_mask,
               fparam_tensor, phantom_aparam, charge_spin_tensor, comm_tensors));
+      deepmd::require_defined_outputs(
+          out, "DeepPotPTExpt::compute_charge_response");
       ae = out["energy"].reshape({phantom_n}).slice(0, phantom_n).contiguous();
       force_t = out["energy_derv_r"]
                     .squeeze(-2)
