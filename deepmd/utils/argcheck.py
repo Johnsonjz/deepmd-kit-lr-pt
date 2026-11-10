@@ -3652,8 +3652,17 @@ def interaction_kernel_sog() -> list[Argument]:
         "k = 0, ..., `n_gaussian` - 1."
     )
     doc_n_gaussian = "The number of Gaussians of the default widths."
-    doc_base_width = "The width of the first default Gaussian, in Å."
-    doc_width_ratio = "The ratio of consecutive default widths. Must exceed one."
+    doc_base_width = (
+        "The width of the first default Gaussian, in Å. Unset leaves the ladder "
+        "to the config layer, which applies the SOG library rule "
+        "sigma = n_layers * rcut / 1.9893 for a bare `sog` kernel; set it to "
+        "use an explicit ladder instead."
+    )
+    doc_width_ratio = (
+        "The ratio of consecutive default widths. Must exceed one. Unset leaves "
+        "the ladder to the config layer, which applies the SOG library rule for "
+        "a bare `sog` kernel; set it to use an explicit ladder instead."
+    )
     doc_trainable = "Whether the amplitudes and widths are trained."
     return [
         Argument(
@@ -3673,16 +3682,16 @@ def interaction_kernel_sog() -> list[Argument]:
         Argument("n_gaussian", int, optional=True, default=12, doc=doc_n_gaussian),
         Argument(
             "base_width",
-            float,
+            [float, type(None)],
             optional=True,
-            default=2.180230445405648,
+            default=None,
             doc=doc_base_width,
         ),
         Argument(
             "width_ratio",
-            float,
+            [float, type(None)],
             optional=True,
-            default=1.6297670882677647,
+            default=None,
             doc=doc_width_ratio,
         ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),

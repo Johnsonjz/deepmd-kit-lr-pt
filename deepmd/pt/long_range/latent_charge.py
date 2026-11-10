@@ -122,7 +122,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
         }
         kernel_type = str(kernel_config.pop("type"))
         if kernel_type == "sog" and not any(
-            key in kernel_config
+            kernel_config.get(key) is not None
             for key in ("width", "amplitude", "base_width", "width_ratio")
         ):
             # D12: new configurations follow the SOG library rule rather than
