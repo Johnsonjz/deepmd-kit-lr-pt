@@ -41,6 +41,9 @@
 
 ## 2. 两条部署链
 
+> 本节只管**第一部分这棵树自己的产物**（`fitting=sog_energy` 谱系）。第二部分的
+> `latent_charge` 产物怎么进来，见 §10。
+
 模型产物（`.pt2`）里可能带四种长程相关的东西，用哪个由输入决定：
 
 | 产物里的条目 | 谁用它 | 怎么开 |
@@ -375,16 +378,19 @@ dp --pt-expt freeze -c model.ckpt.pt -o model --compress
 
 ## 10. 与第一部分的接口
 
-两棵树唯一的接触点是 **模型加载库**。第一部分的 plugin 通过
-`DP_BACKEND_PLUGIN_PATH` 指向某棵树的 `deepmd/lib`，那里有
-`libdeepmd_cc.so` 与 `libdeepmd_backend_ptexpt.so`（两棵树都会编译这两个）。
+两棵树唯一的接触点是 **模型加载库**。LAMMPS 的 pair（无论来自哪棵树）通过
+`DP_BACKEND_PLUGIN_PATH` 选一个 `deepmd/lib`，那里有 `libdeepmd_cc.so` 与
+`libdeepmd_backend_ptexpt.so`（两棵树都会编译这两个）。
 
-| 用法 | 输入长什么样 | 说明 |
+本树的产物有两种用法，**都不需要把模型源码搬来搬去**：
+
+| 用法 | LAMMPS 输入 | 说明 |
 |---|---|---|
-| **图内长程**（这棵树的本命） | `pair_style deepmd/kk ${PT2} full_lr yes` + `kspace_style none` | `.pt2` 自带 `pme_mesh` 拓扑，pair 侧按 `spacing` 建网格；不需要 `sog/kk`、不需要 `fix sog/response`。 |
-| **交给第一部分的链 A** | `pair_style deepmd/kk ${PT2} latent_charge_to_q yes full_lr no` + `kspace_style sog/kk …` + `fix sog/response` | `.pt2` 必须带 `latent_charge` 输出与 `latent_charge_response.pt2` extra；`amp/bandwidth` 按 §附录 A 从 `amplitude/width` 换算。 |
+| **图内长程**（本树产物的默认） | `pair_style deepmd/kk ${PT2}` + `kspace_style none` | `.pt2` 自带 `pme_mesh` 拓扑（`topology_params.pme_mesh.spacing`），由 backend 按盒子建网格；**不需要** `kspace_style`，也不需要 `fix sog/response`。 |
+| **交给第一部分的链 A** | `pair_style deepmd/kk ${PT2} latent_charge_to_q yes full_lr no` + `kspace_style sog/kk …` + `fix sog/response` | 仅当产物带 `latent_charge` 输出与 `latent_charge_response.pt2` extra 时可用；`amp/bandwidth` 按附录 A 从 `amplitude/width` 换算。 |
 
-两条都不需要把模型源码搬来搬去——只换 `DP_BACKEND_PLUGIN_PATH`。
+注意 `full_lr`（第一部分 §2 链 B）是**第一部分自己的 `sog_full_lr.pt2` 产物专用**的关键字；
+本树的 `pme_mesh` 产物不需要它，也未必带它（查 `model/extra/sog_full_lr.pt2` 是否存在）。
 
 ## 11. 本树自己的文档
 
