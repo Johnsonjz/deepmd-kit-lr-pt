@@ -60,6 +60,21 @@ extension. `--lower-kind graph` requires a graph-eligible model. Conversely, a
 graph-capable DPA model may override a requested `nlist` lower with the graph
 form and emit a warning. In multi-task mode, select a model branch with
 `--head CHOSEN_BRANCH`.
+
+**Compression (compact canonical lower).** Add `--compress` to export the
+compressed model on the accelerated graph schema:
+
+```bash
+dp --pt-expt freeze -c model.ckpt.pt -o model --compress
+```
+
+`--compress` re-exports with the *compact canonical* lower
+(`lower_input_kind=dpa4c_canonical`, `float32` edges). This is the recommended
+production form for long-range (`latent_charge`) models: it is markedly faster
+and much smaller than the default graph lower, and it is **required for
+multi-rank** (np>1) inference — a default graph-lower long-range artifact
+raises "run on a single rank" under MPI. `--compress` requires `--pt-expt`.
+See `docs/FREEZE_SOP.md` for the full production procedure.
 :::
 
 :::{tab-item} Paddle {{ paddle_icon }}

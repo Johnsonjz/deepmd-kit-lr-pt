@@ -100,6 +100,17 @@ This command produces an executable compressed artifact only for descriptors
 that support the PyTorch-Exportable compression path. See the
 [DPA-1 model-compression requirements](../model/train-se-atten.md#model-compression)
 for the graph-lowered `.pt2` route used in this example.
+
+For a fresh freeze you can compress in one step with `freeze --compress`:
+
+```bash
+dp --pt-expt freeze -c model.ckpt.pt -o model.pt2 --compress
+```
+
+This emits the compact canonical lower directly (`lower_input_kind=dpa4c_canonical`).
+It is the recommended production form — faster and far smaller than the default
+graph lower — and, for long-range (`latent_charge`) models, **required for
+multi-rank** inference. See `docs/FREEZE_SOP.md`.
 :::
 
 :::{tab-item} JAX {{ jax_icon }}
