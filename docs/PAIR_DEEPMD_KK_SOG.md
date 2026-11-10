@@ -402,6 +402,10 @@ dp --pt-expt freeze -c model.ckpt.pt -o model --compress
 - `docs/GRID_FROM_ACCURACY.md` —— 网格误差律与参考核网格表
 - `docs/IK_MODE_ACCURACY.md`、`docs/AD_MODE_ACCURACY.md` —— 两种力微分的实测
 - `docs/MIDTOWN_VS_BSPLINE_BENCH.md` —— 等精度下的后端选择
+- `docs/SPLINE_MATRIX_BENCH.md` —— 极端大体系（526 k / 1.12 M 原子）下十种样条配置 ×
+  复制/分布式网格的时间与显存全表
+- `docs/SLAB_IK_FAILURE_DIAGNOSIS.md` —— 分布式网格 × ik 的崩溃诊断与修复记录
+- `docs/PR_SUBMISSION.md` —— 提 PR 用的范围划分、环境、编译与验证步骤
 - `docs/SLAB_DEPLOYMENT.md` —— z-slab 分布式网格（算子侧，与 LAMMPS 的 `sog/kk` 无关）
 
 本树自己的验收：`pytest source/tests/pt_expt/kernels/test_mesh_backend.py`、
@@ -490,6 +494,159 @@ allows one.
 | `SOG_SLAB_STRICT=1` | 上两者遇 ik 时**硬报错**而不是回落（CI / 批处理用） |
 | `SOG_MIDTOWN_FORM_A=0/1` | CubeS₂ 的 Form A / Form B 去卷积 |
 | `SOG_MIDTOWN_DEBUG=1` | 打印网格重建与 kernel 参数 |
+
+## 13. 本树的标准编译与调用流程
+
+前面 §10 说的是"产物怎么被第一部分消费"。这一节是**在这一棵树里从源码到跑起来**的完整流程。
+
+### 13.1 环境
+
+```bash
+source /etc/profile.d/modules.sh
+module load gcc/13 cmake/3.26.3 openmpi/4.1.4
+conda activate lr212            # Python 3.11，torch 2.12.1+cu126
+export PATH=/usr/local/cuda-12.4/bin:$PATH     # 系统默认 nvcc 是 11.8，不认 -std=c++20
+```
+
+| 组件 | 必须是 | 不对会怎样 |
+|---|---|---|
+| gcc / mpicc | 13.x | AOTI 冻结报 `-std=c++20: unrecognized`；插件 MPI 符号错 |
+| cmake | 3.26.3 | — |
+| CUDA toolkit | **12.4** | 11.8 编不过 `-std=c++20` |
+| torch | **2.12.1+cu126** | 算子 `.so` 与运行环境 ABI 不符，`import deepmd` 直接报版本错 |
+| LAMMPS 源码 | `$REPO/lammps_src/lammps-stable_22Jul2025_update2` | 编 `deepmd_lmp` 目标需要 |
+
+> 仓库根 `AGENTS.md` 写的是**上游** `uv pip install -e .` 流程，不适用：这里要同时编 CUDA
+> 算子、MPI 与 LAMMPS 插件。
+
+### 13.2 编译
+
+**① 核心五目标**（算子 / C++ API / pt_expt 后端 / C API / **主机版 LAMMPS 插件**）：
+
+```bash
+export REPO=/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt
+sog_work/mdsuite/build_lrpt212_full.sh --build
+# 等价于：cmake -S $REPO/source -B $REPO/build-lmp-mpi-212 <一堆开关>；
+#         make deepmd_op_pt deepmd_cc deepmd_backend_ptexpt deepmd_c deepmd_lmp
+#         装进 /data/home/public/jiangzhen/dp/lr212_install_lrpt/deepmd/lib
+#         主机插件软链 -> /tmp/lmpplugin_lrpt/dpplugin.so
+#         并校验 canonical op 的 22 参数 schema 含 force_mode
+```
+
+**② Kokkos（device）插件** —— 同一份源码，`DEEPMD_LAMMPS_KOKKOS=ON`，但**不能**用普通
+`nvcc_wrapper` 直接编（三个坑：CMake 发 `-std=c++2a`；CMake 先发 `CXX_INCLUDES` 再发
+`CXX_FLAGS`，LAMMPS 的 `src/STUBS/mpi.h` 会先命中导致 MPI 符号 C++ 修饰；Kokkos 要
+`-fopenmp`）。用一个 shim 抹平：
+
+```bash
+cat > /tmp/nvcc_wrapper_shim <<'EOF'
+#!/bin/bash
+OMPI=/data/app/openmpi-4.1.4/install/openmpi/4.1.4
+args=("-I$OMPI/include")          # 必须排在所有 -I 之前
+for a in "$@"; do
+  case "$a" in
+    -std=c++2a|-std=gnu++2a) args+=("-std=c++20") ;;
+    *) args+=("$a") ;;
+  esac
+done
+exec /data/home/public/jiangzhen/lammps/lammps_stable/lib/kokkos/bin/nvcc_wrapper "${args[@]}"
+EOF
+chmod +x /tmp/nvcc_wrapper_shim
+
+cmake -S $REPO/source/lmp/plugin -B /tmp/kk_lrpt_build \
+  -DCMAKE_CXX_COMPILER=/tmp/nvcc_wrapper_shim \
+  -DDEEPMD_LAMMPS_KOKKOS=ON \
+  -DLAMMPS_SOURCE_ROOT=/data/home/public/jiangzhen/lammps/lammps_stable \
+  -DKokkos_DIR=/data/home/public/jiangzhen/lammps/lammps_stable/build_kokkos/lib/kokkos \
+  -DCMAKE_CXX_FLAGS="-fopenmp -pthread -I$REPO/source/api_cc/include -I$REPO/source/lib/include"
+cmake --build /tmp/kk_lrpt_build -j 16
+mkdir -p /tmp/kk_lrpt_plugin
+ln -sfn /tmp/kk_lrpt_build/libdeepmd_lmp.so /tmp/kk_lrpt_plugin/dpplugin.so
+```
+
+### 13.3 运行时环境
+
+```bash
+CONDA=/data/home/jiangzhen/.conda/envs/lr212
+NVD=$CONDA/lib/python3.11/site-packages/nvidia
+export LD_LIBRARY_PATH=$CONDA/lib:$CONDA/lib/python3.11/site-packages/torch/lib:\
+$NVD/cuda_runtime/lib:$NVD/cuda_cupti/lib:$NVD/nvjitlink/lib:$NVD/cudnn/lib:\
+$NVD/cublas/lib:$NVD/cusparse/lib:$NVD/cusparselt/lib:$NVD/curand/lib:\
+$NVD/cufft/lib:$NVD/cufile/lib:$NVD/nccl/lib:$NVD/nvshmem/lib:\
+/data/home/public/jiangzhen/dp/lmp_kokkos_install/lib:\
+/data/home/public/jiangzhen/dp/lr212_install_lrpt/deepmd/lib
+export DP_BACKEND_PLUGIN_PATH=/data/home/public/jiangzhen/dp/lr212_install_lrpt/deepmd/lib
+export LAMMPS_PLUGIN_PATH=/tmp/kk_lrpt_plugin      # 或 /tmp/lmpplugin_lrpt（主机插件）
+export OMP_NUM_THREADS=1
+```
+
+顺序有意义：conda 的 `libstdc++` 要在系统之前，torch 自带的 CUDA 运行时要在系统之前。
+
+### 13.4 标准调用
+
+本树的产物**长程在图内**（`pme_mesh` 拓扑），所以**不需要 `kspace_style`**：
+
+```lammps
+units           metal
+boundary        p p p
+atom_style      charge/kk          # 主机插件用 charge
+atom_modify     map yes
+neighbor        2.0 bin
+neigh_modify    every 20 delay 0 check no
+read_data       <system>.lmp
+mass            1 16
+mass            2 2
+pair_style      deepmd/kk <model>.pt2      # 主机插件写 deepmd <model>.pt2
+pair_coeff      * * O H
+kspace_style    none
+fix             1 all nve/kk                # 主机插件用 nve
+run_style       verlet/kk                  # 主机插件可不写
+velocity        all create 300.0 12345 mom yes rot no dist gaussian
+timestep        0.0005
+thermo_style    custom step temp pe press vol
+run             100000
+```
+
+```bash
+# 单卡
+lmp -k on g 1 -in in.lammps
+# 多卡：一个 rank 一张卡，按 LOCAL rank 绑定
+mpirun --oversubscribe -np 2 /tmp/lmp_rank_dev.sh lmp -k on g 1 -in in.lammps
+```
+
+`/tmp/lmp_rank_dev.sh`：
+
+```bash
+#!/bin/bash
+IFS=',' read -r -a _devs <<< "${CUDA_VISIBLE_DEVICES}"
+export CUDA_VISIBLE_DEVICES="${_devs[${OMPI_COMM_WORLD_LOCAL_RANK:-0}]}"
+exec "$@"
+```
+
+**产物 → 输入**：`.pt2` 里 `model/extra/metadata.json` 的
+`topology_params.pme_mesh.spacing` 决定网格；`pme_order` / `mesh_backend` / `force_mode`
+是**冻结时的计算设置**，改它们要重新冻结（`sog_work/tools/freeze_lr_variants.py
+--backend {bspline|midtown|quads} --order {4|6} --force-mode {ad|ik}`，冻结前
+`module load gcc/13`）。
+
+### 13.5 自检
+
+```bash
+# 纯 Python（不需 GPU）
+python -m pytest source/tests/common/dpmodel/test_grid_rule.py \
+                 source/tests/common/dpmodel/test_long_range.py -q        # 82 passed
+# 算子（需要一张 GPU，PYTHONPATH=/ LD_LIBRARY_PATH 指向 deepmd/lib）
+python -m pytest source/tests/pt_expt/kernels/test_mesh_backend.py -q     # 20 passed
+
+# 端到端：run 0 对拍 + 多卡一致
+lmp -k on g 1 -in in.lammps -log log.np1
+mpirun -np 2 ... -in in.lammps -log log.np2
+# pe 应逐位相同；不同 mesh_backend 之间按等精度设计应到 ~1e-8 eV/atom
+```
+
+> **量单步时间时不要用 `run 6`**：LAMMPS 的 `Loop time` 含一次性 setup（邻居表、首次求值、
+> AOTI 图捕获），在几十万原子上是好几秒。用 `run 5` + `run 20` 两段，取第二段
+> （`docs/bench_spline_matrix.py` 就是这么做的）。
 
 ---
 

@@ -38,7 +38,12 @@ KK_PLUGIN = "/tmp/kk_lrpt_plugin"  # dpplugin.so -> the deepmd/kk build
 OUT = os.environ.get(
     "OUT", "/data/home/public/jiangzhen/dp/sog_work/bench/matrix_spline_modes"
 )
-STEPS = int(os.environ.get("STEPS", "6"))
+STEPS = int(os.environ.get("STEPS", "20"))
+# A LAMMPS `run` includes the one-time setup (neighbour build, first evaluation,
+# AOTI graph capture) in its Loop time, and at these sizes that setup is seconds.
+# The deck therefore runs WARM steps first and reports the SECOND segment, whose
+# per-step time is the steady state.
+WARM = int(os.environ.get("WARM", "5"))
 DEVS = [int(x) for x in os.environ.get("DEVS", "1,2").split(",")]
 
 ENV = {
@@ -170,6 +175,7 @@ def deck(n, model, np_ranks, slab):
         "thermo_style    custom step temp pe press vol",
         "thermo          1000",
         "timestep        0.0005",
+        f"run             {WARM}",
         f"run             {STEPS}",
     ]
     os.makedirs(OUT, exist_ok=True)
@@ -214,7 +220,8 @@ def run(n, label, stem, np_ranks, slab):
     samp.stop()
     samp.join(timeout=2)
     txt = open(log, errors="ignore").read() if os.path.exists(log) else ""
-    m = re.search(r"Loop time of ([\d.eE+-]+) on \d+ procs for (\d+) steps", txt)
+    loops = re.findall(r"Loop time of ([\d.eE+-]+) on \d+ procs for (\d+) steps", txt)
+    m = list(loops)[-1] if loops else None
     pe = None
     for line in txt.splitlines():
         f = line.split()
@@ -233,7 +240,8 @@ def run(n, label, stem, np_ranks, slab):
             break
     return dict(
         label=label, stem=stem, np=np_ranks, slab=slab,
-        loop=float(m.group(1)) if m else None,
+        # m = (total_seconds, steps): the table reports PER-STEP milliseconds.
+        loop=float(m[0]) / float(m[1]) if m else None,
         pe=pe, mem_max=max(mem.values()) if mem else 0,
         mem_sum=sum(mem.values()), wall=wall, rc=rc,
         err="" if m else (msg or err.strip().splitlines()[-1][:220] if err.strip() else ""),
@@ -244,6 +252,16 @@ def main():
     sizes = [int(x) for x in sys.argv[1:]] or [526848, 1119744]
     only = [x for x in os.environ.get("ONLY", "").split(",") if x]
     cases = [c for c in CASES if not only or c[1] in only]
+    if os.environ.get("EXTRA"):
+        # Same-grid ad vs ik pairs: the ik artifact re-frozen at the AD spacing
+        # of its own backend, so the only difference is the force mode.
+        cases += [
+            ("CubeS2-6 ad@462", "lr_mid6"),
+            ("CubeS2-6 ik@462", "lr_mid6ik_sp462"),
+            ("QuadS-6 ad@577", "lr_quads6"),
+            ("QuadS-6 ik@577", "lr_quads6ik_sp577"),
+            ("(SR only)", "lr_sr"),
+        ]
     missing = [s for _, s in cases if not os.path.exists(f"{FR}/{s}.pt2")]
     if missing:
         sys.exit(f"missing artifacts: {missing}")
