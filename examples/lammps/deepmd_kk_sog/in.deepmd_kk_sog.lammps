@@ -1,0 +1,81 @@
+# ============================================================================
+# in.deepmd_kk_sog.lammps
+#
+#   Kokkos device chain for a long-range (SOG) model, "pair + kspace + fix":
+#
+#     pair   deepmd/kk    short-range energy/force + latent charge -> atom->q
+#                         (the charge is written on the device, no host trip)
+#     kspace sog/kk       SOG particle-mesh solve on the same device arrays
+#                         (spread -> cuFFT -> green -> inverse -> gather)
+#     fix    sog/response dq/dr correction: the long-range force also acts
+#                         through the coordinates the charge depends on
+#
+#   Everything below the "USER" block is generic; only those five variables
+#   change between systems.
+#
+#   Run (one GPU per process):
+#       lmp -k on g 1 -in in.deepmd_kk_sog.lammps
+#   Multi-rank: use the HOST chain instead (pair deepmd + kspace sog) --
+#   the device response path in `fix sog/response` aborts at np > 1 and the
+#   replicated k-space virial is scaled by np.  See docs/PAIR_DEEPMD_KK_SOG.md
+#   §9 before running this input on more than one rank.
+#   See docs/PAIR_DEEPMD_KK_SOG.md for the environment, the keyword reference
+#   and the failure modes.
+# ============================================================================
+
+# ---------------------------- USER: replace these ---------------------------
+# Frozen artifact that carries the latent-charge response extras
+# (`model/extra/latent_charge_response.pt2`); `*_fused.pt2` is the usual one.
+variable  MODEL  index   /path/to/dpa4_sog_fused.pt2
+variable  DATA   index   /path/to/system.data
+# LAMMPS type names, in the order of the model's type_map.
+variable  TYPES  string  "O H"
+# SOG kernel of the trained model, in the C++ kspace convention:
+#   K(k^2) = sum_m amp_m exp(-bandwidth_m k^2 / 2),  bandwidth = sigma^2
+# Extract it from the checkpoint, do NOT retype it by hand -- see the doc.
+variable  KERNEL string  "amp 0.0 bandwidth 0.0"
+# Optional: number of steps.
+variable  NSTEPS index   100000
+# ---------------------------------------------------------------------------
+
+units           metal
+boundary        p p p
+atom_style      charge/kk
+atom_modify     map yes
+
+read_data       ${DATA}
+mass            1 16
+mass            2 2
+
+neighbor        2.0 bin
+neigh_modify    every 1 delay 0 check no
+
+# --- pair: short range + latent charge on the device -----------------------
+# `latent_charge_to_q yes` writes the model's latent charge to atom->q so the
+# k-space solver can read it.  `full_lr no` pins the pair+kspace chain: with a
+# model whose artifact also carries the in-graph long-range graph, `full_lr`
+# would otherwise be enabled and the charge write-back skipped.
+pair_style      deepmd/kk ${MODEL} latent_charge_to_q yes full_lr no
+pair_coeff      * * ${TYPES}
+
+# --- k-space: SOG particle mesh, device resident ---------------------------
+# `use_gpu yes` is what selects the cuFFT device path; without it sog/kk
+# silently falls back to the host solver (correct, ~2x slower per atom).
+kspace_style    sog/kk ${KERNEL} use_gpu yes
+
+# --- charge response ------------------------------------------------------
+# Adds the term that is missing when q is treated as constant.  Needs the
+# response extra in the artifact; also arms the per-atom potential v_i that
+# the SOG solver computes.
+fix             resp all sog/response model ${MODEL}
+
+# --- integration ----------------------------------------------------------
+fix             1 all nve/kk
+run_style       verlet/kk
+
+velocity        all create 300.0 12345 mom yes rot no dist gaussian
+timestep        0.0005
+thermo_style    custom step pe ke etotal temp press vol
+thermo          1000
+
+run             ${NSTEPS}
