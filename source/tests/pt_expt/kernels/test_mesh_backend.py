@@ -292,7 +292,10 @@ def test_unknown_force_mode_is_rejected() -> None:
 
 @pytest.mark.parametrize("mesh_backend", ["midtown", "quads", "bspline"])
 @pytest.mark.parametrize("order", [4, 6])
-def test_slab_solve_matches_replicated(monkeypatch, mesh_backend, order) -> None:
+@pytest.mark.parametrize("full_brick", [False, True])
+def test_slab_solve_matches_replicated(
+    monkeypatch, mesh_backend, order, full_brick
+) -> None:
     """The z-slab distributed solve reproduces the replicated solve in every
     spline mode.
 
@@ -308,6 +311,12 @@ def test_slab_solve_matches_replicated(monkeypatch, mesh_backend, order) -> None
     the window exactly and B-spline inverts its assignment factor, both on
     either side.  Any spline-dependent slip in the green table -- the one silent
     failure mode of this path -- shows up as a mismatch here.
+
+    `full_brick` is the path a rank owning atoms at ANY z takes (the LAMMPS
+    processor grid is not 1 x 1 x np): the spread covers the whole box height
+    and the periodic ghosts fold inside the rank's own brick.  At np == 1 it is
+    already the default (`ZL == nz`); forcing it pins the env switch and the
+    fold/ghost-fill pair that the multi-rank all-reduce path sits on top of.
     """
     coord, charge, mask, n_node, total, box = _system()
     common = {
@@ -320,10 +329,13 @@ def test_slab_solve_matches_replicated(monkeypatch, mesh_backend, order) -> None
         "mesh_backend": mesh_backend,
     }
     monkeypatch.delenv("SOG_MIDTOWN_SLAB", raising=False)
+    monkeypatch.delenv("SOG_MIDTOWN_FULLBRICK", raising=False)
     if mesh_backend == "midtown":
         monkeypatch.setenv("SOG_MIDTOWN_FORM_A", "0")
     reference = latent_charge_sum(coord, charge, mask, n_node, total, **common)
     monkeypatch.setenv("SOG_MIDTOWN_SLAB", "1")
+    if full_brick:
+        monkeypatch.setenv("SOG_MIDTOWN_FULLBRICK", "1")
     slab = latent_charge_sum(coord, charge, mask, n_node, total, **common)
     names = ("atom_energy", "charge_gradient", "force", "atom_virial", "virial")
     for name, ref, got in zip(names, reference, slab, strict=False):

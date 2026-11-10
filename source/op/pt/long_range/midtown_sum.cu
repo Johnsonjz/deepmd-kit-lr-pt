@@ -1050,7 +1050,22 @@ ChargeSumOutputs midtown_sum_slab(
   TORCH_CHECK(ZL >= gh, "midtown slab: nz/np = ", ZL,
               " is thinner than the stencil (", gh,
               "); use fewer ranks or a finer grid");
-  const bool full_brick = (ZL == nz);
+  // full_brick: the atom decomposition is NOT rank == z-slab, so a rank owns
+  // atoms at any z.  Every rank then spreads into a full-height brick and the
+  // density/potential are made global with one device all-reduce each; the
+  // transforms below still work on this rank's nz/np z-slab, so the mesh
+  // memory and the collective traffic of the transposes are unchanged.  The
+  // trade is the spread brick: it holds all nz planes (+ghosts) instead of
+  // ZL, i.e. the full mesh rather than 1/np of it.
+  //
+  // Selected automatically when a single z band owns the box (np == 1), or
+  // forced with SOG_MIDTOWN_FULLBRICK=1 for a processor grid that splits x
+  // and/or y (the LAMMPS default).  Without the force the z-band guard below
+  // rejects such a grid rather than silently spreading atoms onto the wrong
+  // slab.
+  const char* fb_env = std::getenv("SOG_MIDTOWN_FULLBRICK");
+  const bool full_brick =
+      (ZL == nz) || (fb_env != nullptr && std::atoi(fb_env) != 0);
   const int zb_lo = full_brick ? -gh : zlo - gh;
   const int zb_hi = full_brick ? nz - 1 + gh : zhi + gh;
   const int ZB = full_brick ? nz + 2 * gh : ZL + 2 * gh;
@@ -1229,16 +1244,22 @@ ChargeSumOutputs midtown_sum_slab(
                            c_f.data_ptr<double>(), boxlo, lx, ly, lz,
                            q.data_ptr<double>(), rho_scale, spline, nx, ny, nz,
                            0, nx - 1, 0, ny - 1, zb_lo, zb_hi);
-  if (np == 1) {
-    // Reverse halo: the ghost planes are periodic images, so their charge
-    // folds back into the owned planes at the other end of the slab.  Kept on
-    // the device: the host get/add pairs were four synchronising bus round
-    // trips per ghost plane and dominated the np == 1 call.
+  if (full_brick) {
+    // No z neighbour: the ghost planes are periodic images inside this rank's
+    // own full-height brick.  Fold them first, then sum the bricks across
+    // ranks so every rank holds the GLOBAL density.  The 2^40 integers add
+    // exactly, so the global mesh is independent of the reduction order and of
+    // the atom decomposition.
     for (int j = 0; j < gh; ++j) {
       sog_gpu_brick_add_planes(local.state, plane * (size_t)j,
-                               plane * (size_t)(zoff + ZL - gh + j), plane);
-      sog_gpu_brick_add_planes(local.state, plane * (size_t)(zoff + ZL + j),
-                               plane * (size_t)(zoff + j), plane);
+                               plane * (size_t)(nz + j), plane);
+      sog_gpu_brick_add_planes(local.state, plane * (size_t)(nz + gh + j),
+                               plane * (size_t)(gh + j), plane);
+    }
+    if (np > 1) {
+      TORCH_CHECK(sog_gpu_brick_allreduce_fx(local.state, plane * (size_t)gh,
+                                             plane * (size_t)nz) == 0,
+                  "midtown slab: full-brick density all-reduce failed");
     }
   } else {
     TORCH_CHECK(sog_gpu_nccl_halo_rev(local.state, prev, next, plane, zoff, ZL,
@@ -1308,20 +1329,27 @@ ChargeSumOutputs midtown_sum_slab(
                                                       ZL, np, zoff, ZB) == 0,
               "midtown slab: unpack + inverse (x,y) FFT failed");
   mark(7);  // unpack + inverse (x,y) FFT
-  if (np > 1) {
+  if (full_brick) {
+    // The inverse transform wrote this rank's own ZL planes; the rest of the
+    // brick was zeroed by the unpack.  Sum across ranks to get the full
+    // potential, then fill the periodic ghosts from the owned edge planes.
+    if (np > 1) {
+      TORCH_CHECK(sog_gpu_brick_allreduce_f(local.state, plane * (size_t)gh,
+                                            plane * (size_t)nz) == 0,
+                  "midtown slab: full-brick potential all-reduce failed");
+    }
+    for (int j = 0; j < gh; ++j) {
+      // lower ghost <- the last gh owned planes (periodic wrap)
+      sog_gpu_brick_copy_planes(local.state, plane * (size_t)(nz + j),
+                                plane * (size_t)j, plane);
+      // upper ghost <- the first gh owned planes
+      sog_gpu_brick_copy_planes(local.state, plane * (size_t)(gh + j),
+                                plane * (size_t)(nz + gh + j), plane);
+    }
+  } else {
     TORCH_CHECK(sog_gpu_nccl_halo_fwd(local.state, prev, next, plane, zoff, ZL,
                                       gh, gh) == 0,
                 "midtown slab: NCCL forward halo failed");
-  } else {
-    // Forward halo: the potential is periodic, so the owned edge planes fill
-    // the ghosts of the other end.  Device to device, as above.
-    for (int j = 0; j < gh; ++j) {
-      sog_gpu_brick_copy_planes(local.state, plane * (size_t)(zoff + j),
-                                plane * (size_t)(zoff + ZL + j), plane);
-      sog_gpu_brick_copy_planes(local.state,
-                                plane * (size_t)(zoff + ZL - gh + j),
-                                plane * (size_t)j, plane);
-    }
   }
 
   mark(8);  // forward halo

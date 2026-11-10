@@ -2237,6 +2237,7 @@ NcclApi &nccl_api(){
 }
 constexpr int kNcclDouble=8;    // ncclDataType_t: ncclFloat64/ncclDouble
 constexpr int kNcclFloat32=7;   // ncclDataType_t: ncclFloat32/ncclFloat
+constexpr int kNcclUint64=5;    // ncclDataType_t: ncclUint64 (exact integer sum)
 constexpr int kNcclSum=0;       // ncclRedOp_t
 
 // One communicator per process: neutralize/qmean (which have no handle) and
@@ -2386,12 +2387,29 @@ extern "C" int sog_gpu_nccl_halo_fwd(SogGpuState*s,int prev,int next,
   return 0;
 }
 
-// Generic in-place device all-reduce (double).  Used by neutralize/qmean.
-extern "C" int sog_gpu_nccl_allreduce_dev(void *buf,size_t n){
+// Generic in-place device all-reduce with an explicit element width.  The
+// full-brick path needs the 64-bit fixed-point density (ncclUint64: an exact
+// integer sum, so the global mesh does not depend on the reduction order) and
+// the float potential (ncclFloat32); neutralize/qmean use doubles.
+extern "C" int sog_gpu_nccl_allreduce_dev_dtype(void *buf,size_t n,int dtype){
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1) return -1;
-  return a.all_reduce(buf,buf,n,kNcclDouble,kNcclSum,g_comm,(cudaStream_t)0)==0
+  return a.all_reduce(buf,buf,n,dtype,kNcclSum,g_comm,(cudaStream_t)0)==0
              ? 0 : -2;
+}
+extern "C" int sog_gpu_nccl_allreduce_dev(void *buf,size_t n){
+  return sog_gpu_nccl_allreduce_dev_dtype(buf,n,kNcclDouble);
+}
+
+// full_brick: every rank spread its own atoms over the WHOLE z range, so the
+// rank sum is the global mesh.  `off`/`n` are element counts inside the brick
+// (the owned planes, [gh*plane, (gh+nz)*plane)); the ghost planes are not part
+// of the sum.
+extern "C" int sog_gpu_brick_allreduce_fx(SogGpuState*s,size_t off,size_t n){
+  return sog_gpu_nccl_allreduce_dev_dtype(s->s_brick_fx+off,n,kNcclUint64);
+}
+extern "C" int sog_gpu_brick_allreduce_f(SogGpuState*s,size_t off,size_t n){
+  return sog_gpu_nccl_allreduce_dev_dtype(s->d_brick+off,n,kNcclFloat32);
 }
 
 extern "C" int sog_gpu_nccl_allreduce_red(SogGpuState*s){

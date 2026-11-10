@@ -171,6 +171,13 @@ int sog_gpu_nccl_init(int np, int me, const void *id);
 int sog_gpu_nccl_ok();
 int sog_gpu_nccl_available();
 int sog_gpu_nccl_allreduce_dev(void *buf, size_t n);
+// Same, with an explicit element width (kNcclDouble / kNcclFloat32 /
+// kNcclUint64).  The full-brick path sums the fixed-point density as uint64.
+int sog_gpu_nccl_allreduce_dev_dtype(void *buf, size_t n, int dtype);
+// full_brick: make the owned planes of the brick global (rank sum).  `off`/`n`
+// are element counts inside the brick.
+int sog_gpu_brick_allreduce_fx(SogGpuState *s, size_t off, size_t n);
+int sog_gpu_brick_allreduce_f(SogGpuState *s, size_t off, size_t n);
 int sog_gpu_nccl_alltoall_fwd(SogGpuState *s, const int *scnt,
                               const int *sdisp, const int *rcnt,
                               const int *rdisp, int np);
