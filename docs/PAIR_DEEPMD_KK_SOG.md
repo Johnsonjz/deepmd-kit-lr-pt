@@ -407,6 +407,90 @@ dp --pt-expt freeze -c model.ckpt.pt -o model --compress
 本树自己的验收：`pytest source/tests/pt_expt/kernels/test_mesh_backend.py`、
 `pytest source/tests/common/dpmodel/test_grid_rule.py`、`test_long_range.py`。
 
+## 12. 故障与修复（本树的代码）
+
+这一节是本树对两个"看起来像 LAMMPS 崩溃"的问题的处理。完整诊断过程见
+`docs/SLAB_IK_FAILURE_DIAGNOSIS.md`；这里给的是**结论与用法**。
+
+### 12.1 ik × 分布式网格：警告 + 回落，不再中止
+
+**现象**：LAMMPS 里跑 ik 模型（`force_mode: ik`）而环境里设了 `SOG_MIDTOWN_SLAB=1`
+（或 `SOG_MIDTOWN_DIST=1`）时，整个 MD 直接中止，报
+
+```
+ERROR: … Expected a proper Tensor but got None … for argument #0 'self'
+```
+
+**原因**：分布式求解器（z-slab / local-spread）的力只来自 AD gather，**没有 `i·k` 微分**。
+旧实现用 `TORCH_CHECK` 硬拒（`latent_charge_sum.cu`），而这个 env 通常是进程级设的
+（bench 脚本、容器 profile），于是"一个环境变量打死整条 MD"。
+
+**现在的行为**：仍是拒绝走分布式，但**回落到 replicated**——力定律完全相同，只是每 rank
+持全网格——并打一次警告：
+
+```
+[W… latent_charge_sum.cu] Warning: SOG_MIDTOWN_SLAB is set but force_mode != 0 (ik):
+the distributed solves implement only the AD gather, so this call runs the replicated
+solve. The force law is identical; every rank now holds the full mesh.
+```
+
+要保留硬失败（批处理不希望悄悄换成更吃显存的路径）：`export SOG_SLAB_STRICT=1`。
+
+**为什么不给分布式补 ik 通路**：那意味着三遍额外的 `z` 逆变换 + all-to-all，而分布式网格
+在整步里只省 8.7–11.9% 显存（`docs/MIDTOWN_VS_BSPLINE_BENCH.md`）。收益与代价不成比例。
+
+| 配置 | 修复前 | 修复后 |
+|---|---|---|
+| `pair deepmd lr_mid4ik.pt2` + `SOG_MIDTOWN_SLAB=1`，np=1 | 中止 | 跑完，`pe = -29946.558`（与不带 env **逐位相同**） |
+| 同上 np=2 | 中止 | 跑完，`pe = -29946.558` |
+| 同上 + `SOG_SLAB_STRICT=1` | 一行误导信息 | 明确的 undefined-output 错误（§12.2） |
+
+### 12.2 算子异常不再被 AOTI 吞成 "None / 'self'"
+
+`.pt2` 里的自定义算子通过 AOTI proxy executor 调用；它**捕获**算子抛出的 C++ 异常，只往
+stderr 打一行 `[E... shim_common.cpp]`，并把该算子的输出张量留成 undefined。图照常"返回"，
+上层随后在第一次 `reshape` 上崩，报的却是 `Expected a proper Tensor … 'self'`——**显存不足、
+力模式被拒、参数非法三种事故同一个字符串**。Python 路径更糟：不崩，返回 `nan`。
+
+**修复**：`require_defined_outputs()`（`source/api_cc/include/commonPT.h`）在每次
+`extract_outputs` 之后点名列出 undefined 的槽位，并指向 stderr 的 `[E...]` 行；
+`flatten_canonical_atom_virial` 也不再对 None 调 `reshape`。
+
+```
+ERROR: … DeepPotPTExpt::compute: the exported graph returned undefined output(s)
+'atom_energy', 'atom_virial', 'energy', 'force', 'mask', 'virial'. A custom operator
+inside the graph threw and the AOTI proxy executor caught it instead of propagating
+it, so the model still 'returned' its outputs with those slots unset. The operator's
+own message is the '[E...] … shim_common.cpp' line on stderr -- look there for the
+real cause (mesh too large for the device, an unsupported force mode, invalid
+arguments, ...).
+```
+
+### 12.3 网格过大：建表之前就报，而不是裸 OOM
+
+replicated 网格按 **20 B/格点**占用设备内存（`f_gp` 8 + `f_rho_r` 4 + `f_rho_fx` 8）。
+旧路径先花约一分钟在 host 上造几十 GB 的 fp64 绿函数，再在 `cudaMalloc` 上失败。
+现在先与 `cudaMemGetInfo` 比对：
+
+```
+midtown: the replicated mesh needs 26.52 GiB of device memory for a 1125x1125x1125 grid,
+but only 18.14 GiB is free. Use a coarser mesh (a larger `pme_spacing` or a less
+demanding `pme_accuracy`), a smaller box, or a distributed backend where the force mode
+allows one.
+```
+
+同一个 526 848 原子 / 1125³ 的算例从"1 分钟后 OOM"变成 **10 秒**内报错。
+
+### 12.4 相关开关一览
+
+| 环境变量 | 作用 |
+|---|---|
+| `SOG_MIDTOWN_SLAB=1` | 走 z-slab 分布式网格（AD 力）；ik 时自动回落 |
+| `SOG_MIDTOWN_DIST=1` | 走 local-spread 分布式网格（AD 力）；ik 时自动回落 |
+| `SOG_SLAB_STRICT=1` | 上两者遇 ik 时**硬报错**而不是回落（CI / 批处理用） |
+| `SOG_MIDTOWN_FORM_A=0/1` | CubeS₂ 的 Form A / Form B 去卷积 |
+| `SOG_MIDTOWN_DEBUG=1` | 打印网格重建与 kernel 参数 |
+
 ---
 
 # 附录 A　核参数口径换算（第二部分的模型 → 第一部分的 `sog/kk`）
@@ -443,3 +527,6 @@ bandwidth = [s**2 for s in width]
 1. `pytest source/tests/pt_expt/kernels/test_mesh_backend.py`（各样条对 replicated 的偏差）。
 2. `pytest source/tests/common/dpmodel/test_grid_rule.py test_long_range.py`。
 3. 冻结后 `dp test -m model.pt2` 能加载、`topologies` 里含 `pme_mesh`。
+4. 若环境里设了 `SOG_MIDTOWN_SLAB` / `SOG_MIDTOWN_DIST`：ik 模型必须看到 §12.1 的警告
+   并**跑完**（`pe` 与不带 env 逐位相同）；想让配置错误立刻暴露，再加 `SOG_SLAB_STRICT=1`
+   确认它变成可读的 undefined-output 错误而不是 `'self'`。
