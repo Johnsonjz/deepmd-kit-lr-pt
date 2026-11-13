@@ -30,7 +30,7 @@ variable  DATA   index   /path/to/system.data
 variable  TYPES  string  "O H"
 # SOG kernel of the trained model, in the C++ kspace convention:
 #   K(k^2) = sum_m amp_m exp(-bandwidth_m k^2 / 2),  bandwidth = sigma^2
-# Extract it from the checkpoint, do NOT retype it by hand -- see the doc.
+# Export it from the checkpoint, do NOT retype it by hand.
 variable  KERNEL string  "amp 0.0 bandwidth 0.0"
 # Optional: number of steps.
 variable  NSTEPS index   100000
