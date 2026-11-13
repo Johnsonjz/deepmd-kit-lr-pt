@@ -3053,10 +3053,9 @@ NcclApi &nccl_api(){
   if(e) cands[nc++]=e;
   cands[nc++]="libnccl.so.2";
   cands[nc++]="libnccl.so";
-  // Last resort for this deployment: the NCCL that ships inside the torch
-  // wheel's nvidia/ tree, which is not on LD_LIBRARY_PATH by default.
-  cands[nc++]="/data/home/jiangzhen/.conda/envs/lr/lib/python3.11/"
-              "site-packages/nvidia/nccl/lib/libnccl.so.2";
+  // The NCCL that ships inside the torch wheel's nvidia/ tree is not on
+  // LD_LIBRARY_PATH by default; point SOG_NCCL_LIB at it when the loader
+  // cannot find a system NCCL.
   for(int i=0;i<nc && !a.ok;++i){
     void *lib=dlopen(cands[i],RTLD_NOW|RTLD_LOCAL);
     if(!lib) continue;

@@ -17,10 +17,8 @@
 #       lmp -k on g 1 -in in.deepmd_kk_sog.lammps
 #   Multi-rank: use the HOST chain instead (pair deepmd + kspace sog) --
 #   the device response path in `fix sog/response` aborts at np > 1 and the
-#   replicated k-space virial is scaled by np.  See docs/PAIR_DEEPMD_KK_SOG.md
-#   §9 before running this input on more than one rank.
-#   See docs/PAIR_DEEPMD_KK_SOG.md for the environment, the keyword reference
-#   and the failure modes.
+#   replicated k-space virial is scaled by np.  Do not run this input on more
+#   than one rank.
 # ============================================================================
 
 # ---------------------------- USER: replace these ---------------------------

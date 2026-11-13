@@ -658,7 +658,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
       sog_gpu_setup_f32(local.state, nx, ny, nz, ge.data(), gf.data(),
                         gv.data());
       // Form A: replace the Form-B variance subtraction by the exact measured
-      // assignment-window symbol (see docs/MESH_ERROR_MODEL_AND_FORM_A.md).
+      // assignment-window symbol (see the Midtown paper).
       //
       // Default: ON at both CubeS2 orders, for every non-tilted mesh.  The
       // variance-subtraction residual dominates the order-4 energy error

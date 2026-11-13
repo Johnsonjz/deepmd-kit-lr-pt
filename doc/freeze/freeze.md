@@ -74,7 +74,6 @@ production form for long-range (`latent_charge`) models: it is markedly faster
 and much smaller than the default graph lower, and it is **required for
 multi-rank** (np>1) inference — a default graph-lower long-range artifact
 raises "run on a single rank" under MPI. `--compress` requires `--pt-expt`.
-See `docs/FREEZE_SOP.md` for the full production procedure.
 :::
 
 :::{tab-item} Paddle {{ paddle_icon }}

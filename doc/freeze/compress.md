@@ -110,7 +110,7 @@ dp --pt-expt freeze -c model.ckpt.pt -o model.pt2 --compress
 This emits the compact canonical lower directly (`lower_input_kind=dpa4c_canonical`).
 It is the recommended production form — faster and far smaller than the default
 graph lower — and, for long-range (`latent_charge`) models, **required for
-multi-rank** inference. See `docs/FREEZE_SOP.md`.
+multi-rank** inference.
 :::
 
 :::{tab-item} JAX {{ jax_icon }}

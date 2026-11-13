@@ -4,21 +4,29 @@
 #   ./run.sh in.deepmd_kk_sog.lammps            # 1 rank, 1 GPU
 #   ./run.sh -np 4 in.deepmd_kk_sog.lammps      # 4 ranks, one GPU each
 #
-# The three variables below are the only host-specific settings.
+# The four variables below are the only host-specific settings.
 set -euo pipefail
 
 # 1. Kokkos-enabled LAMMPS (PKG_KOKKOS built with CUDA).
-LMP=${LMP:-/data/home/public/jiangzhen/dp/lmp_kokkos_install/bin/lmp}
+LMP=${LMP:-lmp}
 # 2. DeePMD install prefix (holds deepmd/lib/libdeepmd_cc.so and the
 #    AOTInductor runtime the frozen .pt2 needs).
-DP_INSTALL=${DP_INSTALL:-/data/home/public/jiangzhen/dp/lr_install}
+DP_INSTALL=${DP_INSTALL:?set DP_INSTALL to the DeePMD install prefix}
 # 3. Directory holding the plugin .so (deepmd_lmp.so, or a *plugin.so symlink).
 PLUGIN_DIR=${PLUGIN_DIR:-/tmp/lmpkk_plugin}
 # 4. Conda env that ships the libstdc++/CUDA runtimes the frozen artifact was
 #    built against (torch's bundled CUDA must win over the system one).
-CONDA=${CONDA:-/data/home/jiangzhen/.conda/envs/lr}
+CONDA=${CONDA:-${CONDA_PREFIX:-}}
+if [ -z "$CONDA" ]; then
+    echo "run.sh: activate the conda env the artifact was built with, or set CONDA" >&2
+    exit 1
+fi
 
-TORCH_NV=${CONDA}/lib/python3.11/site-packages/nvidia
+TORCH_NV=$(ls -d "$CONDA"/lib/python*/site-packages/nvidia 2>/dev/null | head -n 1)
+if [ -z "$TORCH_NV" ]; then
+    echo "run.sh: no nvidia/ runtime tree under $CONDA/lib/python*" >&2
+    exit 1
+fi
 export LD_LIBRARY_PATH=${CONDA}/lib:${TORCH_NV}/cuda_runtime/lib:${TORCH_NV}/cuda_cupti/lib:${TORCH_NV}/nvjitlink/lib:${LMP%/bin/lmp}/lib:${DP_INSTALL}/deepmd/lib
 export DP_BACKEND_PLUGIN_PATH=${DP_INSTALL}/deepmd/lib
 export LAMMPS_PLUGIN_PATH=${PLUGIN_DIR}
