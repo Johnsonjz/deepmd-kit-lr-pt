@@ -440,12 +440,15 @@ class DeepPotBackend : public DeepBaseModelBackend {
       const std::int64_t nloc,
       const std::int64_t nall_nodes,
       const std::int64_t edge_storage,
-      void* stream);
+      void* stream,
+      const InputNlist* comm_nlist = nullptr,
+      const std::vector<int>* node_map = nullptr);
   virtual bool supports_device_edge_inference() const;
   virtual bool uses_fp32_edge_vectors() const;
   virtual bool uses_canonical_graph_inference() const;
   virtual bool canonical_graph_requires_source_csr() const;
   virtual bool has_long_range() const;
+  virtual bool has_message_passing() const;
 };
 
 /**
@@ -973,7 +976,8 @@ class DeepPot : public DeepBaseModel {
    * without a synchronization of the stream. A graph without halo nodes is
    * captured into a CUDA graph on the second consecutive call with the same
    * buffers and extents and replayed while they stay the same, except where a
-   * model with a long-range module receives a communicator. A model whose
+   * model with a long-range module receives a communicator or a message-passing
+   * descriptor exchanges halo features (``comm_nlist`` non-null). A model whose
    * module serves periodic systems copies the cell into memory of its own,
    * which a replay reads, and the mesh size of the cell counts as an extent: a
    * call with another cell than the previous call first waits for the earlier
@@ -992,6 +996,18 @@ class DeepPot : public DeepBaseModel {
    * turns; CUDA work outside DeePMD-kit that waits for the whole device while a
    * capture is under way invalidates it, and the model then evaluates without
    * replay.
+   * @param[in] comm_nlist Send/recv swap metadata of the caller's decomposition
+   * (its geometry fields are unused), or null. A model whose descriptor
+   * exchanges halo features across ranks carries an exchange artifact, and a
+   * frame it evaluates with halo nodes requires it; every other model ignores
+   * it. The compact canonical node set is the extended real-atom set, so the
+   * swap lists address it directly unless ``node_map`` remaps them.
+   * @param[in] node_map ``(nall)`` map from a LAMMPS atom index to its compact
+   * canonical model-node index, with ``-1`` for an atom without a node (a
+   * NULL-type virtual atom), or null when the two index spaces coincide. Read
+   * only with ``comm_nlist``; the swap lists are translated through it and
+   * every entry without a node is dropped, so the exchange runs on the node
+   * set the artifact evaluates.
    */
   void compute_canonical_graph_gpu(double* d_atom_energy,
                                    double* d_force,
@@ -1010,7 +1026,21 @@ class DeepPot : public DeepBaseModel {
                                    const std::int64_t nloc,
                                    const std::int64_t nall_nodes,
                                    const std::int64_t edge_storage,
-                                   void* stream = nullptr);
+                                   void* stream = nullptr,
+                                   const InputNlist* comm_nlist = nullptr,
+                                   const std::vector<int>* node_map = nullptr);
+
+  /**
+   * @brief Whether the model's descriptor is message passing.
+   *
+   * A message-passing descriptor updates each node from its neighbours'
+   * features, so under domain decomposition its halo nodes need features
+   * exchanged across ranks inside the forward pass (see the ``comm_nlist``
+   * parameter of compute_canonical_graph_gpu and compute_edges_gpu). A local
+   * descriptor computes every node from its own neighbourhood and needs no
+   * exchange.
+   */
+  bool has_message_passing() const;
 
   int dim_chg_spin() const;
 

@@ -3655,8 +3655,8 @@ def interaction_kernel_sog() -> list[Argument]:
     doc_base_width = (
         "The width of the first default Gaussian, in Å. Unset leaves the ladder "
         "to the config layer, which applies the SOG library rule "
-        "sigma = n_layers * rcut / 1.9893 for a bare `sog` kernel; set it to "
-        "use an explicit ladder instead."
+        "sigma = n_layers * rcut * 0.3633717409009413 for a bare `sog` kernel; "
+        "set it to use an explicit ladder instead."
     )
     doc_width_ratio = (
         "The ratio of consecutive default widths. Must exceed one. Unset leaves "
@@ -3679,7 +3679,8 @@ def interaction_kernel_sog() -> list[Argument]:
             default=None,
             doc=doc_width,
         ),
-        Argument("n_gaussian", int, optional=True, default=12, doc=doc_n_gaussian),
+        # The SOG library default, deepmd.dpmodel.long_range.kernel.SOG_DEFAULT_M.
+        Argument("n_gaussian", int, optional=True, default=7, doc=doc_n_gaussian),
         Argument(
             "base_width",
             [float, type(None)],

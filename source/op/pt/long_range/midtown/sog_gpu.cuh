@@ -162,10 +162,30 @@ int sog_gpu_slab_xyfft_pack_brick_dev(SogGpuState *s, int nx, int ny, int nz,
                                       int ZL, int np, int zoff);
 int sog_gpu_slab_unpack_green_izpack_dev(SogGpuState *s, int nx, int ny, int nz,
                                          int ylo, int YL, double lx, double ly,
-                                         double lz, double scaleinv, int np);
+                                         double lz, double scaleinv, int np,
+                                         int keep_spec);
+// ik force mode: i*k_axis applied to the spectrum kept by the call above, its
+// inverse z transform and the pack for the same transpose.
+int sog_gpu_slab_grad_izpack_dev(SogGpuState *s, int nx, int ny, int nz, int ylo,
+                                 int YL, double lx, double ly, double lz,
+                                 int np, int axis);
 int sog_gpu_slab_unpack_ixyfft_to_brick_dev(SogGpuState *s, int nx, int ny,
                                             int nz, int ZL, int np, int zoff,
-                                            int ZB);
+                                            int ZB, float *out);
+// ik force mode: one Cartesian component of the force from one gradient brick.
+// `upload` shares the x/q transfer across the three components; the result
+// stays on the device until sog_gpu_gather_brick_ik_finish.
+float *sog_gpu_potential_brick(SogGpuState *s);
+float *sog_gpu_grad_brick(SogGpuState *s, size_t n);
+void sog_gpu_gather_brick_dev_ik(SogGpuState *s, int nlocal, const double *x,
+                                 const double *boxlo, double lx, double ly,
+                                 double lz, const double *q, double qscale,
+                                 int spline, int nx, int ny, int nz, int nxlo,
+                                 int nxhi, int nylo, int nyhi, int nzlo,
+                                 int nzhi, const float *u, const float *g,
+                                 int comp, int want_pot, int upload);
+void sog_gpu_gather_brick_ik_finish(SogGpuState *s, int nlocal, double *force,
+                                    double *vpot, int want_pot);
 int sog_gpu_nccl_get_id(void *id);
 int sog_gpu_nccl_init(int np, int me, const void *id);
 int sog_gpu_nccl_ok();
@@ -188,6 +208,14 @@ int sog_gpu_nccl_halo_rev(SogGpuState *s, int prev, int next, size_t plane,
                           int zoff, int ZL, int gh_lo, int gh_hi);
 int sog_gpu_nccl_halo_fwd(SogGpuState *s, int prev, int next, size_t plane,
                           int zoff, int ZL, int gh_lo, int gh_hi);
+// The same exchange on an arbitrary float brick (the ik gradient brick).
+int sog_gpu_nccl_halo_fwd_at(SogGpuState *s, float *base, int prev, int next,
+                             size_t plane, int zoff, int ZL, int gh_lo,
+                             int gh_hi);
+int sog_gpu_brick_allreduce_f_at(SogGpuState *s, float *base, size_t off,
+                                 size_t n);
+void sog_gpu_brick_copy_planes_at(SogGpuState *s, float *base, size_t src_off,
+                                  size_t dst_off, size_t n);
 int sog_gpu_nccl_allreduce_red(SogGpuState *s);
 void sog_gpu_red_download(SogGpuState *s, double *host);
 int sog_gpu_slab_xyfft_pack_brick(SogGpuState *s, int nx, int ny, int nz,

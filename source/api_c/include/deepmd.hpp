@@ -1417,6 +1417,17 @@ class DeepPot : public DeepBaseModel {
   }
 
   /**
+   * @brief Query whether the model's descriptor is message passing, whose
+   * halo nodes need their features exchanged across ranks inside the forward
+   * pass; see DP_DeepPotHasMessagePassing.
+   */
+  bool has_message_passing() const {
+    const bool result = DP_DeepPotHasMessagePassing(dp);
+    DP_CHECK_OK(DP_DeepPotCheckOK, dp);
+    return result;
+  }
+
+  /**
    * @brief Query whether the loaded artifact supports device-edge inference.
    */
   bool supports_device_edge_inference() const {

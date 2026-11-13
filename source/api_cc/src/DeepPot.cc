@@ -674,7 +674,9 @@ void DeepPotBackend::compute_canonical_graph_gpu(
     const std::int64_t nloc,
     const std::int64_t nall_nodes,
     const std::int64_t edge_storage,
-    void* stream) {
+    void* stream,
+    const InputNlist* comm_nlist,
+    const std::vector<int>* node_map) {
   (void)d_atom_energy;
   (void)d_force;
   (void)d_virial;
@@ -692,6 +694,8 @@ void DeepPotBackend::compute_canonical_graph_gpu(
   (void)nall_nodes;
   (void)edge_storage;
   (void)stream;
+  (void)comm_nlist;
+  (void)node_map;
   throw deepmd::deepmd_exception(
       "compact canonical graph inference is only supported by a compatible "
       "PyTorch Exportable backend.");
@@ -708,6 +712,8 @@ bool DeepPotBackend::supports_device_edge_inference() const { return false; }
 bool DeepPotBackend::uses_canonical_graph_inference() const { return false; }
 
 bool DeepPotBackend::has_long_range() const { return false; }
+
+bool DeepPotBackend::has_message_passing() const { return false; }
 
 void DeepPot::compute_edges_gpu(double* d_atom_energy,
                                 double* d_force,
@@ -780,12 +786,14 @@ void DeepPot::compute_canonical_graph_gpu(
     const std::int64_t nloc,
     const std::int64_t nall_nodes,
     const std::int64_t edge_storage,
-    void* stream) {
+    void* stream,
+    const InputNlist* comm_nlist,
+    const std::vector<int>* node_map) {
   dp->compute_canonical_graph_gpu(
       d_atom_energy, d_force, d_virial, d_atom_virial, d_atype, d_source,
       index_width, d_edge_vec, d_destination_row_ptr, d_source_row_ptr,
       d_source_order, d_coord, world, box, nloc, nall_nodes, edge_storage,
-      stream);
+      stream, comm_nlist, node_map);
 }
 
 bool DeepPot::uses_fp32_edge_vectors() const {
@@ -805,6 +813,8 @@ bool DeepPot::canonical_graph_requires_source_csr() const {
 }
 
 bool DeepPot::has_long_range() const { return dp->has_long_range(); }
+
+bool DeepPot::has_message_passing() const { return dp->has_message_passing(); }
 
 int DeepPot::dim_chg_spin() const { return dp->dim_chg_spin(); }
 

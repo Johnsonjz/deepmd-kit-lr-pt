@@ -40,12 +40,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 COUL = 14.3996454784255
 KEY = "model.Default.atomic_model.long_range.kernel"
-CKPT = (sys.argv[1] if len(sys.argv) > 1 else
-        "/data/home/public/jiangzhen/dp/master-merge-test/water/"
-        "run_150k_widthfloor_archive/model.ckpt-150000.pt")
-_sd = torch.load(CKPT, map_location="cpu")["model"]
-KA = _sd[KEY + ".amplitude"].detach().cpu().double().numpy().tolist()
-KW = np.exp(_sd[KEY + ".log_width"].detach().cpu().double().numpy()).tolist()
+
+# Optional geometric u-series kernel (RBSOG_SISC 2023 Table 1, C1 construction).
+#   SOG_GEOM="b,sigma_min,omega,M"  ->  sigma_m = sigma_min b^m,
+#   a_m = (pi/2)^-1/2 ln(b)/sigma_m, a_0 *= omega  (k-space b_m = 4 pi ln b sigma_m^2).
+GEOM = os.environ.get("SOG_GEOM", "")
+# Energy-error normalisation: "k" divides by the k-space reference energy Ek
+# (the mesh error lives entirely in the k-space part; the self-energy is exact),
+# "e" (default) divides by the total reference energy E.
+ENORM = os.environ.get("SOG_ENORM", "e")
+if GEOM:
+    _b, _smin, _omega, _M = [float(x) for x in GEOM.split(",")]
+    KW = [_smin * _b**m for m in range(int(_M))]
+    KA = [(math.pi / 2) ** -0.5 * math.log(_b) / s for s in KW]
+    KA[0] *= _omega
+    CKPT = f"geom_b{_b:g}_s{_smin:g}_w{_omega:g}_M{int(_M)}"
+else:
+    CKPT = (sys.argv[1] if len(sys.argv) > 1 else
+            "/data/home/public/jiangzhen/dp/master-merge-test/water/"
+            "run_150k_widthfloor_archive/model.ckpt-150000.pt")
+    _sd = torch.load(CKPT, map_location="cpu")["model"]
+    KA = _sd[KEY + ".amplitude"].detach().cpu().double().numpy().tolist()
+    KW = np.exp(_sd[KEY + ".log_width"].detach().cpu().double().numpy()).tolist()
 OUT = sys.argv[2] if len(sys.argv) > 2 else ""
 
 NATOMS, L, NCONF = 64, 12.0, 32
@@ -78,11 +94,12 @@ def direct_k_sum(coord, q, L, kcut=14):
     ph = c @ k.T
     rho = (qq[:, None] * torch.exp(-1j * ph)).sum(0)
     E = 0.5 / L ** 3 * (K * rho.abs() ** 2).sum() * COUL
+    Ek = float(E.item())
     E = E - 0.5 * COUL * float(np.sum(KA)) * float((qq * qq).sum())
     imag = (rho.conj()[None, :] * torch.exp(-1j * ph)).imag
     F = -(COUL / L ** 3) * (qq[:, None, None] * imag[:, :, None]
                             * K[None, :, None] * k[None, :, :]).sum(1)
-    return float(E.item()), F.numpy().reshape(-1, 3)
+    return float(E.item()), F.numpy().reshape(-1, 3), Ek
 
 
 def fit(dl, err):
@@ -102,16 +119,17 @@ def main():
     box = torch.tensor([[L, 0, 0, 0, L, 0, 0, 0, L]], dtype=torch.float64)
     comm = torch.zeros(1, dtype=torch.int64)
 
-    coords, charges, refs, frms = [], [], [], []
+    coords, charges, refs, frms, eknorms = [], [], [], [], []
     for s in range(NCONF):
         g = torch.Generator().manual_seed(100 + s)
         c = torch.rand(NATOMS, 3, generator=g, dtype=torch.float64) * L
         q = torch.randn(NATOMS, generator=g, dtype=torch.float32).double()
         q = q - q.mean()
-        E, F = direct_k_sum(c, q, L)
+        E, F, Ek = direct_k_sum(c, q, L)
         coords.append(c)
         charges.append(q)
         refs.append((E, F))
+        eknorms.append(abs(Ek))
         frms.append(float(np.sqrt((F ** 2).mean())))
 
     def ev(coord, q, order, spacing, backend, mode):
@@ -128,8 +146,8 @@ def main():
         torch.cuda.synchronize()
         return float(e.sum().item()), f.double().cpu().numpy().reshape(-1, 3)
 
-    print(f"# kernel {os.path.basename(os.path.dirname(CKPT))}  "
-          f"sigma_min={SMIN:.4f} A")
+    print(f"# kernel {CKPT if GEOM else os.path.basename(os.path.dirname(CKPT))}  "
+          f"sigma_min={SMIN:.4f} A  M={len(KA)}")
     print(f"{'backend':>9} {'mode':>3} {'ord':>3} {'n':>4} {'D/sig':>7} "
           f"{'dE/E':>11} {'dF/F':>11}")
     res = {}
@@ -142,7 +160,8 @@ def main():
                 de, df = [], []
                 for s in range(NCONF):
                     E, F = ev(coords[s], charges[s], order, sp, backend, mode)
-                    de.append(abs(E - refs[s][0]) / abs(refs[s][0]))
+                    de.append(abs(E - refs[s][0])
+                              / (eknorms[s] if ENORM == "k" else abs(refs[s][0])))
                     df.append(float(np.sqrt(((F - refs[s][1]) ** 2).mean())) / frms[s])
                 dl = (L / ng) / SMIN
                 e = float(np.sqrt(np.mean(np.square(de))))

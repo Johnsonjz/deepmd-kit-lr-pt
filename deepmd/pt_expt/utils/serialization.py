@@ -317,11 +317,15 @@ def _needs_with_comm_artifact(
     ):
         return False
     if atomic_model.has_long_range():
-        # Neither with-comm lower carries the reciprocal-space topologies of a
-        # long-range module: the graph with-comm trace raises in the atomic
-        # model for want of them, and the compact canonical route has no comm
-        # slots at all. A model with a module therefore gets no with-comm
-        # sibling, whatever its descriptor could do on its own.
+        # Neither of the lowers this function speaks for carries the
+        # reciprocal-space topologies of a long-range module: the graph
+        # with-comm trace has no slot for the node positions, the cell or the
+        # module's communicator, and the dense with-comm wrapper has none
+        # either. A model with a module therefore gets no with-comm sibling
+        # here. The compact canonical lower is the exception, and it is asked
+        # separately: ``_needs_canonical_with_comm`` answers for it, because
+        # its with-comm trace does carry the positions, the cells and one MPI
+        # handle that serves both the border exchange and the module.
         return False
     if lower_kind == "graph":
         return True

@@ -1,5 +1,15 @@
 # midtown 样条性能优化计划（CubeS₂ / QuadS）
 
+> **2026-11-13 更正（重要）**：本文 §1 的 M0 与 `SPLINE_MATRIX_BENCH.md`
+> 的 per-atom/显存数据，是在 **midtown 的 CUDA graph 捕获失败**时测的
+> （CUDA 系数未 pin 的 D2H 让 capture 回退 eager；mesh kernel 走 legacy
+> default stream，即使捕获成功也不进图）。这些数字是 **pre-fix**，
+> 不能用于 backend 对比。修复后的 98k/331k 实测见
+> [`MIDTOWN_PERF_REDESIGN.md`](MIDTOWN_PERF_REDESIGN.md) §0.1：
+> CubeS₂-6 AD 等精度 LR −5%、显存 −4~5%，mesh 本身同网格 −20~25%。
+> 全配置（B-spline 4/6、CubeS₂ 4/6 AD/ik、QuadS 4/6 AD/ik）的
+> post-fix 表见 [`MIDTOWN_ALL_CONFIGS.md`](MIDTOWN_ALL_CONFIGS.md)。
+
 范围：**lr-pt 侧图内算子** `latent_charge_sum` 的 midtown 后端
 （`source/op/pt/long_range/midtown/`），即 `sog_gpu.cu` / `sog_spline.h` / `sog_green.h`。
 LAMMPS 树（`deepmd-kit-LR`）的 `sog.cpp` 不在本文范围内。

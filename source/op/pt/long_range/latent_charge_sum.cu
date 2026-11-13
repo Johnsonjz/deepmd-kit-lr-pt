@@ -274,30 +274,41 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
   bool slab_ok = slab_env != nullptr && std::atoi(slab_env) != 0 &&
                  (mesh_backend == 0 || mesh_backend == 1 || mesh_backend == 2);
   if (slab_ok && force_mode != 0) {
-    // The distributed solves carry the AD gather only; they have no i*k
-    // differentiation.  Falling back to the replicated solve is a PARALLELISM
-    // change, not a physics one -- the replicated solve evaluates the same
-    // force law -- so warn and continue instead of aborting an MD run from an
-    // env var that may be set process-wide (a bench harness, a container
-    // profile).  Each rank then holds the full mesh, which is why
-    // SOG_SLAB_STRICT=1 restores the hard error for batch runs that must not
-    // silently take the more memory-hungry path.
-    const char* strict = std::getenv("SOG_SLAB_STRICT");
-    TORCH_CHECK(
-        strict == nullptr || std::atoi(strict) == 0,
-        "latent_charge_sum: force_mode != 0 (ik) is implemented on the "
-        "replicated midtown solve only; unset SOG_MIDTOWN_SLAB (or unset "
-        "SOG_SLAB_STRICT to fall back automatically)");
-    static bool warned_ik_slab = false;
-    if (!warned_ik_slab) {
-      warned_ik_slab = true;
-      TORCH_WARN(
-          "SOG_MIDTOWN_SLAB is set but force_mode != 0 (ik): the distributed "
-          "solves implement only the AD gather, so this call runs the "
-          "replicated solve. The force law is identical; every rank now holds "
-          "the full mesh.");
+    // The distributed solve carries the ik force mode behind its own opt-in
+    // switch: ik needs one extra transpose + inverse z per Cartesian component,
+    // ~4x the collective traffic of the AD solve and one extra pencil and
+    // brick, so it must not follow a SOG_MIDTOWN_SLAB that a bench harness or
+    // a container profile set process-wide.
+    const char* ik_env = std::getenv("SOG_SLAB_IK");
+    const bool ik_slab = ik_env != nullptr && std::atoi(ik_env) != 0;
+    if (!ik_slab) {
+      // Falling back to the replicated solve is a PARALLELISM change, not a
+      // physics one -- the replicated solve evaluates the same force law -- so
+      // warn and continue instead of aborting an MD run from an env var.  Each
+      // rank then holds the full mesh, which is why SOG_SLAB_STRICT=1 restores
+      // the hard error for batch runs that must not silently take the more
+      // memory-hungry path.
+      const char* strict = std::getenv("SOG_SLAB_STRICT");
+      TORCH_CHECK(
+          strict == nullptr || std::atoi(strict) == 0,
+          "latent_charge_sum: force_mode != 0 (ik) on the distributed mesh "
+          "needs SOG_SLAB_IK=1; unset SOG_MIDTOWN_SLAB (or unset "
+          "SOG_SLAB_STRICT to fall back automatically)");
+      static bool warned_ik_slab = false;
+      if (!warned_ik_slab) {
+        warned_ik_slab = true;
+        TORCH_WARN(
+            "SOG_MIDTOWN_SLAB is set but force_mode != 0 (ik) and "
+            "SOG_SLAB_IK is not: this call runs the REPLICATED solve, so every "
+            "rank holds the full mesh. Set SOG_SLAB_IK=1 to run ik on the "
+            "distributed mesh. The force law is identical either way.");
+      }
+      slab_ok = false;
+    } else {
+      TORCH_CHECK(mesh_backend != 0,
+                  "latent_charge_sum: the ik force mode is defined for the "
+                  "midtown and quads mesh backends only, not the B-spline");
     }
-    slab_ok = false;
   }
   if (slab_ok) {
     TORCH_CHECK(periodic, "the slab backend needs periodic frames");
@@ -309,7 +320,7 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
         coord, charge, node_mask, n_node_per_frame, total_charge, cells,
         coefficient, kernel, channel, prefactor, order, spacing,
         &communicator, /*quads=*/mesh_backend == 2,
-        /*bspline=*/mesh_backend == 0);
+        /*bspline=*/mesh_backend == 0, force_mode);
   }
   const char* dist_env = std::getenv("SOG_MIDTOWN_DIST");
   const bool want_dist = dist_env != nullptr && std::atoi(dist_env) != 0;
@@ -329,22 +340,24 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
         &communicator);
   }
   if (mesh_backend == 1 && ranks > 1 && want_dist && force_mode != 0) {
-    // Same fallback as the slab branch above: SOG_MIDTOWN_DIST has no i*k
-    // path, so an ik request runs on the replicated solve instead of aborting.
+    // Same fallback as the slab branch above, but this one has no ik path at
+    // all: the local-spread stencils are hardwired to CubeS2 order 6 and have
+    // no Fourier-differentiated gather.
     const char* strict = std::getenv("SOG_SLAB_STRICT");
     TORCH_CHECK(
         strict == nullptr || std::atoi(strict) == 0,
-        "latent_charge_sum: force_mode != 0 (ik) is implemented on the "
-        "replicated midtown solve only; unset SOG_MIDTOWN_DIST (or unset "
+        "latent_charge_sum: force_mode != 0 (ik) is not implemented on the "
+        "local-spread distributed solve; unset SOG_MIDTOWN_DIST (or unset "
         "SOG_SLAB_STRICT to fall back automatically)");
     static bool warned_ik_dist = false;
     if (!warned_ik_dist) {
       warned_ik_dist = true;
       TORCH_WARN(
-          "SOG_MIDTOWN_DIST is set but force_mode != 0 (ik): the distributed "
-          "solves implement only the AD gather, so this call runs the "
+          "SOG_MIDTOWN_DIST is set but force_mode != 0 (ik): the local-spread "
+          "solve has no Fourier-differentiated force, so this call runs the "
           "replicated solve. The force law is identical; every rank now holds "
-          "the full mesh.");
+          "the full mesh. (The z-slab solve does implement ik: "
+          "SOG_MIDTOWN_SLAB=1 SOG_SLAB_IK=1.)");
     }
   }
   if (ranks == 1) {

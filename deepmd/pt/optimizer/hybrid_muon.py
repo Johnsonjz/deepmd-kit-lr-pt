@@ -2220,6 +2220,21 @@ class HybridMuonOptimizer(Optimizer):
                             state["bias_correction2"] = torch.zeros(
                                 (), dtype=torch.float32, device=p.device
                             )
+                    else:
+                        # ``Optimizer.load_state_dict`` casts restored state to the
+                        # parameter's dtype, so a float64 parameter -- the latent
+                        # charge's per-type bias, for one -- comes back with float64
+                        # moments.  The Adam path is float32 throughout and the
+                        # fused ``_foreach_*`` kernels demand one dtype, so restore
+                        # the documented invariant instead of trusting the cast.
+                        # ``.float()`` returns the tensor itself when it already
+                        # holds float32.
+                        state["exp_avg"] = state["exp_avg"].float()
+                        state["exp_avg_sq"] = state["exp_avg_sq"].float()
+                        for clock_key in ("bias_correction1", "bias_correction2"):
+                            clock = state.get(clock_key)
+                            if isinstance(clock, torch.Tensor):
+                                state[clock_key] = clock.float()
 
                     adam_params.append(p)
                     adam_grads_fp32.append(grad.float())

@@ -109,7 +109,7 @@ ChargeSumOutputs midtown_sum_slab(
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
     const torch::Tensor* communicator, bool quads = false,
-    bool bspline = false);
+    bool bspline = false, int64_t force_mode = 0);
 
 ChargeSumOutputs midtown_sum_local(const torch::Tensor& coord,
                                    const torch::Tensor& charge,

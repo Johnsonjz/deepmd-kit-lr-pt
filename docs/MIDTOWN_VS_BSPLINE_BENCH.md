@@ -1,5 +1,10 @@
 # midtown (CubeS₂) vs B-spline：等精度下的 Fourier 与整步速度
 
+> **2026-11-13 更正**：本文的逐后端数字早于 CUDA graph 捕获/stream 修复
+> （midtown 的 mesh 未进图，模型回退 eager）。修复后 98k/331k/526k 的
+> 等精度实测见 [`MIDTOWN_PERF_REDESIGN.md`](MIDTOWN_PERF_REDESIGN.md) §0.1；
+> 本文的绝对 ms/显存不再可直接比较。
+
 比较 **midtown（CubeS₂）** 与 **B-spline** 两种网格后端在同一条 SOG 长程链上的速度，
 重点回答：**CubeS₂ 的 Fourier 力微分（`ik` 模式）在等精度下是否划得来。**
 

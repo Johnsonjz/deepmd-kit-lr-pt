@@ -1889,6 +1889,15 @@ bool DP_DeepPotHasLongRange(DP_DeepPot* dp) {
   }
 }
 
+bool DP_DeepPotHasMessagePassing(DP_DeepPot* dp) {
+  try {
+    return dp->dp.has_message_passing();
+  } catch (deepmd::deepmd_exception& ex) {
+    dp->exception = std::string(ex.what());
+    return false;
+  }
+}
+
 // multiple frames
 void DP_DeepPotCompute2(DP_DeepPot* dp,
                         const int nframes,

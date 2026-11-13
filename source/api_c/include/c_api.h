@@ -563,6 +563,21 @@ extern bool DP_DeepPotCanonicalGraphRequiresSourceCSR(DP_DeepPot* dp);
 extern bool DP_DeepPotHasLongRange(DP_DeepPot* dp);
 
 /**
+ * @brief Query whether the model's descriptor is message passing.
+ *
+ * A message-passing descriptor updates each node from its neighbours'
+ * features, so under domain decomposition its halo nodes need features
+ * exchanged across ranks inside the forward pass. The C++ API passes the swap
+ * metadata of the decomposition to
+ * DeepPot::compute_canonical_graph_gpu and DeepPot::compute_edges_gpu for
+ * exactly this case; this C interface carries no neighbor-list argument, so a
+ * decomposed frame of such a model is refused rather than evaluated with stale
+ * halo features.
+ * @since API version 31
+ */
+extern bool DP_DeepPotHasMessagePassing(DP_DeepPot* dp);
+
+/**
  * @brief Evaluate the energy, force and virial by using a DP. (double version)
  * @version 2
  * @param[in] dp The DP to use.

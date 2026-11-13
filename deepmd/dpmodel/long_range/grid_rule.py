@@ -43,12 +43,19 @@ The CubeS2 backend has a second force mode, ``force_mode="ik"``, that
 differentiates the potential in Fourier space instead of differentiating the
 assignment weights.  It removes the extra order that the C0 window costs AD, so
 the force exponent rises to ``2 nu`` and the force constant falls by an order of
-magnitude; :data:`IK_FORCE_RULE` holds that law.  Because the force and the
-energy then share one exponent, the energy can be the binding constraint, so
-:func:`spacing` sizes an ik grid by the worse of :data:`IK_FORCE_RULE` and
-:data:`ENERGY_RULE`.  AD and the B-spline keep their force-only rule: their
-force exponent is strictly lower than the energy's, so the force already
-dominates every grid they size.
+magnitude; :data:`IK_FORCE_RULE` holds that law.  The :data:`FORCE_RULE` and
+:data:`IK_FORCE_RULE` tables are the measured force laws; they are kept for
+reference and for callers that need an explicit force-relative guarantee, but
+:func:`spacing` no longer reads them.
+
+**The deployed grid is sized by the energy law** (:data:`ENERGY_RULE`) for every
+backend and force mode.  The energy law uses the k-space normalisation
+``|dE|/|E_k|`` (kernel independent) and is the single convention of the paper's
+equal-accuracy table, so ``spacing`` returns one grid for AD and ik alike.  This
+means ``pme_accuracy`` is an *energy-relative* target: the AD force exponent is
+one lower than the energy exponent, so an AD grid sized this way meets the
+energy target but leaves the force error above it (7-60x the target, measured);
+callers that need a force guarantee must invert :data:`FORCE_RULE` themselves.
 
 The measured law alone sizes the grid.  There is deliberately **no** Nyquist
 ceiling ``PME_SPACING_FRACTION * pi / k_max`` on top of it: the law is measured
@@ -60,7 +67,7 @@ the CubeS2 validity ceiling of :func:`spacing`.
 
 import math
 
-#: Force-relative accuracy target of the spacing rule.
+#: Energy-relative (k-space normalised) accuracy target of the spacing rule.
 DEFAULT_ACCURACY = 1e-4
 
 #: CubeS2 optimal assignment parameters (midtown paper SI, notebook 2).
@@ -116,24 +123,31 @@ IK_FORCE_RULE = {
 }
 
 #: ``(backend, order) -> (C, p, provenance)`` for the ENERGY relative error,
-#: ``eps_E = C (Delta / sigma_min)**p``.  Only the ``ik`` force mode consults it
-#: (there the energy and the force share an exponent and either can bind); the
-#: AD and B-spline grids stay force-only.  Same kernels and ensemble as
-#: :data:`FORCE_RULE`; ``p`` is ``2 nu`` = 4.0 / 6.0 (the measured energy slopes
-#: are 4.28-5.09 / 6.40-7.18, above ``2 nu``, so the rounding is conservative)
-#: and ``C`` is refit at it on the worse kernel.  Measured constants: B-spline-4
-#: 7.336e-1 (sigma 2.00) vs 5.390e-1 (1.13); B-spline-6 1.577e-1 vs 1.145e-1;
-#: CubeS2-4 5.117e-2 vs 4.731e-2; CubeS2-6 4.596e-2 vs 5.835e-2.
+#: ``eps_E = C (Delta / sigma_min)**p``, with the **k-space** normalisation
+#: ``eps_E = |dE| / |E_k|`` (not the total ``|E|``).  The mesh error lives
+#: entirely in the k-space part; the self term ``-1/2 G(0) sum q^2`` is an exact
+#: constant, so dividing by ``|E|`` mixes in a kernel-specific self-energy and,
+#: when ``E_k`` and ``E_self`` nearly cancel, makes ``eps_E`` an accident of
+#: ``G(0) = sum a_m``.  That is a real, measured failure mode: two kernels with
+#: the same ``sigma_min = 2.00`` but ``G(0) = 0.192`` vs ``0.327`` give
+#: ``C_E = 1.65e-1`` vs ``9.53e-3`` under ``|E|`` (17x apart), and
+#: ``6.161e-3`` vs ``6.167e-3`` under ``|E_k|`` (<0.1%).  The values below are
+#: the ``|E_k|`` refit at ``p = 2 nu`` on the worse of the two kernels.
+#:
+#: Only the ``ik`` force mode consults this table (there the energy and the
+#: force share an exponent and either can bind); the AD and B-spline grids stay
+#: force-only, so the B-spline rows below are not used to size a grid but are
+#: kept on the same ``|E_k|`` normalisation for the paper's comparison table.
 ENERGY_RULE = {
-    ("bspline", 4): (7.34e-1, 4.0, "measured"),
-    ("bspline", 5): (3.40e-1, 5.0, "interpolated"),
-    ("bspline", 6): (1.58e-1, 6.0, "measured"),
-    ("bspline", 7): (7.28e-2, 7.0, "extrapolated"),
-    ("bspline", 8): (3.37e-2, 8.0, "extrapolated"),
-    ("midtown", 4): (5.12e-2, 4.0, "measured"),
-    ("midtown", 6): (5.84e-2, 6.0, "measured"),
-    ("quads", 4): (4.54e-2, 4.0, "measured"),
-    ("quads", 6): (2.48e-2, 6.0, "measured"),
+    ("bspline", 4): (3.33e-2, 4.0, "measured"),
+    ("bspline", 5): (1.53e-2, 5.0, "interpolated"),
+    ("bspline", 6): (7.01e-3, 6.0, "measured"),
+    ("bspline", 7): (3.22e-3, 7.0, "extrapolated"),
+    ("bspline", 8): (1.48e-3, 8.0, "extrapolated"),
+    ("midtown", 4): (3.81e-3, 4.0, "measured"),
+    ("midtown", 6): (4.03e-3, 6.0, "measured"),
+    ("quads", 4): (3.39e-3, 4.0, "measured"),
+    ("quads", 6): (1.81e-3, 6.0, "measured"),
 }
 
 #: The B-spline constant falls by this factor per additional order (measured
@@ -141,9 +155,10 @@ ENERGY_RULE = {
 _BSPLINE_C4 = 1.70e-1
 _BSPLINE_P4 = 3.5
 _BSPLINE_C_RATIO = 1.82
-#: Energy fall-off of the B-spline, 0.734 -> 0.158 between orders 4 and 6.
-_BSPLINE_E_C4 = 7.34e-1
-_BSPLINE_E_C_RATIO = 2.16
+#: Energy fall-off of the B-spline (k-space normalised), 3.33e-2 -> 7.01e-3
+#: between orders 4 and 6.
+_BSPLINE_E_C4 = 3.33e-2
+_BSPLINE_E_C_RATIO = 2.18
 
 
 def rule(backend: str, order: int, force_mode: str = "ad") -> tuple[float, int, str]:
@@ -211,23 +226,22 @@ def spacing(
     ``sigma_min / (sqrt(2) xi)``, beyond which the variance subtraction has an
     on-grid variance that is no longer positive.
 
-    ``accuracy`` is the target of the **force** law of :func:`rule`. For
-    ``force_mode="ik"`` the energy and the force share the exponent ``2 nu``,
-    and the energy constant is the larger of the two, so the grid is sized by
-    whichever law is binding (:data:`ENERGY_RULE` versus :data:`IK_FORCE_RULE`);
-    a caller that only needs the force keeps the target, and a caller that also
-    needs the energy gets it at the same target. AD and the B-spline are sized
-    by the force alone.
+    The grid is sized by the **energy** law of :func:`energy_rule` for every
+    backend and force mode, so ``accuracy`` is an energy-relative target.  The
+    energy law is kernel independent under its ``|E_k|`` normalisation and is the
+    single convention the paper's equal-accuracy table uses.  ``force_mode`` is
+    accepted for API compatibility but does not change the spacing: the energy
+    law is independent of how the force is differentiated.  Note that the AD
+    force exponent is one lower than the energy exponent, so an AD grid sized
+    this way meets the energy target but leaves the force error above it
+    (measured 7-60x the target across the backends); a caller that needs a
+    force-relative guarantee must size from :data:`FORCE_RULE` /
+    :data:`IK_FORCE_RULE` directly.
     """
-    c, p, _ = rule(backend, order, force_mode)
     if not (accuracy > 0.0) or not math.isfinite(accuracy):
         raise ValueError(f"accuracy must be finite and positive, got {accuracy}")
-    d_table = float(sigma_min) * (float(accuracy) / c) ** (1.0 / float(p))
-    if str(force_mode) == "ik":
-        ce, pe, _ = energy_rule(backend, order)
-        d_energy = float(sigma_min) * (float(accuracy) / ce) ** (1.0 / float(pe))
-        d_table = min(d_table, d_energy)
-    d = d_table
+    ce, pe, _ = energy_rule(backend, order)
+    d = float(sigma_min) * (float(accuracy) / ce) ** (1.0 / float(pe))
     if str(backend) == "midtown":
         xi = CUBES2_XI.get(int(order))
         if xi is not None:

@@ -53,10 +53,10 @@ from .kernel import (
 
 _KERNEL_CLASSES = {"les": LESKernel, "sog": SOGKernel}
 
-# The SOG library's default ladder: sigma = nlayers * rcut / RCUT_TO_SIGMA,
-# b = 2, M = 12.  The pt backend keeps this rule for new configurations
-# (``sog_default_ladder``); a migrated checkpoint passes its explicit widths
-# and amplitudes instead.
+# The SOG library's default ladder: sigma = nlayers * rcut / RCUT_TO_SIGMA with
+# the canonical SOG b and M (see dpmodel/long_range/latent_charge.py).  The pt
+# backend keeps this rule for new configurations (``sog_default_ladder``); a
+# migrated checkpoint passes its explicit widths and amplitudes instead.
 _SOG_DEFAULT_M = SOG_DEFAULT_M
 
 

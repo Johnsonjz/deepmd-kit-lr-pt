@@ -45,7 +45,7 @@
 ## 2. 两条部署链
 
 > 本节只管**第一部分这棵树自己的产物**（`fitting=sog_energy` 谱系）。第二部分的
-> `latent_charge` 产物怎么进来，见 §10。
+> `latent_charge` 产物怎么进来，见 §11。
 
 模型产物（`.pt2`）里可能带四种长程相关的东西，用哪个由输入决定：
 
@@ -363,23 +363,159 @@ deepmd::latent_charge_sum(coord, charge, mask, n_node, total_charge,
 bspline-8 115³、bspline-6 173³、CubeS₂-6 265³、CubeS₂-6·ik 177³、CubeS₂-4·ik 291³。
 详见 `docs/GRID_FROM_ACCURACY.md`、`docs/MIDTOWN_VS_BSPLINE_BENCH.md`。
 
-## 9. 冻结成 `.pt2`
+## 9. 冻结成 `.pt2`：dpa4c-sog 与 dpa4-sog
 
 ```bash
 dp --pt-expt freeze -c model.ckpt.pt -o model --compress
 ```
 
-- `--compress` 出 **compact canonical 下界**（`lower_input_kind=dpa4c_canonical`）：
-  更快、显存省一两个量级，且**多卡必需**；默认 graph 下界在多卡下会拒绝。
-- 长程模型在 `model/extra/metadata.json` 里声明
-  `topologies: ["all_pairs", "pme_mesh"]` 与 `topology_params.pme_mesh.spacing`
-  （= 冻结时的 `mesh_spacing()`）；`source/api_cc/src/DeepPotPTExpt.cc:313-330`
-  读这两项，C++ 侧据此构造网格拓扑。
-- 长程模型要求 `graph` 或 `compact canonical` 下界，其他下界直接抛异常。
+两条谱系**用同一条命令、出同一种工件**（`lower_input_kind=dpa4c_canonical`）。
+"dpa4c" 在这里是**压缩构造的名字**，不是描述符的名字：DPA4C（全局部）和 DPA4（消息传递）
+都被压到这一个 compact canonical 下界上，差别只在压缩后的产物里有没有交换工件。
 
-完整流程见 `docs/FREEZE_SOP.md`。
+### 9.1 压缩后的两条产物差在哪
 
-## 10. 与第一部分的接口
+| | **dpa4c-sog**（DPA4C + latent_charge） | **dpa4-sog**（DPA4/SeZM + latent_charge） |
+|---|---|---|
+| `lower_input_kind` | `dpa4c_canonical` | `dpa4c_canonical`（同） |
+| `has_message_passing` | `false` | **`true`** |
+| `has_comm_artifact` | `false` | **`true`**（多出 `model/extra/forward_lower_with_comm.pt2`） |
+| 多卡时 halo 特征 | 就地算，不需要交换 | **每层之后跨 rank 交换** |
+| 多卡特有约束 | 无 | 每个 rank 至少一个节点（见 §10.4） |
+| CUDA graph 捕获 | 多卡不重放（halo 让 extent 每步变）；单卡可重放 | 多卡不重放（且交换是 host 集合通信，即使 extent 不变也不能捕获）；单卡折叠后仍可重放 |
+
+压缩本身对两者是一样的：节点轴收缩到 model node（null-type 原子剔除，`loc2model` /
+`model2loc` 每张邻居表重建一次）、键矢量 f32（模型长度单位）、边用 32-bit 节点号排两次
+（destination-major CSR + 需要时 source-major CSR 及置换）。同权重下能量不变，约 3× 快、
+约 1/40 显存。
+
+### 9.2 产物自检
+
+```bash
+python - <<'PY'
+import zipfile, json
+z = zipfile.ZipFile("model.pt2")
+m = json.loads(z.read("model/extra/metadata.json"))
+print("lower:", m["lower_input_kind"])          # dpa4c_canonical
+print("MP   :", m["has_message_passing"])       # dpa4-sog 为 True
+print("comm :", m["has_comm_artifact"])         # dpa4-sog 为 True
+print("1rank:", m["canonical_single_rank_only"])# 必须为 False 才能多卡
+print("top  :", m["topologies"])               # 含 all_pairs + pme_mesh
+print("spac :", m["topology_params"]["pme_mesh"]["spacing"])
+print([n for n in z.namelist() if "with_comm" in n])
+PY
+```
+
+四个字段要一起看：
+
+- `has_comm_artifact=true` 但归档里**没有** `model/extra/forward_lower_with_comm.pt2`
+  ——冻结树的版本比这条链旧，重新冻结即可。
+- `canonical_single_rank_only` 由冻结时算出（`has_message_passing and not
+  有交换工件`），为 `true` 时冻结日志会给警告。它是**记录与警告**，运行期不读；真正的运行期
+  门是"有交换工件 + 拿到 comm 载荷"，缺一即报错（§10.4）。
+- `canonical_index_dtype` / `canonical_index_storage` / `graph_edge_dtype` 是 compact ABI
+  的编码：`auto`/`byte_words`/`float32`。驱动侧按它们决定 32 还是 64 位索引、键矢量精度。
+- `canonical_requires_source_csr=true` 表示力按 source 分组装，算子每步都会读 source CSR。
+
+### 9.3 交换工件是什么
+
+`dpa4-sog` 的 `forward_lower_with_comm.pt2` 是同一条 compact ABI 加上：
+
+1. 长程操作数——节点位置（f64, `3N`）、模块自己的 communicator、晶胞（f64, 9）；
+2. 八个交换张量——send/recv 列表与计数、communicator、`nlocal`、`nghost`。它们**留在
+   host**，因为消费它们的是 `deepmd_export::border_op` 这个不透明算子（host 侧解引用
+   send-list 指针）。
+
+**一个 communicator 兼两用**：它既是长程算子的集合通信句柄，也是 border 交换的句柄，所以
+compact ABI 只带一个 MPI handle 而不是两个。
+
+**为什么必须有它**：没有交换工件时，消息传递描述子会把每个 halo 节点**沿用第一层给出的
+特征**——能量看着正常，但跨 rank 的消息从未发生。这条路径现在会**明确报错**而不是给出
+错答案（见 §10.4）。
+
+完整冻结流程见 `docs/FREEZE_SOP.md`。
+
+## 10. 调用：`pair_style deepmd/kk <model>.pt2`
+
+本树的产物长程**在图内**（`pme_mesh` 拓扑），所以**不需要 `kspace_style`，也不需要
+`fix sog/response`**，而且 `full_lr`、`latent_charge_to_q` 这两个关键字在本树里不存在。
+
+### 10.1 单卡
+
+```lammps
+units           metal
+boundary        p p p
+atom_style      charge/kk          # 主机插件用 charge
+atom_modify     map yes            # 消息传递模型必需；全局部模型也建议加
+neighbor        2.0 bin
+neigh_modify    every 20 delay 0 check no
+read_data       <system>.lmp
+mass            1 16
+mass            2 2
+pair_style      deepmd/kk <model>.pt2      # 主机插件写 deepmd <model>.pt2
+pair_coeff      * * O H
+kspace_style    none
+fix             1 all nve/kk                # 主机插件用 nve
+run_style       verlet/kk                  # 主机插件可不写
+velocity        all create 300.0 12345 mom yes rot no dist gaussian
+timestep        0.0005
+thermo_style    custom step temp pe press vol
+run             100000
+```
+
+```bash
+lmp -k on g 1 -in in.lammps
+```
+
+单卡时 `nloc == nall_nodes`，`dpa4-sog` 也**不**交换、也**会**被捕获重放，和 `dpa4c-sog`
+走同一条路径。
+
+### 10.2 多卡
+
+```lammps
+processors      1 1 2              # 或 1 1 4；z 向切分
+atom_modify     map yes            # pair_style deepmd/kk 硬性要求（init_style 里检查）
+pair_style      deepmd/kk <model>.pt2
+kspace_style    none
+```
+
+```bash
+mpirun --oversubscribe -np 2 ./lmp_rank_dev.sh lmp -k on g 1 -in in.lammps
+```
+
+`/tmp/lmp_rank_dev.sh` 见 §14.3——把 `CUDA_VISIBLE_DEVICES` 按 `LOCAL_RANK` 逐 rank 缩到一个
+GPU。
+
+`dpa4-sog` 多卡时 `pair deepmd/kk` 会自动把邻居表的 send/recv 元数据传给模型，模型在
+forward 内交换 halo 特征；`dpa4c-sog` 不传，因为没有东西要换。**两者对输入的要求相同**，
+区别只在性能（DPA4 每步多一次 host 集合通信，且因此放弃 CUDA graph 重放）。
+
+### 10.3 实测（2026-11-11）
+
+`master-merge-test/water_dpa4_sog` 的 `model.ckpt-30000.pt` 重新 `--compress`，
+192 原子水盒子，`run 0`，`|F|rms = 0.81 eV/Å`：
+
+| 运行 | PE (eV) | press (atm) | max\|ΔF\| vs host np1 |
+|---|---|---|---|
+| host np=1 | −29946.758 | −3151.59 | — |
+| host np=2 / np=4 | −29946.758 | −3151.59 | 2.7e-6 / 3.0e-6 |
+| **`deepmd/kk` np=1 / np=2 / np=4** | −29946.758 | −3151.59 | **7.0e-6 / 6.6e-6 / 6.7e-6** |
+
+净力各次都在 ~1e-5。用同样的盒子加两个 NULL 型（虚拟）原子、`pair_coeff * * O H NULL`，
+`host`/`kk` 的 np=2/4 同样到 2.3e-6 / 5.8e-6，虚拟原子受力恒为零。
+
+对照：非消息传递的 `dpa4c-sog` 压缩产物（`lr_bs6.pt2`）np=1/2/4 无回归，`kk` 到 7e-6。
+
+### 10.4 多卡的四种拒绝（都是刻意的）
+
+| 现象 | 原因 |
+|---|---|
+| `... needs the swap metadata of the decomposition (comm_nlist) ...` | 有交换工件却没拿到 comm 载荷；只有宿主引擎不打这个参数时会触发 |
+| `... cannot serve a rank without nodes.` | 消息传递 + 压缩 ABI 没有 phantom 原子的位置；某个 rank 被切空即拒绝，不会挂在别人已进入的集合通信里 |
+| `... evaluates a periodic system with a long-range module only through a compressed DPA4C model ...` | `deepmd/kk` 的 device edge 路径不传晶胞；周期体系的长程只能走压缩 canonical |
+| 未压缩的 graph 产物在多卡下报缺 with-comm 工件 | graph 的 with-comm 下界**没有**长程槽位（无位置/晶胞/communicator），所以**消息传递 + 长程的模型必须在冻结时压缩**才能多卡 |
+
+## 11. 与第一部分的接口
 
 两棵树唯一的接触点是 **模型加载库**。LAMMPS 的 pair（无论来自哪棵树）通过
 `DP_BACKEND_PLUGIN_PATH` 选一个 `deepmd/lib`，那里有 `libdeepmd_cc.so` 与
@@ -395,7 +531,7 @@ dp --pt-expt freeze -c model.ckpt.pt -o model --compress
 注意 `full_lr`（第一部分 §2 链 B）是**第一部分自己的 `sog_full_lr.pt2` 产物专用**的关键字；
 本树的 `pme_mesh` 产物不需要它，也未必带它（查 `model/extra/sog_full_lr.pt2` 是否存在）。
 
-## 11. 本树自己的文档
+## 12. 本树自己的文档
 
 - `docs/FREEZE_SOP.md` —— 冻结 SOP（`--compress`、谱系锁、多卡）
 - `docs/BUILD_AND_TEST.md` —— 两棵树的编译与测试全流程
@@ -411,45 +547,60 @@ dp --pt-expt freeze -c model.ckpt.pt -o model --compress
 本树自己的验收：`pytest source/tests/pt_expt/kernels/test_mesh_backend.py`、
 `pytest source/tests/common/dpmodel/test_grid_rule.py`、`test_long_range.py`。
 
-## 12. 故障与修复（本树的代码）
+## 13. 故障与修复（本树的代码）
 
 这一节是本树对两个"看起来像 LAMMPS 崩溃"的问题的处理。完整诊断过程见
 `docs/SLAB_IK_FAILURE_DIAGNOSIS.md`；这里给的是**结论与用法**。
 
-### 12.1 ik × 分布式网格：警告 + 回落，不再中止
+### 13.1 ik × 分布式网格：已支持，但默认仍走 replicated
 
-**现象**：LAMMPS 里跑 ik 模型（`force_mode: ik`）而环境里设了 `SOG_MIDTOWN_SLAB=1`
-（或 `SOG_MIDTOWN_DIST=1`）时，整个 MD 直接中止，报
+**历史**：早先 ik 模型（`force_mode: ik`）遇到 `SOG_MIDTOWN_SLAB=1` 会直接中止，
+报 `Expected a proper Tensor but got None … 'self'`——分布式求解器的力只来自 AD gather，
+没有 `i·k` 微分，算子用 `TORCH_CHECK` 硬拒，而这个 env 通常是进程级设的（bench 脚本、
+容器 profile），于是"一个环境变量打死整条 MD"。中间版本改成"警告 + 回落到 replicated"。
 
-```
-ERROR: … Expected a proper Tensor but got None … for argument #0 'self'
-```
+**现在**：z-slab 求解器**实现了 ik 通路**，但**默认不用**——`SOG_MIDTOWN_SLAB=1` 单独出现
+时仍然回落到 replicated（力定律相同，每 rank 持全网格），并打一次警告；要真的跑分布式 ik
+必须再显式加一个开关：
 
-**原因**：分布式求解器（z-slab / local-spread）的力只来自 AD gather，**没有 `i·k` 微分**。
-旧实现用 `TORCH_CHECK` 硬拒（`latent_charge_sum.cu`），而这个 env 通常是进程级设的
-（bench 脚本、容器 profile），于是"一个环境变量打死整条 MD"。
-
-**现在的行为**：仍是拒绝走分布式，但**回落到 replicated**——力定律完全相同，只是每 rank
-持全网格——并打一次警告：
-
-```
-[W… latent_charge_sum.cu] Warning: SOG_MIDTOWN_SLAB is set but force_mode != 0 (ik):
-the distributed solves implement only the AD gather, so this call runs the replicated
-solve. The force law is identical; every rank now holds the full mesh.
+```bash
+export SOG_MIDTOWN_SLAB=1 SOG_SLAB_IK=1     # ik 走 z-slab 分布式网格
+export SOG_SLAB_STRICT=1                    # 上两者缺任一个时硬失败，而不是回退
 ```
 
-要保留硬失败（批处理不希望悄悄换成更吃显存的路径）：`export SOG_SLAB_STRICT=1`。
+为什么默认不跟：ik 的每个笛卡尔分量都要走一遍"逆 z + 转置 + 逆 (x,y)"，即**转置次数 ×4**，
+外加一个 pencil 和一个 brick 的工作集；这个代价不该由一个上游统一设的 `SOG_MIDTOWN_SLAB`
+替你决定。
 
-**为什么不给分布式补 ik 通路**：那意味着三遍额外的 `z` 逆变换 + all-to-all，而分布式网格
-在整步里只省 8.7–11.9% 显存（`docs/MIDTOWN_VS_BSPLINE_BENCH.md`）。收益与代价不成比例。
+**实现**（`midtown_sum_slab`，[`midtown_sum.cu:1330`](../source/op/pt/long_range/midtown_sum.cu#L1330)
+起）：green 乘完之后把势谱 φ̂ 留在 `s_pot2`，然后对 x/y/z 各做一次 `i·k_a·φ̂`
+（**在 z-pencil 域**，那里 kx/ky/kz 齐全，自共轭判据与 replicated 的 `k_mul_ik` 完全一致），
+各自逆 z、转置、逆 (x,y) 到同一个梯度 brick，再逐分量 gather。三条分量依次复用同一对
+block/pencil 缓冲和同一个梯度 brick，所以内存只多一个 pencil + 一个 brick，不是四套。
 
-| 配置 | 修复前 | 修复后 |
-|---|---|---|
-| `pair deepmd lr_mid4ik.pt2` + `SOG_MIDTOWN_SLAB=1`，np=1 | 中止 | 跑完，`pe = -29946.558`（与不带 env **逐位相同**） |
-| 同上 np=2 | 中止 | 跑完，`pe = -29946.558` |
-| 同上 + `SOG_SLAB_STRICT=1` | 一行误导信息 | 明确的 undefined-output 错误（§12.2） |
+**数值**（`lr_mid4ik.pt2` / `lr_mid6ik.pt2` / `lr_quads6ik.pt2`，192 原子水盒，`run 0`，
+`|F|rms = 0.81 eV/Å`）：
 
-### 12.2 算子异常不再被 AOTI 吞成 "None / 'self'"
+| 扫描 | np=1 | np=2 | np=4 |
+|---|---|---|---|
+| CubeS₂-4 ik：分布式 vs 复制 | 6.7e-7 | 2.4e-6 | 1.8e-6 |
+| CubeS₂-6 ik：分布式 vs 复制 | 6.8e-7 | 1.9e-6 | —（网格 18³，`1 1 4` 下 4 < 6 阶模板，沿用原有网格守卫） |
+| QuadS-6 ik：分布式 vs 复制 | 5.8e-7 | 1.8e-6 | — |
+
+PE 各次都是 −29946.558 eV，净力 ~1e-6。AD 分布式路径无回归（5.8e-7 / 1.6e-6 / 2.1e-6）。
+
+单步代价（192 原子，40 步，小网格下开销主导）：复制 ik 0.102 s、分布式 ik np=1 0.116 s
+（+14%）、np=2 0.097 s；作为对照分布式 AD np=1 比复制 AD 慢 +11%。也就是说三个额外转置
+在整步里与分布式本身的固定开销同量级。
+
+`SOG_MIDTOWN_DIST=1`（local-spread）仍然**没有** ik 通路：它的 stencil 是 CubeS₂ 6 阶硬编码
+的，没有 Fourier 微分版 gather；设了它 + ik 仍回落到 replicated 并警告。
+
+**网格守卫**：`ZL = nz/np` 必须 ≥ 模板宽度（CubeS₂/QuadS 4 → 4，6 → 6）。小盒子配高阶
+ik 时 `1 1 4` 会报 `nz/np = … is thinner than the stencil` —— 这是网格划分的限制，不是
+ik 的问题，换更细网格或更少 rank。
+
+### 13.2 算子异常不再被 AOTI 吞成 "None / 'self'"
 
 `.pt2` 里的自定义算子通过 AOTI proxy executor 调用；它**捕获**算子抛出的 C++ 异常，只往
 stderr 打一行 `[E... shim_common.cpp]`，并把该算子的输出张量留成 undefined。图照常"返回"，
@@ -470,7 +621,7 @@ real cause (mesh too large for the device, an unsupported force mode, invalid
 arguments, ...).
 ```
 
-### 12.3 网格过大：建表之前就报，而不是裸 OOM
+### 13.3 网格过大：建表之前就报，而不是裸 OOM
 
 replicated 网格按 **20 B/格点**占用设备内存（`f_gp` 8 + `f_rho_r` 4 + `f_rho_fx` 8）。
 旧路径先花约一分钟在 host 上造几十 GB 的 fp64 绿函数，再在 `cudaMalloc` 上失败。
@@ -485,21 +636,23 @@ allows one.
 
 同一个 526 848 原子 / 1125³ 的算例从"1 分钟后 OOM"变成 **10 秒**内报错。
 
-### 12.4 相关开关一览
+### 13.4 相关开关一览
 
 | 环境变量 | 作用 |
 |---|---|
-| `SOG_MIDTOWN_SLAB=1` | 走 z-slab 分布式网格（AD 力）；ik 时自动回落 |
-| `SOG_MIDTOWN_DIST=1` | 走 local-spread 分布式网格（AD 力）；ik 时自动回落 |
-| `SOG_SLAB_STRICT=1` | 上两者遇 ik 时**硬报错**而不是回落（CI / 批处理用） |
+| `SOG_MIDTOWN_SLAB=1` | 走 z-slab 分布式网格。AD 力直接生效；ik 力**需同时设** `SOG_SLAB_IK=1`，否则回落到 replicated |
+| `SOG_SLAB_IK=1` | 打开 z-slab 的 ik（Fourier 微分）通路：转置次数 ×4，多一个 pencil + 一个 brick |
+| `SOG_MIDTOWN_DIST=1` | 走 local-spread 分布式网格（只有 AD 力；ik 一律回落） |
+| `SOG_SLAB_STRICT=1` | 需要分布式却没开成（如 ik 未设 `SOG_SLAB_IK`）时**硬报错**而不是回落（CI / 批处理用） |
 | `SOG_MIDTOWN_FORM_A=0/1` | CubeS₂ 的 Form A / Form B 去卷积 |
 | `SOG_MIDTOWN_DEBUG=1` | 打印网格重建与 kernel 参数 |
+| `SOG_SLAB_TIME=1` / `SOG_SLAB_TRACE=1` | 分阶段计时 / 阶段跟踪（调试分布式管线） |
 
-## 13. 本树的标准编译与调用流程
+## 14. 本树的标准编译与调用流程
 
-前面 §10 说的是"产物怎么被第一部分消费"。这一节是**在这一棵树里从源码到跑起来**的完整流程。
+前面 §11 说的是"产物怎么被第一部分消费"。这一节是**在这一棵树里从源码到跑起来**的完整流程。
 
-### 13.1 环境
+### 14.1 环境
 
 ```bash
 source /etc/profile.d/modules.sh
@@ -519,7 +672,7 @@ export PATH=/usr/local/cuda-12.4/bin:$PATH     # 系统默认 nvcc 是 11.8，�
 > 仓库根 `AGENTS.md` 写的是**上游** `uv pip install -e .` 流程，不适用：这里要同时编 CUDA
 > 算子、MPI 与 LAMMPS 插件。
 
-### 13.2 编译
+### 14.2 编译
 
 **① 核心五目标**（算子 / C++ API / pt_expt 后端 / C API / **主机版 LAMMPS 插件**）：
 
@@ -564,7 +717,7 @@ mkdir -p /tmp/kk_lrpt_plugin
 ln -sfn /tmp/kk_lrpt_build/libdeepmd_lmp.so /tmp/kk_lrpt_plugin/dpplugin.so
 ```
 
-### 13.3 运行时环境
+### 14.3 运行时环境
 
 ```bash
 CONDA=/data/home/jiangzhen/.conda/envs/lr212
@@ -582,54 +735,29 @@ export OMP_NUM_THREADS=1
 
 顺序有意义：conda 的 `libstdc++` 要在系统之前，torch 自带的 CUDA 运行时要在系统之前。
 
-### 13.4 标准调用
-
-本树的产物**长程在图内**（`pme_mesh` 拓扑），所以**不需要 `kspace_style`**：
-
-```lammps
-units           metal
-boundary        p p p
-atom_style      charge/kk          # 主机插件用 charge
-atom_modify     map yes
-neighbor        2.0 bin
-neigh_modify    every 20 delay 0 check no
-read_data       <system>.lmp
-mass            1 16
-mass            2 2
-pair_style      deepmd/kk <model>.pt2      # 主机插件写 deepmd <model>.pt2
-pair_coeff      * * O H
-kspace_style    none
-fix             1 all nve/kk                # 主机插件用 nve
-run_style       verlet/kk                  # 主机插件可不写
-velocity        all create 300.0 12345 mom yes rot no dist gaussian
-timestep        0.0005
-thermo_style    custom step temp pe press vol
-run             100000
-```
-
-```bash
-# 单卡
-lmp -k on g 1 -in in.lammps
-# 多卡：一个 rank 一张卡，按 LOCAL rank 绑定
-mpirun --oversubscribe -np 2 /tmp/lmp_rank_dev.sh lmp -k on g 1 -in in.lammps
-```
-
-`/tmp/lmp_rank_dev.sh`：
+多卡时一个 rank 一张卡，用这个 shim 把 `CUDA_VISIBLE_DEVICES` 按 `LOCAL_RANK` 缩到一张：
 
 ```bash
 #!/bin/bash
+# /tmp/lmp_rank_dev.sh
 IFS=',' read -r -a _devs <<< "${CUDA_VISIBLE_DEVICES}"
 export CUDA_VISIBLE_DEVICES="${_devs[${OMPI_COMM_WORLD_LOCAL_RANK:-0}]}"
 exec "$@"
 ```
 
-**产物 → 输入**：`.pt2` 里 `model/extra/metadata.json` 的
-`topology_params.pme_mesh.spacing` 决定网格；`pme_order` / `mesh_backend` / `force_mode`
-是**冻结时的计算设置**，改它们要重新冻结（`sog_work/tools/freeze_lr_variants.py
---backend {bspline|midtown|quads} --order {4|6} --force-mode {ad|ik}`，冻结前
-`module load gcc/13`）。
+### 14.4 标准调用
 
-### 13.5 自检
+输入文件、单卡/多卡命令、逐 rank 绑卡脚本都在 **§10**。这里只补环境侧的两条：
+
+- 多卡启动时 `LAMMPS_PLUGIN_PATH` 指向 Kokkos 插件目录（§14.2 的 `/tmp/kk_lrpt_plugin`），
+  主机插件是 `/tmp/lmpplugin_lrpt`；两者**不要同时**挂着。
+- **产物 → 输入**：`.pt2` 里 `model/extra/metadata.json` 的
+  `topology_params.pme_mesh.spacing` 决定网格；`pme_order` / `mesh_backend` / `force_mode`
+  是**冻结时的计算设置**，改它们要重新冻结（`sog_work/tools/freeze_lr_variants.py
+  --backend {bspline|midtown|quads} --order {4|6} --force-mode {ad|ik}`，冻结前
+  `module load gcc/13`）。运行期没有能改样条类型的开关，见 §15。
+
+### 14.5 自检
 
 ```bash
 # 纯 Python（不需 GPU）
@@ -647,6 +775,70 @@ mpirun -np 2 ... -in in.lammps -log log.np2
 > **量单步时间时不要用 `run 6`**：LAMMPS 的 `Loop time` 含一次性 setup（邻居表、首次求值、
 > AOTI 图捕获），在几十万原子上是好几秒。用 `run 5` + `run 20` 两段，取第二段
 > （`docs/bench_spline_matrix.py` 就是这么做的）。
+
+## 15. MD 时能不能改 SOG 用的样条类型？
+
+**分两棵树的链回答。第一部分的链可以，第二部分的链不可以。**
+
+### 15.1 第一部分：`kspace_style sog|sog/kk` 有 `spline` 关键字
+
+`source/lmp/sog.cpp::settings()` 解析，**运行期生效，不需要重新编译或重新冻结**；
+`SOGKSpaceKokkos` 继承同一个 `settings()`，所以 `sog` 和 `sog/kk` 用法一致。默认
+**CubeS₂ 4 阶**（关键字总表见 §3.2）：
+
+```lammps
+# 追加在核参数之后、其它关键字之前或之后均可
+kspace_style    sog/kk ${KERNEL} spline cubes2_6 use_gpu yes
+```
+
+`${KERNEL}` 就是 §4.1 里那组 `amp … bandwidth …`（或旧的 `accuracy b sigma M [n_dl]`）。
+
+| `spline` 取值 | 含义 |
+|---|---|
+| `bspline` / `bspline_5` | 可分离 B-spline，5 阶（`bspline` 是 `bspline_5` 的别名） |
+| `bspline_4` / `bspline_6` | 可分离 B-spline，4 / 6 阶 |
+| `cubes2_4` | CubeS₂（midtown 非可分离窗），4 阶 —— **默认** |
+| `cubes2_6` | CubeS₂，6 阶 |
+| `quads_4` / `quads_6` | QuadS³，4 / 6 阶 |
+
+同一处 `settings()` 还有 `grid_method`（`sog_bandwidth`／`pppm_legacy`）、
+`mesh_oversample`、`mesh_alias_extent`、`remove_self_interaction`、`phi_max`、`n_dl`。
+CUDA 侧另有只在运行期读的环境变量（`SOG_MIDTOWN_SLAB`、`SOG_MIDTOWN_DIST`、
+`SOG_MIDTOWN_FORM_A`、`SOG_SLAB_STRICT`）——它们只改**同一个样条**的网格分布/Green 形式，
+**不改样条族或阶数**。
+
+### 15.2 第二部分：样条是**冻结进图**的常量，运行期无接口
+
+`mesh_backend`、`pme_order`、`force_mode` 是 `latent_charge_sum` 算子的**参数**，在冻结时
+由模型配置决定，随后作为常量写进 AOTInductor 程序。`.pt2` 的操作数表（`pair_style
+deepmd/kk` 的输入）里**没有**这几个字段，`pair_deepmd*` 也不解析任何相关关键字。
+
+要换样条，**必须重新冻结**（权重不动，只换求值设置）：
+
+```bash
+module load gcc/13
+python /data/home/public/jiangzhen/dp/sog_work/tools/freeze_lr_variants.py \
+    --ckpt model.ckpt-30000.pt --out model_mid4.pt2 \
+    --backend midtown --order 4 --force-mode ad
+```
+
+| 参数 | 取值 | 说明 |
+|---|---|---|
+| `--backend` | `bspline` / `midtown` / `quads` | 对应 `mesh_backend`；默认 `bspline` |
+| `--order` | `4` / `6` | midtown/Quads 只有这两个 |
+| `--force-mode` | `ad` / `ik` | `ik` 需要 `midtown`/`quads` |
+| `--accuracy` | 例如 `1e-4` | 反解网格间距的精度档（`pme_accuracy`） |
+| `--spacing` | 数值 | 直接钉死网格间距，做同网格对照时用 |
+| `--sr-only` | — | 丢掉长程模块，做短程基线 |
+| `--no-compress` | — | 出 graph 下界而不是 compact canonical（多卡用不到） |
+
+> 换 backend/阶数会改变**网格尺寸**，所以跨配置比较必须先对齐精度档（`--accuracy`）或直接
+> 钉同一个 `--spacing`，否则比的是两套不同的离散误差——见 `docs/GRID_FROM_ACCURACY.md`、
+> `docs/SPLINE_MATRIX_BENCH.md`。
+
+为什么不做成运行期开关：样条的阶数/族决定**网格尺寸**与**算子内核的编译分支**，两者都在
+冻结期固定；若运行期可切换，要么每次切换重编程序，要么在每个 kernel 里带多份实现，代价
+都高于"改设置就重冻一次"（权重不重训，几分钟）。
 
 ---
 
@@ -684,6 +876,12 @@ bandwidth = [s**2 for s in width]
 1. `pytest source/tests/pt_expt/kernels/test_mesh_backend.py`（各样条对 replicated 的偏差）。
 2. `pytest source/tests/common/dpmodel/test_grid_rule.py test_long_range.py`。
 3. 冻结后 `dp test -m model.pt2` 能加载、`topologies` 里含 `pme_mesh`。
-4. 若环境里设了 `SOG_MIDTOWN_SLAB` / `SOG_MIDTOWN_DIST`：ik 模型必须看到 §12.1 的警告
-   并**跑完**（`pe` 与不带 env 逐位相同）；想让配置错误立刻暴露，再加 `SOG_SLAB_STRICT=1`
-   确认它变成可读的 undefined-output 错误而不是 `'self'`。
+4. 分布式网格（§13.1）：
+   - **AD 模型**：`SOG_MIDTOWN_SLAB=1` 下 `run 0` 的 `pe` 与 replicated 一致（力到 ~1e-6）。
+   - **ik 模型**：只设 `SOG_MIDTOWN_SLAB=1` 时必须看到警告并**跑完**（回落 replicated，
+     `pe` 与不带 env 逐位相同）；再加 `SOG_SLAB_IK=1` 时不应再有警告，`pe` 仍相同、力到
+     ~1e-6（分布式 ik 真的走了）。
+   - 想让配置错误立刻暴露，加 `SOG_SLAB_STRICT=1`：应变成可读的 undefined-output 错误
+     而不是 `'self'`。
+5. 分布式 ik 的网格守卫：`nz/np` 必须 ≥ 模板宽度（4 阶 → 4，6 阶 → 6）；小盒子跑
+   `processors 1 1 4` 配 6 阶会报 `is thinner than the stencil`，换细网格或减少 rank。

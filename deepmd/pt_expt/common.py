@@ -380,6 +380,23 @@ def dpmodel_setattr(obj: torch.nn.Module, name: str, value: Any) -> tuple[bool, 
     >>> # Case 3: dpmodel object → pt_expt module
     >>> obj.emask = AtomExcludeMaskDP(...)  # becomes AtomExcludeMask module
     """
+    # A slot that already holds a trainable parameter keeps it trainable. The
+    # dpmodel layer may assign a plain array to such a slot (`__setitem__` in
+    # `deserialize`, `change_type_map`); registering it as a buffer instead
+    # would silently stop training it.
+    if "_parameters" in obj.__dict__:
+        current = obj._parameters.get(name)
+        if (
+            current is not None
+            and isinstance(value, (np.ndarray, torch.Tensor))
+            and not isinstance(value, torch.nn.Parameter)
+        ):
+            tensor = torch.as_tensor(value, dtype=current.dtype, device=current.device)
+            torch.nn.Module.__setattr__(
+                obj, name, torch.nn.Parameter(tensor.detach().clone())
+            )
+            return True, obj._parameters[name]
+
     # numpy array → torch buffer
     if isinstance(value, np.ndarray) and "_buffers" in obj.__dict__:
         tensor = torch.as_tensor(value, device=_module_buffer_device(obj, name))

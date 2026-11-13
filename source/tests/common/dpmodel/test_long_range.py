@@ -23,6 +23,11 @@ from deepmd.dpmodel.long_range import (
     LESKernel,
     SOGKernel,
 )
+from deepmd.dpmodel.long_range.kernel import (
+    SOG_DEFAULT_BASE_WIDTH,
+    SOG_DEFAULT_M,
+    SOG_DEFAULT_WIDTH_RATIO,
+)
 from deepmd.dpmodel.model.model import (
     get_model,
 )
@@ -146,10 +151,20 @@ def test_sog_kernel_closed_form_and_defaults() -> None:
     np.testing.assert_allclose(
         default.amplitude, np.sqrt(2 / np.pi) * np.log(1.5) / np.array([2.0, 3.0, 4.5])
     )
-    # The default kernel exerts the Coulomb force, r^2 K'(r) = -1, between a
-    # few times its first width and a fraction of its widest one.
+    # The default ladder is the SOG library one: M bands from the canonical
+    # base width, each the previous one times b.
     default = SOGKernel()
-    r = np.geomspace(6.5, 150.0, 200)
+    widths = np.exp(default.log_width)
+    np.testing.assert_allclose(
+        widths, SOG_DEFAULT_BASE_WIDTH * SOG_DEFAULT_WIDTH_RATIO ** np.arange(widths.size)
+    )
+    assert widths.size == SOG_DEFAULT_M
+    # The default kernel exerts the Coulomb force, r^2 K'(r) = -1, between a
+    # few times its first width and a fraction of its widest one.  The reach of
+    # the ladder grows with its band count, so the range is derived from the
+    # kernel rather than hard coded: at M = 7 it is [6.5, 14.3] A, at M = 12
+    # [6.5, 164] A.  Inside it the force matches 1/r to better than 0.4 %.
+    r = np.geomspace(3.0 * widths[0], 0.35 * widths[-1], 200)
     step = 1e-4 * r
     slope = (default((r + step) ** 2) - default((r - step) ** 2)) / (2 * step)
     np.testing.assert_allclose(r**2 * slope, -1.0, rtol=0, atol=5e-3)

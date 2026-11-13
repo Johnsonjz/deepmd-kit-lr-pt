@@ -61,34 +61,34 @@ class TestIkForceMode:
         # Every existing caller keeps the weight-differentiated rule.
         assert grid_rule.rule("midtown", 6) == grid_rule.rule("midtown", 6, "ad")
 
-    def test_ik_sizes_by_the_worse_of_energy_and_force(self):
-        # In ik mode the two laws share the exponent; the energy constant is
-        # the larger, so the energy binds and the grid is the energy-law
-        # spacing (the Nyquist and validity caps do not bind here).
+    def test_spacing_uses_the_energy_law_for_every_mode(self):
+        # The grid is sized by the energy law, which is independent of the
+        # force mode, so AD and ik give the same spacing.
         for order in (4, 6):
             ce, pe, _ = grid_rule.energy_rule("midtown", order)
             d_energy = self.sigma * (1e-4 / ce) ** (1.0 / pe)
-            d = grid_rule.spacing(
-                "midtown", order, self.sigma, self.kmax, 1e-4, force_mode="ik"
-            )
-            assert d == pytest.approx(d_energy, rel=1e-9)
+            for mode in ("ad", "ik"):
+                d = grid_rule.spacing(
+                    "midtown", order, self.sigma, self.kmax, 1e-4, force_mode=mode
+                )
+                assert d == pytest.approx(d_energy, rel=1e-9)
 
-    def test_ik_is_coarser_than_ad_at_equal_accuracy(self):
-        # Removing the window derivative buys about an order in Delta.
+    def test_spacing_is_independent_of_the_force_mode(self):
+        # The energy law does not care how the force is differentiated.
         for order in (4, 6):
             d_ad = grid_rule.spacing("midtown", order, self.sigma, self.kmax, 1e-4)
             d_ik = grid_rule.spacing(
                 "midtown", order, self.sigma, self.kmax, 1e-4, force_mode="ik"
             )
-            assert d_ik > d_ad
+            assert d_ik == pytest.approx(d_ad, rel=1e-12)
 
     def test_energy_rule_rounds_down_to_2nu(self):
-        assert grid_rule.energy_rule("midtown", 4)[:2] == (5.12e-2, 4.0)
-        assert grid_rule.energy_rule("midtown", 6)[:2] == (5.84e-2, 6.0)
+        assert grid_rule.energy_rule("midtown", 4)[:2] == (3.81e-3, 4.0)
+        assert grid_rule.energy_rule("midtown", 6)[:2] == (4.03e-3, 6.0)
 
     @pytest.mark.parametrize(
         "order,spacing,points",
-        [(4, 0.420448, 291), (6, 0.691769, 177)],
+        [(4, 0.805005, 152), (6, 1.080138, 114)],
     )
     def test_ik_reference_kernel_grid(self, order, spacing, points):
         d = grid_rule.spacing("midtown", order, 2.0000, 3.0349, 1e-4, force_mode="ik")
@@ -101,7 +101,7 @@ class TestSpacing:
 
     sigma, kmax = 2.0, 3.0349  # the reference water kernel
 
-    def test_inverts_the_law_inside_the_validity_band(self):
+    def test_inverts_the_energy_law_inside_the_validity_band(self):
         for backend, order in (
             ("bspline", 4),
             ("bspline", 5),
@@ -109,9 +109,9 @@ class TestSpacing:
             ("midtown", 4),
             ("midtown", 6),
         ):
-            c, p, _ = grid_rule.rule(backend, order)
+            ce, pe, _ = grid_rule.energy_rule(backend, order)
             d = grid_rule.spacing(backend, order, self.sigma, self.kmax, 1e-4)
-            assert c * (d / self.sigma) ** p == pytest.approx(1e-4, rel=1e-9)
+            assert ce * (d / self.sigma) ** pe == pytest.approx(1e-4, rel=1e-9)
 
     def test_a_tighter_target_is_a_finer_mesh(self):
         loose = grid_rule.spacing("midtown", 6, self.sigma, self.kmax, 1e-3)
@@ -120,11 +120,11 @@ class TestSpacing:
 
     def test_the_measured_law_alone_sizes_the_grid(self):
         # There is no extra Nyquist ceiling: every backend, including the
-        # high-order B-spline, uses exactly the spacing its error law gives.
+        # high-order B-spline, uses exactly the spacing its energy law gives.
         for backend, order in (("bspline", 6), ("bspline", 8), ("midtown", 6)):
-            c, p, _ = grid_rule.rule(backend, order)
+            ce, pe, _ = grid_rule.energy_rule(backend, order)
             d = grid_rule.spacing(backend, order, self.sigma, self.kmax, 1e-4)
-            assert c * (d / self.sigma) ** p == pytest.approx(1e-4, rel=1e-9)
+            assert ce * (d / self.sigma) ** pe == pytest.approx(1e-4, rel=1e-9)
 
     def test_midtown_is_capped_by_the_cubes2_validity_ceiling(self):
         # Beyond sigma_min / (sqrt(2) xi) the variance subtraction of the
@@ -155,9 +155,9 @@ class TestReferenceKernelGrid:
     @pytest.mark.parametrize(
         "backend,order,spacing,points",
         [
-            ("bspline", 8, 1.0647, 115),
-            ("bspline", 6, 0.7071, 173),
-            ("midtown", 6, 0.4620, 265),
+            ("bspline", 8, 1.42806, 86),
+            ("bspline", 6, 0.98494, 125),
+            ("midtown", 6, 1.08014, 114),
         ],
     )
     def test_spacing_and_grid(self, backend, order, spacing, points):
@@ -165,9 +165,11 @@ class TestReferenceKernelGrid:
         assert d == pytest.approx(spacing, abs=1e-4)
         assert math.ceil(self.box / d) == points
 
-    def test_at_equal_accuracy_the_bpline_needs_the_fewer_points(self):
+    def test_at_equal_energy_accuracy_midtown_needs_the_fewer_points(self):
+        # At equal ENERGY accuracy the midtown order-6 constant is smaller than
+        # the B-spline's, so its grid is coarser (fewer points).
         d_b = grid_rule.spacing("bspline", 6, self.sigma_min, self.k_max)
         d_m = grid_rule.spacing("midtown", 6, self.sigma_min, self.k_max)
-        assert d_m < d_b
-        ratio = (d_b / d_m) ** 3
-        assert 3.0 < ratio < 5.0
+        assert d_m > d_b
+        ratio = (d_m / d_b) ** 3
+        assert 1.2 < ratio < 1.4

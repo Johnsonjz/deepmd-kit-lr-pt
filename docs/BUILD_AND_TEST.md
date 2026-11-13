@@ -1,7 +1,7 @@
 # 编译与测试：可复现全流程
 
 本文把本轮工作涉及的两棵树、两条链的**全套编译命令、安装布局、测试**和**文件/数据路径**固定下来。
-配套文档：冻结 [`FREEZE_SOP.md`](FREEZE_SOP.md)、基准 [`MIDTOWN_VS_BSPLINE_BENCH.md`](MIDTOWN_VS_BSPLINE_BENCH.md)、
+配套文档：[网格引擎测试与复现](MESH_ENGINE_TEST_REPRO.md)（编译、冻结工件清单、四层测试、基准与论文表格的再生）、冻结 [`FREEZE_SOP.md`](FREEZE_SOP.md)、基准 [`MIDTOWN_VS_BSPLINE_BENCH.md`](MIDTOWN_VS_BSPLINE_BENCH.md)、
 网格规则 [`GRID_FROM_ACCURACY.md`](GRID_FROM_ACCURACY.md)、ik 精度 [`IK_MODE_ACCURACY.md`](IK_MODE_ACCURACY.md)。
 
 - **A 链**（图内长程、生产 MD）：`/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt`（lr-pt，`latent_charge`）。

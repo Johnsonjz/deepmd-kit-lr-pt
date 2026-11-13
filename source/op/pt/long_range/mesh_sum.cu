@@ -1163,6 +1163,78 @@ StreamCapture stream_capture(cudaStream_t stream) {
 // released after the CUDA runtime shuts down.
 constexpr size_t kPlanCacheSize = 16;
 
+// Per-phase device time of a call, printed every kTimingInterval calls when
+// SOG_GPU_TIMING is set.  The midtown engine has the same switch and the same
+// phase names, so the two engines can be read side by side.
+struct MeshTiming {
+  static constexpr int kPhases = 8;
+  static constexpr int kEvents = kPhases + 1;
+  static constexpr int kTimingInterval = 100;
+  cudaEvent_t ev[kEvents];
+  double acc[kPhases] = {};
+  int count = 0;
+  bool on = false;
+  MeshTiming() {
+    on = std::getenv("SOG_GPU_TIMING") != nullptr;
+    if (on) {
+      for (int i = 0; i < kEvents; ++i) {
+        cudaEventCreate(&ev[i]);
+      }
+    }
+  }
+};
+
+MeshTiming& mesh_timing() {
+  static MeshTiming timing;
+  return timing;
+}
+
+// Records the phase boundary ``i`` on ``stream``.  Recording an event that was
+// never created (timing off) is skipped, so the disabled path is free.
+inline void timing_mark(MeshTiming& tm, int i, cudaStream_t stream) {
+  if (tm.on) {
+    cudaEventRecord(tm.ev[i], stream);
+  }
+}
+
+// 0 charges, 1 stencil, 2 spread, 3 fft_fwd, 4 kspace, 5 fft_inv, 6 gather,
+// 7 finish.
+inline void timing_report(MeshTiming& tm, cudaStream_t stream) {
+  if (!tm.on) {
+    return;
+  }
+  if (cudaEventSynchronize(tm.ev[MeshTiming::kPhases]) != cudaSuccess) {
+    cudaGetLastError();
+    return;
+  }
+  for (int i = 0; i < MeshTiming::kPhases; ++i) {
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, tm.ev[i], tm.ev[i + 1]) != cudaSuccess) {
+      cudaGetLastError();
+      ms = 0.0f;
+    }
+    tm.acc[i] += ms;
+  }
+  if (++tm.count < MeshTiming::kTimingInterval) {
+    return;
+  }
+  const int n = tm.count;
+  printf(
+      "SOG_BSPLINE_TIMING (n=%d): charges=%.3f stencil=%.3f spread=%.3f "
+      "fft_fwd=%.3f kspace=%.3f fft_inv=%.3f gather=%.3f finish=%.3f "
+      "ms/step sum=%.3f\n",
+      n, tm.acc[0] / n, tm.acc[1] / n, tm.acc[2] / n, tm.acc[3] / n,
+      tm.acc[4] / n, tm.acc[5] / n, tm.acc[6] / n, tm.acc[7] / n,
+      (tm.acc[0] + tm.acc[1] + tm.acc[2] + tm.acc[3] + tm.acc[4] +
+       tm.acc[5] + tm.acc[6] + tm.acc[7]) /
+          n);
+  fflush(stdout);
+  for (int i = 0; i < MeshTiming::kPhases; ++i) {
+    tm.acc[i] = 0.0;
+  }
+  tm.count = 0;
+}
+
 std::shared_ptr<MeshPlans> mesh_plans(const FrameMesh& mesh,
                                       int channels,
                                       int order,
@@ -1412,6 +1484,8 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
   }
   C10_CUDA_CHECK(
       cudaMemsetAsync(fixed_mesh, 0, sizeof(int64_t) * mesh_total, stream));
+  auto& tm = mesh_timing();
+  timing_mark(tm, 0, stream);
 
   // === Step 3. The constraint, and the stencils and charges of the nodes ===
   const auto counts = n_node_per_frame.to(torch::kInt64).contiguous();
@@ -1427,6 +1501,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
       slice_charge, slice_count, frame_count, total_charge.data_ptr<double>(),
       frame_stat);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  timing_mark(tm, 1, stream);
   dispatch_order(order, [&](auto order_constant) {
     constexpr int kOrder = decltype(order_constant)::value;
     auto* node_stencil = workspace.at<AxisStencil<kOrder>>(stencils_at);
@@ -1438,6 +1513,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
             frame_count, node_count, channels, static_cast<int>(channel),
             node_stencil, node_charge);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    timing_mark(tm, 2, stream);
     // === Step 4. The charge meshes ===
     spread_charges<kOrder>
         <<<stencil_blocks_for(node_count), kStencilWarps * kWarp, 0, stream>>>(
@@ -1448,6 +1524,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
   fixed_to_float<<<blocks_for(mesh_total), kThreads, 0, stream>>>(
       mesh_total, fixed_mesh, charge_mesh);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  timing_mark(tm, 3, stream);
 
   // === Step 5. Influence function and potential meshes, frame by frame ===
   for (int f = 0; f < frame_count; ++f) {
@@ -1461,6 +1538,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
                                reinterpret_cast<cufftComplex*>(spectrum)),
                   "transform");
     }
+    timing_mark(tm, 4, stream);
     const int blocks = influence_blocks(grid);
     apply_influence<<<blocks, kThreads, 0, stream>>>(
         frames_ptr + f, channels, static_cast<int>(kernel),
@@ -1470,6 +1548,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
     mode_virial<<<1, kThreads, 0, stream>>>(block_sum, blocks,
                                             frame_virial + 9 * f);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    timing_mark(tm, 5, stream);
     {
       const std::lock_guard<std::mutex> lock(plan.mutex);
       check_cufft(cufftSetStream(plan.inverse, stream), "stream setup");
@@ -1479,6 +1558,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
                        potential_mesh + grid.offset),
           "transform");
     }
+    timing_mark(tm, 6, stream);
   }
 
   // === Step 6. Potential, force and virial of the owners ===
@@ -1495,6 +1575,7 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
+  timing_mark(tm, 7, stream);
   torch::Tensor owner_frame_storage;
   const int64_t* owner_frame_ptr =
       owner_frame_offsets(every_node, frame_ptr, owner_count, counts.options(),
@@ -1537,6 +1618,8 @@ ChargeSumOutputs mesh_sum(const torch::Tensor& coord,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>(),
       virial.data_ptr<float>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  timing_mark(tm, 8, stream);
+  timing_report(tm, stream);
   return {atom_energy, charge_gradient, force, atom_virial, virial};
 }
 

@@ -1,5 +1,13 @@
 # 极端大体系下的样条矩阵：复制网格 vs 分布式网格
 
+> **2026-11-13 更正（重要）**：下面的 per-atom 17/18/49 ns 与显存主表是在
+> **midtown 的 CUDA graph 捕获失败**时测的（pre-fix）；修复后 mesh 已能进图。
+> 修复后的 98k/331k 实测见
+> [`MIDTOWN_PERF_REDESIGN.md`](MIDTOWN_PERF_REDESIGN.md) §0.1。
+> 本文数字仍可用于"pre-fix 现象"的对照，但不要用于 backend 选型。
+> 全配置（B-spline 4/6、CubeS₂ 4/6 AD/ik、QuadS 4/6 AD/ik）的
+> post-fix 表见 [`MIDTOWN_ALL_CONFIGS.md`](MIDTOWN_ALL_CONFIGS.md)。
+
 十种等精度样条配置（B-spline 4/6、CubeS₂ 4/6 ×{ad,ik}、QuadS 4/6 ×{ad,ik}）×
 两种网格（replicated / z-slab）× 两个极端尺寸（526 848 / 1 119 744 原子）的
 **每步时间**与**峰值显存**。装置链 `pair_style deepmd/kk`，同一份 checkpoint 冻结。

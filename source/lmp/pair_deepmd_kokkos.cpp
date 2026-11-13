@@ -32,6 +32,7 @@ PairDeepMDKokkos<DeviceType>::PairDeepMDKokkos(LAMMPS* lmp)
     : PairDeepMD(lmp),
       compact_graph(lmp),
       multi_rank(false),
+      message_passing(false),
       edge_capacity(0),
       edge_vec_fp32(false),
       canonical_graph(false),
@@ -222,6 +223,7 @@ void PairDeepMDKokkos<DeviceType>::init_style() {
   edge_vec_fp32 = deep_pot.uses_fp32_edge_vectors();
   canonical_graph = deep_pot.uses_canonical_graph_inference();
   canonical_source_csr = deep_pot.canonical_graph_requires_source_csr();
+  message_passing = deep_pot.has_message_passing();
   // PairDeepMD::init_style() has confined a model with a long-range module to
   // a system periodic in every dimension or in none. The device edge path
   // passes such a module no cell, so a periodic system reaches it through the
@@ -558,14 +560,30 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
 
   // Send/recv swap metadata for a message-passing model under domain
   // decomposition: ghost features are exchanged across ranks inside the forward
-  // pass. It is passed only when the raw LAMMPS atom indices in the swap lists
-  // match the model-node indices, i.e. when no virtual (NULL-type) atoms
-  // compact the node set; otherwise the extended edge-input path is rejected.
+  // pass. The swap lists address LAMMPS atoms, which are the model-node indices
+  // too unless virtual (NULL-type) atoms compact the node set. The compact
+  // canonical lower then translates them through the same map its graph was
+  // built from; the edge-input lower has no channel for the translation, so it
+  // states no payload and lets the model layer refuse the decomposed frame
+  // rather than refresh every halo with stale features.
   deepmd_compat::InputNlist comm_list;
   const deepmd_compat::InputNlist* comm_ptr = nullptr;
-  if (multi_rank && !compact_graph.has_null_types) {
-    comm_list = make_comm_nlist();
-    comm_ptr = &comm_list;
+  std::vector<int> node_map;
+  const std::vector<int>* node_map_ptr = nullptr;
+  if (multi_rank && message_passing) {
+    if (!compact_graph.has_null_types) {
+      comm_list = make_comm_nlist();
+      comm_ptr = &comm_list;
+    } else if (canonical_graph) {
+      auto h_loc2model = compact_graph.k_loc2model.view_host();
+      node_map.resize(nall);
+      for (int i = 0; i < nall; ++i) {
+        node_map[i] = h_loc2model(i);
+      }
+      comm_list = make_comm_nlist();
+      comm_ptr = &comm_list;
+      node_map_ptr = &node_map;
+    }
   }
 
   // A model with a long-range module evaluates the system over all the ranks
@@ -615,7 +633,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
             source_csr ? compact_graph.d_source_row_ptr.data() : nullptr,
             source_csr ? compact_graph.d_source_order.data() : nullptr,
             coord_ptr, world_ptr, cell_ptr, nloc_m, nnode_m,
-            compact_graph.storage_count, model_stream);
+            compact_graph.storage_count, model_stream, comm_ptr, node_map_ptr);
       } else if (edge_vec_fp32) {
         deep_pot.compute_edges_gpu(d_atom_energy.data(), d_out_force.data(),
                                    d_atom_virial.data(), coord_ptr,

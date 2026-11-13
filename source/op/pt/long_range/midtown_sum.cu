@@ -29,6 +29,7 @@
 // scalars the device entry point wants on the host (the squared charge sum
 // and the charged-node count) make the round trip.
 
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/library.h>
 #include <torch/types.h>
 
@@ -225,8 +226,7 @@ __global__ void k_midtown_finish1(int n, const double* vpot, const double* f3,
                                   const double* q, const bool* mask,
                                   const double* coord, double prefactor,
                                   double kernel_zero, int channel,
-                                  double* energy, double* sums,
-                                  double* moments) {
+                                  double* energy, double* sums) {
   __shared__ double ssum[10][8];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -238,12 +238,10 @@ __global__ void k_midtown_finish1(int n, const double* vpot, const double* f3,
     const double phi = (vpot[i] - prefactor * kernel_zero * q[i]) * m;
     energy[i] = 0.5 * q[i] * phi;
     if (channel >= 0) local[0] = phi;
-    const int k = i * 9;
-    for (int a = 0; a < 3; ++a) {
+      for (int a = 0; a < 3; ++a) {
       for (int b = 0; b < 3; ++b) {
-        const double mom = f3[3 * i + a] * coord[3 * i + b];
-        moments[k + 3 * a + b] = mom;
-        local[1 + 3 * a + b] = mom;
+        // Only the reduction needs it; finish2 recomputes the per-atom value.
+        local[1 + 3 * a + b] = f3[3 * i + a] * coord[3 * i + b];
       }
     }
   }
@@ -274,9 +272,9 @@ __global__ void k_midtown_finish2(int n, const double* vpot, const double* q,
                                   const bool* mask, double prefactor,
                                   double kernel_zero, int channel,
                                   const double* sums, const double* count,
-                                  const double* moments, const double* red,
-                                  double virial_scale, float* grad,
-                                  float* virial9) {
+                                  const double* f3, const double* coord,
+                                  const double* red, double virial_scale,
+                                  float* grad, float* virial9) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const double m = mask[i] ? 1.0 : 0.0;
@@ -289,9 +287,16 @@ __global__ void k_midtown_finish2(int n, const double* vpot, const double* q,
   const double W[9] = {red[1] * v, red[4] * v, red[5] * v,
                        red[4] * v, red[2] * v, red[6] * v,
                        red[5] * v, red[6] * v, red[3] * v};
+  // F_i (x) r_i recomputed here rather than carried through a 72 B/atom
+  // scratch written by finish1 and read back: the same fp64 product of the
+  // same arrays, so bit-identical, without the write+read of 144 B/atom/step.
   const int k = i * 9;
-  for (int t = 0; t < 9; ++t) {
-    virial9[k + t] = static_cast<float>(moments[k + t] + (W[t] - sums[1 + t]) / cnt);
+  for (int a = 0; a < 3; ++a) {
+    for (int b = 0; b < 3; ++b) {
+      const int t = 3 * a + b;
+      const double mom = f3[3 * i + a] * coord[3 * i + b];
+      virial9[k + t] = static_cast<float>(mom + (W[t] - sums[1 + t]) / cnt);
+    }
   }
 }
 
@@ -369,6 +374,8 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              const torch::Tensor* communicator,
                              int64_t force_mode,
                              bool quads) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
   CpuTimer::cycle();
   TORCH_CHECK(kernel == kSog,
               "the midtown mesh backend evaluates the SOG kernel only");
@@ -394,6 +401,10 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
   const int spline = midtown_spline(order, quads);
   const bool is_quads = (spline == SOG_QUADS_4 || spline == SOG_QUADS_6);
   const int64_t bands = coefficient.size(0) / 2;
+  if (std::getenv("SOG_MIDTOWN_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[midtown] nodes=%lld frames=%lld\n",
+                 static_cast<long long>(n), static_cast<long long>(frame_count));
+  }
 
   // The coefficients are metadata: the caller passes them on the host, so no
   // device synchronization happens here.  The frame boundaries are only read
@@ -401,9 +412,33 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
   // device (the charge constraint reads it there).
   CpuTimer tm;
   const bool coef_host = coefficient.device().is_cpu();
-  torch::Tensor coef_h =
-      coef_host ? coefficient.detach().flatten().contiguous()
-                : coefficient.detach().flatten().to(at::kCPU).contiguous();
+  // A CUDA coefficient (the frozen canonical graph carries it as a device
+  // constant) cannot be copied to an ordinary CPU tensor while a stream is
+  // being captured: ATen rejects the copy and the whole graph capture falls
+  // back to eager.  Keep a pinned host mirror, keyed by the tensor identity,
+  // so the first call stages it and every later call (including the capture)
+  // reuses it.  A pinned destination is the one copy ATen allows inside a
+  // capture, so even the first call is legal.
+  torch::Tensor coef_h;
+  if (coef_host) {
+    coef_h = coefficient.detach().flatten().contiguous();
+  } else {
+    static std::mutex coef_mutex;
+    static const void* coef_ptr = nullptr;
+    static int64_t coef_numel = -1;
+    static torch::Tensor coef_pinned;
+    const std::lock_guard<std::mutex> lock(coef_mutex);
+    const void* ptr = coefficient.data_ptr();
+    if (coef_ptr != ptr || coef_numel != coefficient.numel()) {
+      coef_pinned = torch::empty(
+          {coefficient.numel()},
+          coefficient.options().device(at::kCPU).pinned_memory(true));
+      coef_pinned.copy_(coefficient.detach().flatten());
+      coef_ptr = ptr;
+      coef_numel = coefficient.numel();
+    }
+    coef_h = coef_pinned;
+  }
   const double* cf = coef_h.data_ptr<double>();
   std::vector<double> amp(bands), bw(bands);
   double kernel_zero = 0.0;
@@ -530,10 +565,10 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     auto q = at::empty({count}, double_options);
     auto csums = at::zeros({2}, double_options);
     const int qblocks = static_cast<int>((count + 255) / 256);
-    k_midtown_charges1<<<qblocks, 256>>>(
+    k_midtown_charges1<<<qblocks, 256,0,stream>>>(
         static_cast<int>(count), raw.data_ptr<float>(), mask_f.data_ptr<bool>(),
         q.data_ptr<double>(), csums.data_ptr<double>());
-    k_midtown_charges2<<<qblocks, 256>>>(
+    k_midtown_charges2<<<qblocks, 256,0,stream>>>(
         static_cast<int>(count), mask_f.data_ptr<bool>(),
         csums.data_ptr<double>(), qtot + f, static_cast<int>(channel),
         q.data_ptr<double>());
@@ -594,7 +629,14 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const double ng = static_cast<double>(nx) * ny * nz;
-        const double need = ng * 20.0;
+        // f_gp (float2, 8 B) + f_rho_r (4) + f_rho_fx (8) per grid point.
+        // QuadS adds its half-spectrum buffer (4 B) and the ik force mode the
+        // three gradient meshes (12 B) plus their half-spectrum scratch (4 B);
+        // the old flat 20 counted neither, so a QuadS-ik mesh could pass this
+        // check and then fail inside the solve.
+        const double per_point = 20.0 + (is_quads ? 4.0 : 0.0) +
+                                 (force_mode != 0 ? 16.0 : 0.0);
+        const double need = ng * per_point;
         TORCH_CHECK(static_cast<double>(free_b) >= need * 1.10,
                     "midtown: the replicated mesh needs ",
                     need / 1073741824.0, " GiB of device memory for a ", nx,
@@ -693,27 +735,25 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     force.narrow(0, begin, count).copy_(f3);
 
     auto sums = at::zeros({10}, double_options);
-    auto moments = at::empty({count * 9}, double_options);
     const int fblocks = static_cast<int>((count + 255) / 256);
     // The energy lands in the output directly: no buffer, no copy.
     double* energy_out = atom_energy.data_ptr<double>() + begin;
-    k_midtown_finish1<<<fblocks, 256>>>(
+    k_midtown_finish1<<<fblocks, 256,0,stream>>>(
         static_cast<int>(count), d_vpot.data_ptr<double>(),
         f3.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
         c_f.data_ptr<double>(), prefactor, kernel_zero,
-        static_cast<int>(channel), energy_out, sums.data_ptr<double>(),
-        moments.data_ptr<double>());
-    k_midtown_finish2<<<fblocks, 256>>>(
+        static_cast<int>(channel), energy_out, sums.data_ptr<double>());
+    k_midtown_finish2<<<fblocks, 256,0,stream>>>(
         static_cast<int>(count), d_vpot.data_ptr<double>(),
         q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
         static_cast<int>(channel), sums.data_ptr<double>(),
-        csums.data_ptr<double>(), moments.data_ptr<double>(), red,
-        0.5 * volume * prefactor,
+        csums.data_ptr<double>(), f3.data_ptr<double>(),
+        c_f.data_ptr<double>(), red, 0.5 * volume * prefactor,
         charge_gradient.narrow(0, begin, count).data_ptr<float>(),
         atom_virial.narrow(0, begin, count).data_ptr<float>());
 
     // The frame virial, from the same six sums, in one nine-thread kernel.
-    k_midtown_virial<<<1, 32>>>(red, 0.5 * volume * prefactor,
+    k_midtown_virial<<<1, 32,0,stream>>>(red, 0.5 * volume * prefactor,
                                 virial.data_ptr<float>() + 9 * f);
 
     tm.mark("finish");
@@ -907,15 +947,13 @@ ChargeSumOutputs midtown_sum_local(
   auto f_s = d_force.reshape({count, 3});
   force.copy_(f_s);
   auto sums = at::zeros({10}, double_options);
-  auto moments = at::empty({count * 9}, double_options);
   auto energy_f = at::empty({count}, double_options);
   const int fblocks = static_cast<int>((count + 255) / 256);
   k_midtown_finish1<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       f_s.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
       c_f.data_ptr<double>(), prefactor, kernel_zero, static_cast<int>(channel),
-      energy_f.data_ptr<double>(), sums.data_ptr<double>(),
-      moments.data_ptr<double>());
+      energy_f.data_ptr<double>(), sums.data_ptr<double>());
   // The frame sums (the constrained-channel potential sum and the nine moment
   // sums) are what finish2 shares over the charged nodes, so they are global.
   sums.copy_(sum_over_domains(*communicator, sums));
@@ -925,8 +963,8 @@ ChargeSumOutputs midtown_sum_local(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
       static_cast<int>(channel), sums.data_ptr<double>(),
-      count_d.data_ptr<double>(), moments.data_ptr<double>(),
-      red.data_ptr<double>(), 0.5 * volume * prefactor,
+      count_d.data_ptr<double>(), f_s.data_ptr<double>(),
+      c_f.data_ptr<double>(), red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
   atom_energy.copy_(energy_f.reshape({count, 1}));
   static const int64_t kSym[9] = {0, 3, 4, 3, 1, 5, 4, 5, 2};
@@ -1007,7 +1045,8 @@ ChargeSumOutputs midtown_sum_slab(
     const torch::Tensor& total_charge, const torch::Tensor& box,
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
-    const torch::Tensor* communicator, bool quads, bool bspline) {
+    const torch::Tensor* communicator, bool quads, bool bspline,
+    int64_t force_mode) {
   TORCH_CHECK(kernel == kSog, "the slab midtown backend evaluates the SOG kernel only");
   TORCH_CHECK(charge.size(1) == 1, "the slab midtown backend supports one channel");
   TORCH_CHECK(channel == -1 || channel == 0,
@@ -1326,8 +1365,17 @@ ChargeSumOutputs midtown_sum_slab(
   }
   mark(3);  // forward all-to-all
   if (TR()) fprintf(stderr, "[slab] alltoall fwd done\n");
+  // The ik force mode differentiates in Fourier space: the green-multiplied
+  // potential spectrum is kept (keep_spec), and every Cartesian component is
+  // then pushed through the same inverse z + transpose + inverse (x,y) chain
+  // that the potential takes.  That is one transpose per component -- the price
+  // of the mode -- but it keeps the solve's memory at one extra pencil, one
+  // extra brick, and no extra block buffers.
+  const bool ik = (force_mode != 0);
+  TORCH_CHECK(!ik || (!bspline), "the slab midtown backend implements the ik force mode for CubeS2 and QuadS only");
   TORCH_CHECK(sog_gpu_slab_unpack_green_izpack_dev(
-                  local.state, nx, ny, nz, ylo, YL, lx, ly, lz, scaleinv, np) == 0,
+                  local.state, nx, ny, nz, ylo, YL, lx, ly, lz, scaleinv, np,
+                  /*keep_spec=*/ik ? 1 : 0) == 0,
               "midtown slab: unpack / z FFT / green failed");
   mark(4);  // unpack + z FFT + green + inverse
   if (TR()) fprintf(stderr, "[slab] zfft+green done\n");
@@ -1338,44 +1386,59 @@ ChargeSumOutputs midtown_sum_slab(
   }
   mark(5);  // accumulator all-reduce
   if (TR()) fprintf(stderr, "[slab] red reduce done\n");
-  if (use_nccl) {
-    TORCH_CHECK(sog_gpu_nccl_alltoall_bwd(local.state, rcnt.data(),
-                                          rdisp.data(), scnt.data(),
-                                          sdisp.data(), np) == 0,
-                "midtown slab: NCCL inverse all-to-all failed");
-  } else {
-    TORCH_CHECK(sog_gpu_slab_copy_packed(local.state, /*forward=*/0,
-                                         (size_t)rcnt[0]) == 0,
-                "midtown slab: packed block copy failed");
-  }
+  // One inverse transpose: the packed blocks of the spectrum just produced in
+  // s_rho are moved to the receiving ranks' (x,y) slabs in s_pot.
+  auto transpose_back = [&]() {
+    if (use_nccl) {
+      TORCH_CHECK(sog_gpu_nccl_alltoall_bwd(local.state, rcnt.data(),
+                                            rdisp.data(), scnt.data(),
+                                            sdisp.data(), np) == 0,
+                  "midtown slab: NCCL inverse all-to-all failed");
+    } else {
+      TORCH_CHECK(sog_gpu_slab_copy_packed(local.state, /*forward=*/0,
+                                           (size_t)rcnt[0]) == 0,
+                  "midtown slab: packed block copy failed");
+    }
+  };
+  // Fill a brick's z ghost planes: a full brick sums the owned planes over the
+  // ranks and wraps them periodically, a z-slab exchanges them with its two
+  // neighbours.
+  auto fill_ghosts = [&](float* brick) {
+    if (full_brick) {
+      // The inverse transform wrote this rank's own ZL planes; the rest of the
+      // brick was zeroed by the unpack.  Sum across ranks to get the full
+      // potential, then fill the periodic ghosts from the owned edge planes.
+      if (np > 1) {
+        TORCH_CHECK(sog_gpu_brick_allreduce_f_at(local.state, brick,
+                                                 plane * (size_t)gh,
+                                                 plane * (size_t)nz) == 0,
+                    "midtown slab: full-brick potential all-reduce failed");
+      }
+      for (int j = 0; j < gh; ++j) {
+        // lower ghost <- the last gh owned planes (periodic wrap)
+        sog_gpu_brick_copy_planes_at(local.state, brick,
+                                     plane * (size_t)(nz + j),
+                                     plane * (size_t)j, plane);
+        // upper ghost <- the first gh owned planes
+        sog_gpu_brick_copy_planes_at(local.state, brick,
+                                     plane * (size_t)(gh + j),
+                                     plane * (size_t)(nz + gh + j), plane);
+      }
+    } else {
+      TORCH_CHECK(sog_gpu_nccl_halo_fwd_at(local.state, brick, prev, next,
+                                           plane, zoff, ZL, gh, gh) == 0,
+                  "midtown slab: NCCL forward halo failed");
+    }
+  };
+  transpose_back();
   mark(6);  // inverse all-to-all
   if (TR()) fprintf(stderr, "[slab] alltoall bwd done\n");
   TORCH_CHECK(sog_gpu_slab_unpack_ixyfft_to_brick_dev(local.state, nx, ny, nz,
-                                                      ZL, np, zoff, ZB) == 0,
+                                                      ZL, np, zoff, ZB,
+                                                      /*out=*/nullptr) == 0,
               "midtown slab: unpack + inverse (x,y) FFT failed");
   mark(7);  // unpack + inverse (x,y) FFT
-  if (full_brick) {
-    // The inverse transform wrote this rank's own ZL planes; the rest of the
-    // brick was zeroed by the unpack.  Sum across ranks to get the full
-    // potential, then fill the periodic ghosts from the owned edge planes.
-    if (np > 1) {
-      TORCH_CHECK(sog_gpu_brick_allreduce_f(local.state, plane * (size_t)gh,
-                                            plane * (size_t)nz) == 0,
-                  "midtown slab: full-brick potential all-reduce failed");
-    }
-    for (int j = 0; j < gh; ++j) {
-      // lower ghost <- the last gh owned planes (periodic wrap)
-      sog_gpu_brick_copy_planes(local.state, plane * (size_t)(nz + j),
-                                plane * (size_t)j, plane);
-      // upper ghost <- the first gh owned planes
-      sog_gpu_brick_copy_planes(local.state, plane * (size_t)(gh + j),
-                                plane * (size_t)(nz + gh + j), plane);
-    }
-  } else {
-    TORCH_CHECK(sog_gpu_nccl_halo_fwd(local.state, prev, next, plane, zoff, ZL,
-                                      gh, gh) == 0,
-                "midtown slab: NCCL forward halo failed");
-  }
+  fill_ghosts(sog_gpu_potential_brick(local.state));
 
   mark(8);  // forward halo
   if (TR()) fprintf(stderr, "[slab] ixyfft done\n");
@@ -1385,6 +1448,46 @@ ChargeSumOutputs midtown_sum_slab(
                            q.data_ptr<double>(), prefactor, spline, nx, ny, nz,
                            0, nx - 1, 0, ny - 1, zb_lo, zb_hi, force.data(),
                            vpot.data());
+  if (ik) {
+    float* gbrick = sog_gpu_grad_brick(local.state, (size_t)ZB * plane);
+    TORCH_CHECK(gbrick != nullptr,
+                "midtown slab: gradient brick allocation failed");
+    // The potential gather above produced the per-atom potential (correct in
+    // both modes) and a provisional AD force.  Each component now overwrites
+    // its own force entry from the gradient brick, leaving the potential
+    // untouched; one device-to-host copy at the end returns the three.
+    TORCH_CHECK(sog_gpu_slab_grad_izpack_dev(local.state, nx, ny, nz, ylo, YL,
+                                             lx, ly, lz, np, /*axis=*/2) == 0,
+                "midtown slab: z gradient pack failed");
+    transpose_back();
+    TORCH_CHECK(sog_gpu_slab_unpack_ixyfft_to_brick_dev(
+                    local.state, nx, ny, nz, ZL, np, zoff, ZB,
+                    gbrick) == 0,
+                "midtown slab: unpack + inverse (x,y) FFT failed");
+    fill_ghosts(gbrick);
+    sog_gpu_gather_brick_dev_ik(
+        local.state, static_cast<int>(count), c_f.data_ptr<double>(), boxlo, lx,
+        ly, lz, q.data_ptr<double>(), prefactor, spline, nx, ny, nz, 0, nx - 1,
+        0, ny - 1, zb_lo, zb_hi, nullptr, gbrick, /*comp=*/2, /*want_pot=*/0, /*upload=*/1);
+    for (int axis = 0; axis < 2; ++axis) {
+      TORCH_CHECK(sog_gpu_slab_grad_izpack_dev(local.state, nx, ny, nz, ylo, YL,
+                                               lx, ly, lz, np, axis) == 0,
+                  "midtown slab: gradient pack failed");
+      transpose_back();
+      TORCH_CHECK(sog_gpu_slab_unpack_ixyfft_to_brick_dev(
+                      local.state, nx, ny, nz, ZL, np, zoff, ZB,
+                      gbrick) == 0,
+                  "midtown slab: unpack + inverse (x,y) FFT failed");
+      fill_ghosts(gbrick);
+      sog_gpu_gather_brick_dev_ik(
+          local.state, static_cast<int>(count), c_f.data_ptr<double>(), boxlo,
+          lx, ly, lz, q.data_ptr<double>(), prefactor, spline, nx, ny, nz, 0,
+          nx - 1, 0, ny - 1, zb_lo, zb_hi, sog_gpu_potential_brick(local.state),
+          gbrick, axis, /*want_pot=*/0, /*upload=*/0);
+    }
+    sog_gpu_gather_brick_ik_finish(local.state, static_cast<int>(count),
+                                   force.data(), vpot.data(), /*want_pot=*/0);
+  }
   mark(9);  // gather
   if (TR()) fprintf(stderr, "[slab] gather done\n");
   if (tim) {
@@ -1426,22 +1529,20 @@ ChargeSumOutputs midtown_sum_slab(
   force_out.copy_(d_force.reshape({count, 3}));
 
   auto sums = at::zeros({10}, double_options);
-  auto moments = at::empty({count * 9}, double_options);
   const int fblocks = static_cast<int>((count + 255) / 256);
   k_midtown_finish1<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       d_force.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
       c_f.data_ptr<double>(), prefactor, kernel_zero, static_cast<int>(channel),
-      atom_energy.data_ptr<double>(), sums.data_ptr<double>(),
-      moments.data_ptr<double>());
+      atom_energy.data_ptr<double>(), sums.data_ptr<double>());
   sums.copy_(sum_over_domains(*communicator, sums));
   auto count_d = csums.narrow(0, 0, 1).clamp_min(1.0);
   k_midtown_finish2<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
       static_cast<int>(channel), sums.data_ptr<double>(),
-      count_d.data_ptr<double>(), moments.data_ptr<double>(),
-      red.data_ptr<double>(), 0.5 * volume * prefactor,
+      count_d.data_ptr<double>(), d_force.data_ptr<double>(),
+      c_f.data_ptr<double>(), red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
   k_midtown_virial<<<1, 32>>>(red.data_ptr<double>(), 0.5 * volume * prefactor,
                               virial.data_ptr<float>());

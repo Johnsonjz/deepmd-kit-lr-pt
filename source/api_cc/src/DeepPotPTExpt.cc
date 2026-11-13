@@ -1553,17 +1553,22 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
         // A message-passing descriptor needs its ghost features refreshed
         // between blocks; the plain compact ABI has no channel for that, so a
         // decomposed frame runs on the with-comm sibling when the archive
-        // carries one.
+        // carries one. The compact node set is the extended real-atom set, so
+        // the swap lists address it directly, except that NULL-type atoms
+        // were filtered out of both, leaving their indices to be translated
+        // through ``fwd_map`` (an entry without a node is dropped).
         std::vector<at::Tensor> canonical_comm;
         if (multi_rank && has_message_passing_ && with_comm_loader) {
           if (nall_real < nall) {
-            throw deepmd::deepmd_exception(
-                "the compact canonical with-comm lower does not serve "
-                "NULL-type atoms on several ranks.");
+            canonical_comm =
+                deepmd::ptexpt::build_comm_tensors_positional_with_virtual_atoms(
+                    lmp_list, fwd_map, nloc, nghost_real, remapped_sendlist,
+                    remapped_sendlist_ptrs, remapped_sendnum, remapped_recvnum);
+          } else {
+            canonical_comm = deepmd::ptexpt::build_comm_tensors_positional(
+                lmp_list, lmp_list.sendlist, lmp_list.sendnum, lmp_list.recvnum,
+                nloc, nghost_real);
           }
-          canonical_comm = deepmd::ptexpt::build_comm_tensors_positional(
-              lmp_list, lmp_list.sendlist, lmp_list.sendnum, lmp_list.recvnum,
-              nloc, nghost_real);
         }
         if (!canonical_comm.empty()) {
           flat_outputs = run_model_canonical_graph_with_comm(
@@ -2555,6 +2560,16 @@ void DeepPotPTExpt::compute_edges_gpu_impl(double* d_atom_energy,
         "a graph-input model, or a message-passing model with its with-comm "
         "artifact and a comm_nlist.");
   }
+  if (extended && has_comm_artifact_ && !use_with_comm) {
+    // An artifact that was frozen with an exchange sibling refreshes its halo
+    // features inside the forward. Without the comm payload it would reuse the
+    // first block's features, answering for a system whose messages never
+    // crossed a rank boundary.
+    throw deepmd::deepmd_exception(
+        "compute_edges_gpu: this model was frozen with an exchange artifact, "
+        "which needs the swap metadata of the decomposition (comm_nlist) for a "
+        "frame with halo nodes.");
+  }
   // Fully device-resident inference for edge-input and graph-input models.
   //
   // The caller (an MD engine or the LAMMPS Kokkos pair) builds the neighbor
@@ -2874,7 +2889,9 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     const std::int64_t nloc,
     const std::int64_t nall_nodes,
     const std::int64_t edge_storage,
-    void* stream) {
+    void* stream,
+    const InputNlist* comm_nlist,
+    const std::vector<int>* node_map) {
   if (!lower_input_is_canonical_) {
     throw deepmd::deepmd_exception(
         "compute_canonical_graph_gpu requires a compact canonical artifact.");
@@ -2910,6 +2927,17 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     if (nloc != 0 || edge_storage != 0) {
       throw deepmd::deepmd_exception(
           "invalid compact canonical graph dimensions.");
+    }
+    if (has_comm_artifact_ && with_comm_loader && comm_nlist != nullptr) {
+      // A message-passing descriptor cannot run on an empty node set: the
+      // exported bounds start at one node, and its border operator exchanges
+      // one row per node. The DPA4C route pads phantom local atoms for this;
+      // the compact ABI has no place for them, so a decomposition that
+      // empties a rank is refused here rather than hanging in a collective
+      // the other ranks have entered.
+      throw deepmd::deepmd_exception(
+          "compute_canonical_graph_gpu: a message-passing compact canonical "
+          "artifact cannot serve a rank without nodes.");
     }
     translate_error([&] {
       const c10::DeviceGuard device_guard(torch::Device(torch::kCUDA, gpu_id));
@@ -2948,6 +2976,50 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
         "compute_canonical_graph_gpu: the source CSR may be omitted only as "
         "a pair, without a per-atom virial, and only for an artifact that "
         "assembles the force without it.");
+  }
+
+  // An artifact frozen with an exchange sibling refreshes its halo node
+  // features between blocks, so a decomposed frame needs the swap metadata of
+  // the caller's decomposition. The payload is built here, on the host and
+  // outside the evaluation, because ``border_op`` dereferences the send-list
+  // pointers it carries: the remapped storage must outlive the call, and a
+  // replay, whose tensors are built once with the first buffers, could not
+  // carry a payload that changes with the decomposition.
+  const bool needs_exchange = has_comm_artifact_ && nloc < nall_nodes;
+  const bool use_with_comm =
+      needs_exchange && with_comm_loader && comm_nlist != nullptr;
+  if (needs_exchange && !with_comm_loader) {
+    throw deepmd::deepmd_exception(
+        "compute_canonical_graph_gpu: this model was frozen with an exchange "
+        "artifact, but it failed to load at init time. See the earlier stderr "
+        "log for the underlying error.");
+  }
+  if (needs_exchange && comm_nlist == nullptr) {
+    // Without the payload the descriptor would refresh each halo node with the
+    // features its first block gave it, silently answering for a system whose
+    // messages never crossed a rank boundary.
+    throw deepmd::deepmd_exception(
+        "compute_canonical_graph_gpu: this model was frozen with an exchange "
+        "artifact, which needs the swap metadata of the decomposition "
+        "(comm_nlist) for a frame with halo nodes.");
+  }
+  std::vector<std::vector<int>> remapped_sendlist;
+  std::vector<int*> remapped_sendlist_ptrs;
+  std::vector<int> remapped_sendnum, remapped_recvnum;
+  std::vector<at::Tensor> comm_tensors;
+  if (use_with_comm) {
+    if (node_map != nullptr) {
+      comm_tensors =
+          deepmd::ptexpt::build_comm_tensors_positional_with_virtual_atoms(
+              *comm_nlist, *node_map, static_cast<int>(nloc),
+              static_cast<int>(nall_nodes - nloc), remapped_sendlist,
+              remapped_sendlist_ptrs, remapped_sendnum, remapped_recvnum);
+    } else {
+      comm_tensors = deepmd::ptexpt::build_comm_tensors_positional(
+          *comm_nlist, comm_nlist->sendlist, comm_nlist->sendnum,
+          comm_nlist->recvnum, static_cast<int>(nloc),
+          static_cast<int>(nall_nodes - nloc));
+    }
   }
 
   translate_error([&] {
@@ -3018,10 +3090,16 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
                                                 {nall_nodes, 3}, opt_f64)
                              : torch::Tensor();
       std::map<std::string, torch::Tensor> output;
-      extract_outputs(output, run_model_canonical_graph(
-                                  atype, n_node, n_local, source, edge_vec,
-                                  destination_row_ptr, source_row_ptr,
-                                  source_order, coord, world, cell));
+      extract_outputs(
+          output, use_with_comm
+                      ? run_model_canonical_graph_with_comm(
+                            atype, n_node, n_local, source, edge_vec,
+                            destination_row_ptr, source_row_ptr, source_order,
+                            coord, world, cell, comm_tensors)
+                      : run_model_canonical_graph(
+                            atype, n_node, n_local, source, edge_vec,
+                            destination_row_ptr, source_row_ptr, source_order,
+                            coord, world, cell));
       // Debug: dump the compact canonical arrays and the outputs of this rank,
       // so a replay through the Python model separates "the arrays are wrong"
       // from "the model is wrong". Enabled by DEEPMD_CANONICAL_DUMP=<dir>; the
@@ -3085,8 +3163,11 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     // is then part of the key, and is evaluated eagerly over several ranks,
     // where it may communicate between its kernels. A replay reads the cell
     // of its call, while the mesh size of the cell fixes the buffers and the
-    // launches of the evaluation, so the size joins the key.
-    bool replay = nloc == nall_nodes && !(long_range && world != nullptr);
+    // launches of the evaluation, so the size joins the key. The border
+    // exchange of a message-passing descriptor is a host MPI call the capture
+    // cannot record, so its evaluation is eager as well.
+    bool replay =
+        nloc == nall_nodes && !use_with_comm && !(long_range && world != nullptr);
     std::array<std::int64_t, 3> mesh = {};
     if (long_range) {
       if (!long_range_box.empty()) {
@@ -3214,12 +3295,14 @@ void DeepPotPTExpt::compute_canonical_graph_gpu(
     const std::int64_t nloc,
     const std::int64_t nall_nodes,
     const std::int64_t edge_storage,
-    void* stream) {
+    void* stream,
+    const InputNlist* comm_nlist,
+    const std::vector<int>* node_map) {
   compute_canonical_graph_gpu_impl(
       d_atom_energy, d_force, d_virial, d_atom_virial, d_atype, d_source,
       index_width, d_edge_vec, d_destination_row_ptr, d_source_row_ptr,
       d_source_order, d_coord, world, box, nloc, nall_nodes, edge_storage,
-      stream);
+      stream, comm_nlist, node_map);
 }
 
 bool DeepPotPTExpt::uses_fp32_edge_vectors() const {
@@ -3241,5 +3324,9 @@ bool DeepPotPTExpt::canonical_graph_requires_source_csr() const {
 }
 
 bool DeepPotPTExpt::has_long_range() const { return long_range_; }
+
+bool DeepPotPTExpt::has_message_passing() const {
+  return has_message_passing_;
+}
 
 #endif

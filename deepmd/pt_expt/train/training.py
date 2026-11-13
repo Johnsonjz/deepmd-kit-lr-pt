@@ -2582,9 +2582,15 @@ class Trainer(AbstractTrainer):
         # A group may carry its own lr (the long-range kernel one does); the
         # schedule multiplies every group by the same lambda, so each group's
         # base must be its own construction lr or the ratio is lost on the
-        # first scheduler step.
-        for param_group in self.optimizer.param_groups:
-            param_group["initial_lr"] = param_group["lr"]
+        # first scheduler step.  The base is rebuilt from the schedule rather
+        # than read back from the checkpoint: a resumed group lr already holds
+        # the schedule value of the saved step, and using it as the base would
+        # multiply the schedule by itself once more (the run would silently
+        # continue with a much smaller learning rate than a fresh run).
+        for index, param_group in enumerate(self.optimizer.param_groups):
+            param_group["initial_lr"] = initial_lr * (
+                self.kernel_lr_scale if index == self._kernel_group else 1.0
+            )
 
         # The resumed step offset is carried by last_epoch; the lambda must not
         # add it again, which would advance the schedule twice.
@@ -3543,7 +3549,9 @@ class Trainer(AbstractTrainer):
         Dynamo intercepts tensor creation inside Adam._init_group,
         which can trigger CUDA init on CPU-only builds.
         """
-        self._freeze_kernel_if_needed()
+        # The kernel is frozen by ``_freeze_kernel_if_needed`` before the
+        # gradient-norm clip of the training step, so a held kernel neither
+        # updates nor inflates the clip norm.
         self.optimizer.step()
         floor = getattr(self, "kernel_amp_floor", 0.0)
         width_floor = getattr(self, "kernel_width_floor", 0.0)
@@ -3565,9 +3573,10 @@ class Trainer(AbstractTrainer):
         """Hold the long-range kernel fixed until it becomes trainable.
 
         Before ``long_range_kernel_train_start_step`` the kernel parameters are
-        not updated at all: their gradients are set to ``None`` right before the
-        optimizer step, which makes every optimizer skip them (no weight decay,
-        no momentum).  ``requires_grad`` is left untouched, so the compiled
+        not updated at all: their gradients are dropped right after the
+        backward pass, so neither the optimizer (no update, no weight decay,
+        no momentum) nor the gradient-norm clip of that step sees them.
+        ``requires_grad`` is left untouched, so the compiled
         forward/backward graph is never re-traced by the switch.
         """
         idx = getattr(self, "_kernel_group", -1)
@@ -3842,6 +3851,11 @@ class Trainer(AbstractTrainer):
             task_key=task_key,
         )
         loss.backward()
+
+        # Hold the long-range kernel fixed, if its training has not started
+        # yet.  This runs before the gradient-norm clip so that a frozen
+        # kernel contributes neither to the update nor to the clipped norm.
+        self._freeze_kernel_if_needed()
 
         if self.gradient_max_norm > 0.0:
             self.nonfinite_grad_guard.update(

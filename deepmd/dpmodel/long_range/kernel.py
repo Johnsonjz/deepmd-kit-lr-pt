@@ -41,6 +41,9 @@ r"""Width of the first Gaussian of the default :class:`SOGKernel` ladder, in Å.
 SOG_DEFAULT_WIDTH_RATIO = 1.62976708826776469
 r"""Ratio of consecutive widths of the default :class:`SOGKernel` ladder."""
 
+SOG_DEFAULT_M = 7
+r"""Number of Gaussians of the default :class:`SOGKernel` ladder."""
+
 
 
 class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")):
@@ -369,7 +372,7 @@ class SOGKernel(BaseInteractionKernel):
         self,
         amplitude: float | list[float] | None = None,
         width: list[float] | None = None,
-        n_gaussian: int = 12,
+        n_gaussian: int = SOG_DEFAULT_M,
         base_width: float | None = SOG_DEFAULT_BASE_WIDTH,
         width_ratio: float | None = SOG_DEFAULT_WIDTH_RATIO,
         trainable: bool = True,

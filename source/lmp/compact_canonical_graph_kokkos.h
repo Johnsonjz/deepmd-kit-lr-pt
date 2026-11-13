@@ -1669,6 +1669,10 @@ class CompactCanonicalGraphKokkos : protected Pointers {
   // LAMMPS type (1-based) -> model type, resident on the device.
   Kokkos::View<int*, DeviceType> d_type_map;
   DAT::tdual_int_1d k_model2loc;      // (nall) model node index -> atom index
+  // Host mirror of the atom -> model-node map, which a caller that states atom
+  // indices to a model reading node indices (the message-passing swap lists)
+  // translates through. Valid once ``refresh_nodes`` has run for this step.
+  DAT::tdual_int_1d k_loc2model;
   typename AT::t_int_1d d_loc2model;  // (nall) atom -> model node index, or -1
   typename AT::t_int_1d d_model2loc;
   // (nall) candidate atom -> model node index, or -1, with a ghost already
@@ -1777,7 +1781,6 @@ class CompactCanonicalGraphKokkos : protected Pointers {
   // past it is zero.
   Kokkos::View<std::int64_t, DeviceType> d_fill_total;
 
-  DAT::tdual_int_1d k_loc2model;
   DAT::tdual_int_1d k_candidate_to_model;
   // Source counts and scatter cursors cover the full global edge range,
   // including source rows assembled from many destination rows.

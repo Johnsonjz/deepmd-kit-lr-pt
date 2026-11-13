@@ -397,7 +397,10 @@ class DeepPotPTExpt : public DeepPotBackend {
                                    const std::int64_t nloc,
                                    const std::int64_t nall_nodes,
                                    const std::int64_t edge_storage,
-                                   void* stream) override;
+                                   void* stream,
+                                   const InputNlist* comm_nlist = nullptr,
+                                   const std::vector<int>* node_map = nullptr)
+      override;
   /**
    * @brief FP32 edge-vector overload for compressed graph artifacts.
    *
@@ -428,6 +431,7 @@ class DeepPotPTExpt : public DeepPotBackend {
   bool uses_canonical_graph_inference() const override;
   bool canonical_graph_requires_source_csr() const override;
   bool has_long_range() const override;
+  bool has_message_passing() const override;
 
  private:
   template <typename EDGE_TYPE>
@@ -462,7 +466,9 @@ class DeepPotPTExpt : public DeepPotBackend {
       const std::int64_t nloc,
       const std::int64_t nall_nodes,
       const std::int64_t edge_storage,
-      void* stream);
+      void* stream,
+      const InputNlist* comm_nlist,
+      const std::vector<int>* node_map);
   bool inited;
   // Every width below is a property of the loaded archive.  They read as zero
   // until ``init`` has run, so that a query on an uninitialised backend

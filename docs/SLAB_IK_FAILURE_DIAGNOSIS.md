@@ -1,11 +1,19 @@
 # 分布式网格（slab）与 ik 力模式的 LAMMPS 崩溃：报错诊断记录
 
+> **2026-11-12 更新**：z-slab 求解器**已实现 ik 通路**，由 `SOG_SLAB_IK=1` 显式打开
+> （默认仍走 replicated，默认行为不变）。实现与验证见
+> `docs/PAIR_DEEPMD_KK_SOG.md` §13.1。本文保留为**诊断记录**：下面第 0 节说
+> "设计如此、不是 bug" 的那一条描述的是 2026-11-10 的状态。
+>
 > 记录 2026-11-10 验证"所有样条模式都支持分布式网格"时撞到的三类失败，
 > 以及它们**看起来相同、实际完全不同**的真因。
 >
 > 一句话结论：`Expected a proper Tensor but got None ... 'self'` 这条报错
 > **不是** 任何一类问题的真因，而是 AOTI proxy executor 吞掉算子异常后的
 > **二次症状**。真因分散在三个互不相关的地方（§3、§4、§5）。
+>
+> 修复与其验证见 §10；**设备链 `pair_style deepmd/kk` 的复测见 §11**
+> ——同一体系比主机版快 23×，而分布式网格在设备链上慢了整整一倍。
 
 ---
 
@@ -135,24 +143,18 @@ Python 侧拿到 `energy = nan` 而**不抛异常**。也就是说：
 包括但不限于：网格过大 OOM、形参/盒子不合法、kernel 参数越界。
 排查时第一小时基本都浪费在这里。
 
-### 3.6 建议修法
+### 3.6 修法（2026-11-10 晚已落地）
 
-1. `flatten_canonical_atom_virial`：先判 `defined()`，未定义时给出**明确**错误，
-   例如
-   `"the exported graph returned an undefined output '<key>'; the underlying
-   operator error was swallowed by the AOTI proxy executor (see the '[E...]
-   shim_common.cpp' line on stderr)"`。
-   同样处理 `remap_graph_outputs_to_dense_keys*` 里读取的每一个键。
-2. 已有前置检查仅覆盖 `atomic && !do_atomic_virial`
-   （`DeepPotPTExpt.cc:961`），覆盖面不够；建议在
-   `DeepPotPTExpt::compute` 拿到 `flat_outputs` 后统一做一次 defined 校验，
-   一次性报出所有未定义的槽位。
+`require_defined_outputs()`（`source/api_cc/include/commonPT.h`）在每次
+`extract_outputs` 之后点名列出 undefined 的槽位并指向 stderr 的 `[E...]` 行；
+`flatten_canonical_atom_virial` 不再对 None 调 `reshape`。
+用法与现状见 `PAIR_DEEPMD_KK_SOG.md` §12.2，实测见本文 §10.2。
 
 ---
 
-## 4. 真因二（设计如此）：ik 力模式不支持分布式网格
+## 4. 真因二（设计如此）：ik 力模式没有分布式实现
 
-`source/op/pt/long_range/latent_charge_sum.cu:273-290`：
+当时的代码（`source/op/pt/long_range/latent_charge_sum.cu:273-290`）：
 
 ```cpp
 const char* slab_env = std::getenv("SOG_MIDTOWN_SLAB");
@@ -170,6 +172,8 @@ if (slab_env != nullptr && std::atoi(slab_env) != 0 &&
 ```
 
 `SOG_MIDTOWN_DIST` 分支（`midtown_sum_local`）有同样的一条（`:304`）。
+**2026-11-10 晚已改为"警告 + 回落 replicated"**（`SOG_SLAB_STRICT=1` 恢复硬报错），
+见 §10。
 
 要点：
 
@@ -262,14 +266,14 @@ B-spline 的 ΔE/ΔVirial 比另外两家大两个量级（dVir −2.2e-2 vs −
 replicated 走 B-spline 的 `mesh_sum`、slab 走独立实现的 `midtown_sum_slab`，
 这就是两个独立 fp32 实现的地板。**分布式网格对三种样条都是对的。**
 
-### 6.2 MD 全链路（LAMMPS + canonical 融合 op，np=2）— **只有 AD + B-spline 通**
+### 6.2 MD 全链路（LAMMPS + canonical 融合 op，np=2，**主机版** `pair deepmd`）
 
-`slab_vs_rep.np2.csv`：
+`slab_vs_rep.np2.csv`（2026-11-10 18:0x，修复前）：
 
 | 模型 | 力模式 | replicated | slab |
 |---|---|---|---|
 | `lr_bs4` | ad | ✓ 1219.8 ms / 11 610 MiB | ✓ 1299.7 ms / 10 596 MiB，`pe` 一致 |
-| `lr_mid4ik` | ik | ✓ 1184.0 ms / 7 654 MiB | ✗（§4 的 guard，被 §3 掩盖） |
+| `lr_mid4ik` | ik | ✓ 1184.0 ms / 7 654 MiB | ✗（§4 的 guard，被 §3 掩盖）；§10 修复后回落 replicated |
 | `lr_quads4ik` | ik | ✓ 1187.3 ms / 6 992 MiB | ✗（同上） |
 | `lr_mid4` | ad | ✗ 526 848 原子（§5.1 显存）；≤98 304 正常 | 未测（同 §5） |
 
@@ -277,25 +281,29 @@ replicated 走 B-spline 的 `mesh_sum`、slab 走独立实现的 `midtown_sum_sl
 `pe = -174649690.0` 两边一致；mid4ik replicated 2529.5 ms / 14 334 MiB，
 quads4ik 2533.7 ms / 14 308 MiB。
 
+> 这一节是**主机版 pair** 的数字。设备链 `pair_style deepmd/kk` 上同一体系快 23×，
+> 而且分布式的代价从 +6% 变成 +102%——见 §11。
+
 ---
 
 ## 7. 该选哪个：论文的多 GPU 数据用 **replicated**
 
-三条理由，按重要性排序：
+四条理由，按重要性排序：
 
-1. **可覆盖性**：论文 §6.5 的 4 阶后端是 `bs4 / mid4ik / quads4ik / sr`，
-   其中两个 LR 后端是 ik，而 ik **只有** replicated 实现。
-   用 slab 就得把一个后端的规则和其它后端写得不一致。
-2. **收益很小**：bs4 上分布式只省 8.7%（526 848）/ 11.9%（1 119 744）显存，
-   代价是 +6.6% / +5.5% 时间。整步显存的大头是 descriptor 与边张量，不是网格。
-3. **规模下限**：分布式网格每 rank 需要约 1 500 原子以上才划算——小尺寸下
+1. **设备链上分布式直接慢一倍**（§11.3）：526 848 原子 np=2，`deepmd/kk` 的
+   rep 77.8 ms/step vs slab 157.4 ms/step，只换来 10 768 → 9 738 MiB（−9.6%）显存。
+2. **可覆盖性**：论文 §6.5 的 4 阶后端里两个 LR 后端是 ik，而 ik 没有分布式实现
+   （§10 之后是静默回落 replicated，多设一个环境变量只会浪费一次警告）。
+3. **收益本来就不大**：主机链上分布式只省 8.7%（526 848）/ 11.9%（1 119 744）显存，
+   代价 +6.6% / +5.5% 时间——整步显存的大头是 descriptor 与边张量，不是网格。
+4. **规模下限**：分布式网格每 rank 需要约 1 500 原子以上才划算——小尺寸下
    交换与同步开销压不住（maxsize 扫描里 `dpa4c-sog` 在 np=4、192 原子直接失败）。
    多 GPU 图的最小点正好在这个区间以下。
 
-所以：**多 GPU 图的绝对数字取 replicated 的 `mid4ik` / `quads4ik` 列**
-（1 184 / 1 187 ms @ 526 848；2 530 / 2 534 ms @ 1 119 744），
-分布式网格只在正文里作为一句"已实现并通过算子层等价性验证，
-但在整步中收益有限且与 ik 互斥"的说明保留。
+所以：**多 GPU 图取 replicated**。绝对数字用哪条链要统一：论文现在的 1 184 / 1 187 ms
+（@526 848）和 2 530 / 2 534 ms（@1 119 744）来自**主机版** `pair deepmd`；
+按文档主线（`deepmd/kk`）同一体系是 **99.6 ms**（bs4）/ **78.6 ms**（mid4ik）。
+分布式网格最多作为一句"已实现并通过算子层等价性验证，但整步无收益、且与 ik 互斥"保留。
 
 ---
 
@@ -407,6 +415,102 @@ bash docs/check_all_spline_modes_slab.sh     # 6 组：rep(np1) vs slab(np2)
 `check_spline_parity_across_ranks.py`（每 rank 存 `par_<tag>_{e,f,i,v}<rank>.npy`）→
 `compare_spline_parity.py`（按全局原子序重排后比较 E/F/virial）。
 输出目录由 `OUT` 环境变量控制（默认 `/tmp/lr_md`）。
+
+---
+
+## 11. 设备链路复测：`pair_style deepmd/kk`（2026-11-10 20:2x）
+
+**为什么重测**：§6.2 / §7 的数字（1.2 s/step @ 526 848）是用 **主机版** `pair_style deepmd`
+量的，而本仓库文档的主线部署命令是 `pair_style deepmd/kk`（`PAIR_DEEPMD_KK_SOG.md` §4.1）。
+本树以前没有 kk 插件产物，所以这两条链从没在这里比过。
+
+### 11.1 先把本树自己的 kk 插件编出来
+
+`source/lmp/plugin/CMakeLists.txt` 本来就有 `DEEPMD_LAMMPS_KOKKOS` 开关，只是没人编过：
+
+```bash
+module load gcc/13
+export PATH=/usr/local/cuda-12.4/bin:$PATH NVCC_WRAPPER_DEFAULT_COMPILER=g++
+R=/data/home/public/jiangzhen/dp/deepmd-kit-LR-lr-pt
+OMPI=/data/app/openmpi-4.1.4/install/openmpi/4.1.4
+cmake -S source/lmp/plugin -B /tmp/kk_lrpt_build \
+  -DLAMMPS_SOURCE_ROOT=/data/home/public/jiangzhen/lammps/lammps_stable \
+  -DCMAKE_CXX_COMPILER=/tmp/nvcc_wrapper_shim \
+  -DDEEPMD_LAMMPS_KOKKOS=ON \
+  -DKokkos_DIR=/data/home/public/jiangzhen/lammps/lammps_stable/build_kokkos/lib/kokkos \
+  -DLIB_DEEPMD_CC=/data/home/public/jiangzhen/dp/lr212_install_lrpt/deepmd/lib/libdeepmd_cc.so \
+  -DCMAKE_CXX_FLAGS="-fopenmp -pthread -I$R/source/api_cc/include" \
+  -DCMAKE_MODULE_LINKER_FLAGS="-L$OMPI/lib -lmpi"
+```
+
+四个坑，每个都是**静默**的：
+
+1. **CUDA 版本**：`nvcc` 11.8 不认 `-std=c++20`（LAMMPS 本身是用 CUDA 12.4 编的）。
+   默认 PATH 上的 `nvcc` 是 11.8 → 必须 `PATH=/usr/local/cuda-12.4/bin:$PATH`。
+2. **`-std=c++2a`**：CMake 对 NVIDIA 编译器发的是 `c++2a`，`nvcc_wrapper` 把它改成 `c++20`
+   又被 nvcc 拒。用一个 shim 把两个别名改写成 `-std=c++20`。
+3. **OpenMP**：Kokkos 的 OpenMP backend 要求编译器带 `-fopenmp`，否则
+   `Kokkos_OpenMP_Instance.hpp:10` 直接 `#error`。
+4. **MPI 符号被 C++ mangled**（最隐蔽）：CMake 把 `$(CXX_INCLUDES)` 放在 `$(CXX_FLAGS)`
+   之前，`lammps_interface` 的 `src/STUBS/mpi.h` 先被命中，于是 MPI 声明没有 `extern "C"`，
+   插件里留下 `_Z9MPI_BcastPviiii` 这样的符号，LAMMPS 加载时报
+   `undefined symbol: _Z9MPI_BcastPviiii`、`Loaded 0 plugins`，然后只说
+   `Unrecognized pair style 'deepmd/kk'`。**把 `-I$OMPI/include` 插到 argv 最前面**（shim 里做）。
+   验收：`nm -D --undefined-only libdeepmd_lmp.so | grep _Z9MPI_` 为空。
+
+产物：`/tmp/kk_lrpt_build/libdeepmd_lmp.so`（`LAMMPS_PLUGIN_PATH=/tmp/kk_lrpt_plugin`，
+`dpplugin.so` 指向它）。输入用 `atom_style charge/kk` + `fix nve/kk` + `run_style verlet/kk`，
+启动 `lmp -k on g 1`。
+
+§11.2/§11.3 的表格由本目录的 `bench_kk_vs_host.py` 产出：
+
+```bash
+OUT=$PWD/matrix_kk python docs/bench_kk_vs_host.py 526848
+```
+
+它按 host/kk × rep/slab × np=1/2 跑同一批冻结产物，写 `kk_vs_host.csv`，
+每行带 `pe`、峰显存和 `fallback_warn` 标记。
+
+### 11.2 数值：与主机链逐位一致
+
+| 场景 | `pair deepmd`（主机） | `pair deepmd/kk`（device） |
+|---|---|---|
+| 1 536 原子、60 步（跨两次 neighbor 重建） | `pe = -239576.69` | `pe = -239576.69` |
+| 526 848 原子、6 步 `lr_bs4` | `pe = -82174044`，`T = 309.93727` | 同值，`T` 同值 |
+| 526 848 原子、6 步 `lr_mid4ik` | （被杀，未测完） | `pe = -82174044` |
+
+60 步那一行是关键：它跨过 `neigh_modify every 20` 的多次重建，末态能量仍逐位相同，
+说明 kk 路径在邻居表更新时重建图、没有复用陈旧拓扑。
+
+### 11.3 速度（526 848 原子，6 步，GPU 2/3 空闲）
+
+| 模型 | pair | mesh | np | 总时长 (s) | ms/step | 峰值显存 (MiB) |
+|---|---|---|---|---|---|---|
+| `lr_bs4` | `deepmd` | rep | 1 | 13.593 | **2265** | 13 768 |
+| `lr_bs4` | `deepmd/kk` | rep | 1 | 0.5976 | **99.6** | 11 980 |
+| `lr_mid4ik` | `deepmd/kk` | rep | 1 | 0.4714 | **78.6** | 9 808 |
+| `lr_bs4` | `deepmd/kk` | rep | 2 | 0.4668 | 77.8 | 10 768 |
+| `lr_bs4` | `deepmd/kk` | slab | 2 | 0.9442 | **157.4** | 9 738 |
+| `lr_mid4ik` | `deepmd/kk` | rep | 2 | 0.3361 | 56.0 | 6 804 |
+| `lr_mid4ik` | `deepmd/kk` | slab | 2 | 0.3339 | 55.7 | 6 804 |
+
+- **同一算例 kk 比主机快 23×**（13.593 → 0.5976 s），差异全在 `Pair` 段（99% 时间都在那里）：
+  主机版每步把 526 k 个原子的坐标/力在 host↔device 间搬一遍并在 CPU 上重建边图，
+  kk 版把坐标、电荷、力都留在 Kokkos 数组里。
+- 1 536 原子 60 步：`0.484 s` → `0.0292 s`（**16.6×**），方向一致。
+- **分布式在这条链上是 2× 的负担**：`slab np=2` 157.4 ms/step vs `rep np=2` 77.8 ms/step，
+  换来 10 768 → 9 738 MiB（−9.6%）显存。主机链里那块 ~80 ms/step 的 z 转置 + all-to-all
+  原本被 2.2 s 的 pair 淹没，kk 把 pair 压到 78 ms 之后就暴露出来了。
+- `lr_mid4ik` + slab 走 §10 的回落：时长与显存和 `rep` **逐位相同**（333.9 vs 336.1 ms 是同一
+  路径的重复测量），警告打在 stderr（`[W…] SOG_MIDTOWN_SLAB is set but force_mode != 0 (ik)`），
+  不进 LAMMPS log——所以 `warn` 列看起来是 False 不代表没回落。
+
+### 11.4 对 §7 结论的影响
+
+结论不变、且更强：**论文的多 GPU 数据用 replicated**。
+原因从"ik 只有 replicated 实现 + 收益小"变成"分布式在设备链上直接慢一倍"。
+同时，论文 §6.5 的绝对时间目前是用主机版 `pair deepmd` 量的，
+若投稿口径应按文档主线（`deepmd/kk`）重测，量级会小一个数量级（526 848 原子 99.6 ms/step）。
 
 ---
 

@@ -94,6 +94,10 @@ class PairDeepMDKokkos : public PairDeepMD, public KokkosBase {
   Kokkos::View<int*, DeviceType>
       d_model_type;  // (nnode_model) edge-input type per model node
   bool multi_rank;   // domain-decomposed run -> extended (local+ghost) node set
+  // The descriptor is message passing, so a decomposed frame refreshes its
+  // halo node features across ranks inside the forward pass; a local
+  // descriptor never exchanges anything.
+  bool message_passing;
   Kokkos::View<double*, DeviceType>
       d_coord_model;  // (3 * nnode_model), model-unit positions of nodes
 

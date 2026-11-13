@@ -61,13 +61,19 @@ CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
 CHARGE_NET_NEURON = [64, 64]
 """Default hidden widths of the charge network."""
 
-RCUT_TO_SIGMA = 1.9892536839080267
-"""The SOG library's receptive field to width ratio, ``sigma = r_c / this``."""
+RCUT_TO_SIGMA = 10.0 / 3.633717409009413
+"""The SOG library's receptive field to width ratio, ``sigma = r_c / this``.
 
-SOG_DEFAULT_B = 2.0
-"""The SOG library's default width ratio."""
+``1 / this = 0.3633717409009413`` is the canonical scale of the
+sum-of-Gaussians decomposition of ``1/r``, so a single-hop descriptor with
+``rcut = 6`` Å starts at ``sigma = 2.180230445405648`` Å, the width the
+:class:`~deepmd.dpmodel.long_range.kernel.SOGKernel` ladder uses by default.
+"""
 
-SOG_DEFAULT_M = 12
+SOG_DEFAULT_B = 1.62976708826776469
+"""The SOG library's default width ratio, the canonical SOG ``b``."""
+
+SOG_DEFAULT_M = 7
 """The SOG library's default number of Gaussian bands."""
 
 
@@ -78,11 +84,11 @@ def sog_default_ladder(
 ) -> tuple[list[float], list[float]]:
     r"""Default SOG widths and amplitudes from the descriptor's receptive field.
 
-    The SOG library rule is :math:`\sigma = r_c / 1.9892536839080267` with
-    :math:`r_c = n_{layers} \, r_{cut}`.  The geometric initial embedding
-    already reaches ``rcut`` before the first message-passing block, so a
-    descriptor with ``B`` blocks sees ``(B + 1) * rcut``; a message-passing-free
-    descriptor such as DPA4C sees one hop.
+    The SOG library rule is ``sigma = n_layers * rcut / RCUT_TO_SIGMA``, the
+    canonical sum-of-Gaussians decomposition of ``1/r``.  The geometric initial
+    embedding already reaches ``rcut`` before the first message-passing block,
+    so a descriptor with ``B`` blocks sees ``(B + 1) * rcut``; a
+    message-passing-free descriptor such as DPA4C sees one hop.
 
     Parameters
     ----------
