@@ -98,6 +98,9 @@ SR 98k 7.96 ms / 1402 MiB；331k 26.18 ms / 2044 MiB。LR 只占 12–16%。
 
 ## 5. 运行方式
 
+编译、冻结、LAMMPS MD 的完整步骤见 [`doc/SOG_BUILD_FREEZE_MD.md`](SOG_BUILD_FREEZE_MD.md)。
+
+
 ```bash
 # 构建
 make -C build-lmp-mpi-212 deepmd_op_pt -j 20
