@@ -3655,7 +3655,8 @@ def interaction_kernel_sog() -> list[Argument]:
     doc_base_width = (
         "The width of the first default Gaussian, in Å. Unset leaves the ladder "
         "to the config layer, which applies the SOG library rule "
-        "sigma = n_layers * rcut * 0.3633717409009413 for a bare `sog` kernel; "
+        "sigma = rcut * 0.3633717409009413 for a bare `sog` kernel, at the "
+        "descriptor's single-hop cutoff whatever its depth; "
         "set it to use an explicit ladder instead."
     )
     doc_width_ratio = (

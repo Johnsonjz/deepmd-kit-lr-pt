@@ -1508,6 +1508,9 @@ struct FittingNetwork {
   const torch::Tensor& b_head;
   const torch::Tensor& bias_atom_e;
   int64_t act;
+  // Optional charge response folded into the input cotangent: d_x += J * v.
+  const float* add_jacobian = nullptr;
+  const float* add_v = nullptr;
 };
 
 // The fitting routes of the runs of ``run`` nodes into which a fused operator
@@ -1578,8 +1581,11 @@ class FittingRuns {
                             long width,
                             const long* node_type,
                             const double* seed,
-                            double* output) const {
-    forward(stream, begin, count, x, d_x, width, node_type, seed, output);
+                            double* output,
+                            const float* add_jacobian = nullptr,
+                            const float* add_v = nullptr) const {
+    forward(stream, begin, count, x, d_x, width, node_type, seed, output,
+            add_jacobian, add_v);
     backward(stream, begin, count, seed, d_x);
   }
 
@@ -1595,7 +1601,9 @@ class FittingRuns {
                long width,
                const long* node_type,
                const double* seed,
-               double* output) const {
+               double* output,
+               const float* add_jacobian = nullptr,
+               const float* add_v = nullptr) const {
     const FittingNetwork& fitting = fitting_;
     const int64_t route = route_of(count);
     if (route != kFittingPerLayer) {
@@ -1603,7 +1611,7 @@ class FittingRuns {
           stream, fitting.plan, x, width, node_type, fitting.ws, fitting.bs,
           fitting.resnets, fitting.w_head, fitting.b_head, fitting.bias_atom_e,
           fitting.act, transposed_.data_ptr<float>(), seed, count, saved(begin),
-          output, d_x, route);
+          output, d_x, route, add_jacobian, add_v);
       return;
     }
     fitting_forward_range(stream, fitting.plan, x, width, node_type, fitting.ws,
@@ -2290,14 +2298,26 @@ dpa4c_canonical_compress_long_range_energy_force(
                                 std::move(charge_fitting_routes), f32, true);
   const auto unit_seed = torch::ones({run}, f64);
   auto raw_charge = torch::empty({node_count}, f64);
-  auto charge_jacobian = torch::empty({node_count, width}, f32);
+  const char* vjp_env = std::getenv("SOG_CANON_VJP");
+  const bool canon_vjp = vjp_env != nullptr && std::atoi(vjp_env) != 0;
+  torch::Tensor charge_jacobian;
+  torch::Tensor charge_cot;
+  if (canon_vjp) {
+    // Tile-sized VJP scratch: the charge net is rerun per tile after the solve
+    // with v as the cotangent, so no N x width Jacobian is ever materialized.
+    charge_cot = torch::empty({run, width}, f32);
+  } else {
+    charge_jacobian = torch::empty({node_count, width}, f32);
+  }
   for (long begin = 0; begin < node_count; begin += run) {
     const long count = std::min(run, node_count - begin);
+    float* const dx = canon_vjp
+        ? nullptr
+        : charge_jacobian.data_ptr<float>() + begin * width;
     charge_runs.forward(
         stream, begin, count, descriptor.data_ptr<float>() + begin * width,
-        charge_jacobian.data_ptr<float>() + begin * width, width,
-        node_type.data_ptr<long>() + begin, unit_seed.data_ptr<double>(),
-        raw_charge.data_ptr<double>() + begin);
+        dx, width, node_type.data_ptr<long>() + begin,
+        unit_seed.data_ptr<double>(), raw_charge.data_ptr<double>() + begin);
   }
 
   // === Step 3. Long range of the charges ===
@@ -2321,20 +2341,53 @@ dpa4c_canonical_compress_long_range_energy_force(
                                w_head, b_head, bias_atom_e, act};
   const FittingRuns runs(stream, fitting, run, node_count,
                          std::move(fitting_routes), f32);
-  for (long begin = 0; begin < node_count; begin += run) {
-    const long count = std::min(run, node_count - begin);
-    float* const run_descriptor = descriptor.data_ptr<float>() + begin * width;
-    runs.output_and_cotangent(
-        stream, begin, count, run_descriptor, run_descriptor, width,
-        node_type.data_ptr<long>() + begin, seed.data_ptr<double>() + begin,
-        raw_energy.data_ptr<double>() + begin);
+  if (canon_vjp) {
+    // The descriptor is still the charge-network input here: per tile, form
+    // J^T v through the same fused charge kernel (v as cotangent), then let
+    // the energy fitting overwrite the descriptor with its own cotangent and
+    // add the response.  The only full-width buffer is the descriptor itself;
+    // the VJP scratch is one tile.
+    auto charge_grad_d = charge_gradient.to(torch::kFloat64).contiguous();
+    auto q_tile = torch::empty({run}, f64);
+    for (long begin = 0; begin < node_count; begin += run) {
+      const long count = std::min(run, node_count - begin);
+      float* const run_descriptor = descriptor.data_ptr<float>() + begin * width;
+      charge_runs.output_and_cotangent(
+          stream, begin, count, run_descriptor, charge_cot.data_ptr<float>(),
+          width, node_type.data_ptr<long>() + begin,
+          charge_grad_d.data_ptr<double>() + begin,
+          q_tile.data_ptr<double>());
+      runs.output_and_cotangent(
+          stream, begin, count, run_descriptor, run_descriptor, width,
+          node_type.data_ptr<long>() + begin, seed.data_ptr<double>() + begin,
+          raw_energy.data_ptr<double>() + begin);
+      descriptor.narrow(0, begin, count)
+          .add_(charge_cot.narrow(0, 0, count));
+    }
+  } else {
+    // The charge response is folded into the energy-fitting cotangent; the
+    // seed may be fp64 in the LR output, so keep a float view for the kernel.
+    auto charge_gradient_f = charge_gradient.to(torch::kFloat32).contiguous();
+    // A per-layer charge run forms its Jacobian rows in backward(); finish
+    // them before the energy fitting reads J for the folded response.
+    for (long begin = 0; begin < node_count; begin += run) {
+      const long count = std::min(run, node_count - begin);
+      charge_runs.backward(stream, begin, count, unit_seed.data_ptr<double>(),
+                           charge_jacobian.data_ptr<float>() + begin * width);
+    }
+    for (long begin = 0; begin < node_count; begin += run) {
+      const long count = std::min(run, node_count - begin);
+      float* const run_descriptor = descriptor.data_ptr<float>() + begin * width;
+      runs.output_and_cotangent(
+          stream, begin, count, run_descriptor, run_descriptor, width,
+          node_type.data_ptr<long>() + begin, seed.data_ptr<double>() + begin,
+          raw_energy.data_ptr<double>() + begin,
+          charge_jacobian.data_ptr<float>() + begin * width,
+          charge_gradient_f.data_ptr<float>() + begin);
+    }
+    // The energy fitting above already folded J * v into the descriptor
+    // cotangent; no separate addcmul pass.
   }
-  for (long begin = 0; begin < node_count; begin += run) {
-    const long count = std::min(run, node_count - begin);
-    charge_runs.backward(stream, begin, count, unit_seed.data_ptr<double>(),
-                         charge_jacobian.data_ptr<float>() + begin * width);
-  }
-  descriptor.addcmul_(charge_jacobian, charge_gradient);
 
   // === Step 5. Descriptor backward and force assembly ===
   arguments.descriptor_gradient = descriptor.data_ptr<float>();

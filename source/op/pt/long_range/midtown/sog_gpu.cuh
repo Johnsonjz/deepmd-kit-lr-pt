@@ -141,12 +141,24 @@ void sog_gpu_spread_brick_dev(SogGpuState *s, int nlocal, const double *x,
                               double lz, const double *q, double rho_scale,
                               int spline, int nx, int ny, int nz, int nxlo,
                               int nxhi, int nylo, int nyhi, int nzlo, int nzhi);
+void sog_gpu_spread_brick_dev_ptr(SogGpuState *s, int nlocal, const double *x,
+                                  const double *boxlo, double lx, double ly,
+                                  double lz, const double *q, double rho_scale,
+                                  int spline, int nx, int ny, int nz, int nxlo,
+                                  int nxhi, int nylo, int nyhi, int nzlo,
+                                  int nzhi);
 void sog_gpu_gather_brick_dev(SogGpuState *s, int nlocal, const double *x,
                               const double *boxlo, double lx, double ly,
                               double lz, const double *q, double qscale,
                               int spline, int nx, int ny, int nz, int nxlo,
                               int nxhi, int nylo, int nyhi, int nzlo, int nzhi,
                               double *force, double *vpot);
+void sog_gpu_gather_brick_dev_ptr(SogGpuState *s, int nlocal, const double *x,
+                                  const double *boxlo, double lx, double ly,
+                                  double lz, const double *q, double qscale,
+                                  int spline, int nx, int ny, int nz, int nxlo,
+                                  int nxhi, int nylo, int nyhi, int nzlo,
+                                  int nzhi, double *dforce, double *dvpot);
 void sog_gpu_brick_get(SogGpuState *s, double *host, size_t off, size_t n);
 void sog_gpu_brick_set(SogGpuState *s, const double *host, size_t off,
                        size_t n);

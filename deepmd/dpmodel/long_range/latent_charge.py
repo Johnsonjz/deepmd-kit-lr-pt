@@ -84,11 +84,16 @@ def sog_default_ladder(
 ) -> tuple[list[float], list[float]]:
     r"""Default SOG widths and amplitudes from the descriptor's receptive field.
 
-    The SOG library rule is ``sigma = n_layers * rcut / RCUT_TO_SIGMA``, the
-    canonical sum-of-Gaussians decomposition of ``1/r``.  The geometric initial
-    embedding already reaches ``rcut`` before the first message-passing block,
-    so a descriptor with ``B`` blocks sees ``(B + 1) * rcut``; a
-    message-passing-free descriptor such as DPA4C sees one hop.
+    The SOG library rule is ``sigma = rcut / RCUT_TO_SIGMA``, the canonical
+    sum-of-Gaussians decomposition of ``1/r`` at the descriptor's single-hop
+    cutoff.  Scaling the widest Gaussian with the descriptor's *receptive
+    field* instead makes it wider than a typical ionic cell, where a Gaussian
+    flat across the box carries no structure: the reciprocal sum then keeps
+    only the ``k = 0`` shell, which a neutral charge constraint removes, and
+    the long-range head contributes nothing.  The head therefore always starts
+    from one hop, whatever the descriptor depth; the message-passing layers
+    change how the descriptor *carries* information, not the length scale at
+    which the reciprocal term has to act.
 
     Parameters
     ----------
@@ -105,8 +110,7 @@ def sog_default_ladder(
         ``width`` and ``amplitude`` in the units of the upstream kernel,
         :math:`a_k = \sqrt{2/\pi}\ln b / \sigma_k`.
     """
-    n_layers = int(getattr(descriptor, "n_blocks", 0) or 0) + 1
-    sigma = n_layers * float(descriptor.get_rcut()) / RCUT_TO_SIGMA
+    sigma = float(descriptor.get_rcut()) / RCUT_TO_SIGMA
     widths = sigma * np.power(b, np.arange(n_gaussian, dtype=np.float64))
     amplitudes = np.sqrt(2.0 / np.pi) * np.log(b) / widths
     return widths.tolist(), amplitudes.tolist()
@@ -466,7 +470,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             kernel_config.get(key) is not None
             for key in ("width", "amplitude", "base_width", "width_ratio")
         ):
-            # The SOG library rule: sigma = nlayers * rcut / RCUT_TO_SIGMA.
+            # The SOG library rule: sigma = rcut / RCUT_TO_SIGMA (one hop).
             widths, amplitudes = sog_default_ladder(
                 descriptor,
                 n_gaussian=int(kernel_config.get("n_gaussian", SOG_DEFAULT_M)),
@@ -541,7 +545,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         accuracy = self.pme_accuracy
         if accuracy is None:
             accuracy = grid_rule.DEFAULT_ACCURACY
-        return grid_rule.spacing(
+        spacing = grid_rule.spacing(
             self.mesh_backend,
             self.effective_order(),
             sigma_min,
@@ -549,6 +553,15 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             accuracy,
             force_mode=self.force_mode,
         )
+        if self.mesh_backend == "bspline" and self.effective_order() >= 8:
+            # The measured law stops at order 4/6; its order-8 extrapolation
+            # leaves the B-spline assignment aliasing above the target (the
+            # PME model tests see ~2e-3 relative energy error at the default
+            # 1e-4).  A Nyquist-fraction cap keeps the high-order PME mesh
+            # inside the band where the assignment factor is accurate.  This
+            # is a PME-model policy; the general grid rule keeps its law.
+            spacing = min(spacing, PME_SPACING_FRACTION * math.pi / k_max)
+        return spacing
 
     def effective_order(self) -> int:
         """The spline order the mesh actually evaluates.

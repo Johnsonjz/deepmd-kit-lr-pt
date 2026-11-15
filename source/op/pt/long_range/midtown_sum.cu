@@ -800,6 +800,9 @@ ChargeSumOutputs midtown_sum_local(
   TORCH_CHECK(n_node_per_frame.size(0) == 1,
               "the distributed midtown backend takes one frame");
   const int64_t count = coord.size(0);
+  if (std::getenv("SOG_MIDTOWN_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[slab] count=%lld\n", static_cast<long long>(count));
+  }
 
   const bool coef_host = coefficient.device().is_cpu();
   torch::Tensor coef_h =
@@ -1442,20 +1445,26 @@ ChargeSumOutputs midtown_sum_slab(
 
   mark(8);  // forward halo
   if (TR()) fprintf(stderr, "[slab] ixyfft done\n");
-  std::vector<double> force(3 * (size_t)count), vpot((size_t)count);
-  sog_gpu_gather_brick_dev(local.state, static_cast<int>(count),
-                           c_f.data_ptr<double>(), boxlo, lx, ly, lz,
-                           q.data_ptr<double>(), prefactor, spline, nx, ny, nz,
-                           0, nx - 1, 0, ny - 1, zb_lo, zb_hi, force.data(),
-                           vpot.data());
-  if (ik) {
+  auto d_force = at::empty({3 * (int64_t)count}, coord.options());
+  auto d_vpot = at::empty({(int64_t)count}, coord.options());
+  if (!ik) {
+    // Device-resident AD path: x/q are the caller's CUDA tensors, and the
+    // gather writes force/vpot straight to device buffers.  No host round trip.
+    sog_gpu_gather_brick_dev_ptr(
+        local.state, static_cast<int>(count), c_f.data_ptr<double>(), boxlo,
+        lx, ly, lz, q.data_ptr<double>(), prefactor, spline, nx, ny, nz, 0,
+        nx - 1, 0, ny - 1, zb_lo, zb_hi,
+        d_force.data_ptr<double>(), d_vpot.data_ptr<double>());
+  } else {
+    std::vector<double> force(3 * (size_t)count), vpot((size_t)count);
+    sog_gpu_gather_brick_dev(local.state, static_cast<int>(count),
+                             c_f.data_ptr<double>(), boxlo, lx, ly, lz,
+                             q.data_ptr<double>(), prefactor, spline, nx, ny,
+                             nz, 0, nx - 1, 0, ny - 1, zb_lo, zb_hi,
+                             force.data(), vpot.data());
     float* gbrick = sog_gpu_grad_brick(local.state, (size_t)ZB * plane);
     TORCH_CHECK(gbrick != nullptr,
                 "midtown slab: gradient brick allocation failed");
-    // The potential gather above produced the per-atom potential (correct in
-    // both modes) and a provisional AD force.  Each component now overwrites
-    // its own force entry from the gradient brick, leaving the potential
-    // untouched; one device-to-host copy at the end returns the three.
     TORCH_CHECK(sog_gpu_slab_grad_izpack_dev(local.state, nx, ny, nz, ylo, YL,
                                              lx, ly, lz, np, /*axis=*/2) == 0,
                 "midtown slab: z gradient pack failed");
@@ -1487,6 +1496,10 @@ ChargeSumOutputs midtown_sum_slab(
     }
     sog_gpu_gather_brick_ik_finish(local.state, static_cast<int>(count),
                                    force.data(), vpot.data(), /*want_pot=*/0);
+    d_force.copy_(at::from_blob(force.data(), {3 * count}, at::kDouble)
+                      .to(coord.device()));
+    d_vpot.copy_(at::from_blob(vpot.data(), {count}, at::kDouble)
+                     .to(coord.device()));
   }
   mark(9);  // gather
   if (TR()) fprintf(stderr, "[slab] gather done\n");
@@ -1512,12 +1525,6 @@ ChargeSumOutputs midtown_sum_slab(
   double acc[20] = {0};
   sog_gpu_red_download(local.state, acc);
 
-  // double_options carries the CUDA device: from_blob on a host pointer needs
-  // plain CPU options or the tensor claims a device it does not live on.
-  auto d_vpot = at::from_blob(vpot.data(), {count}, at::kDouble)
-                    .to(coord.device()).clone();
-  auto d_force = at::from_blob(force.data(), {3 * count}, at::kDouble)
-                     .to(coord.device()).clone();
   auto red = at::from_blob(acc, {7}, at::kDouble).to(coord.device()).clone();
 
   auto atom_energy = torch::zeros({count, 1}, double_options);

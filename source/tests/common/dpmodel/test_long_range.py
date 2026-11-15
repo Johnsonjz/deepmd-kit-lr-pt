@@ -4,6 +4,7 @@
 import itertools
 import pathlib
 
+import math
 import numpy as np
 import pytest
 from scipy.integrate import (
@@ -989,16 +990,19 @@ def test_pme_mesh_follows_the_cells_of_the_batch() -> None:
     # it is exactly that law evaluated at the module's own parameters.
     from deepmd.dpmodel.long_range import grid_rule
 
-    assert spacing == pytest.approx(
-        grid_rule.spacing(
-            long_range.mesh_backend,
-            long_range.effective_order(),
-            long_range._sigma_min(),
-            long_range._k_max(),
-            grid_rule.DEFAULT_ACCURACY,
-            force_mode=long_range.force_mode,
-        )
+    expected = grid_rule.spacing(
+        long_range.mesh_backend,
+        long_range.effective_order(),
+        long_range._sigma_min(),
+        long_range._k_max(),
+        grid_rule.DEFAULT_ACCURACY,
+        force_mode=long_range.force_mode,
     )
+    if long_range.mesh_backend == "bspline" and long_range.effective_order() >= 8:
+        # The PME model applies a Nyquist-fraction cap to the order-8
+        # extrapolation of the measured law (see LatentChargeLongRange).
+        expected = min(expected, 0.75 * math.pi / long_range._k_max())
+    assert spacing == pytest.approx(expected)
     for topologies, box in ((small, _cells()[:1]), (large, 2.0 * _cells())):
         mesh = topologies["pme_mesh"]
         dims = tuple(m.shape[0] for m in (mesh.mode_1, mesh.mode_2, mesh.mode_3))
