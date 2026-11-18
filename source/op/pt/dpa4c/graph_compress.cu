@@ -2375,18 +2375,31 @@ dpa4c_canonical_compress_long_range_energy_force(
       charge_runs.backward(stream, begin, count, unit_seed.data_ptr<double>(),
                            charge_jacobian.data_ptr<float>() + begin * width);
     }
-    for (long begin = 0; begin < node_count; begin += run) {
-      const long count = std::min(run, node_count - begin);
-      float* const run_descriptor = descriptor.data_ptr<float>() + begin * width;
-      runs.output_and_cotangent(
-          stream, begin, count, run_descriptor, run_descriptor, width,
-          node_type.data_ptr<long>() + begin, seed.data_ptr<double>() + begin,
-          raw_energy.data_ptr<double>() + begin,
-          charge_jacobian.data_ptr<float>() + begin * width,
-          charge_gradient_f.data_ptr<float>() + begin);
+    if (std::getenv("SOG_CANON_FUSE_J") == nullptr ||
+        std::getenv("SOG_CANON_NO_B4") != nullptr) {
+      // Bit-reproducible compatibility path: the separate J add, with the
+      // accumulation order of the pre-B4 operator.
+      for (long begin = 0; begin < node_count; begin += run) {
+        const long count = std::min(run, node_count - begin);
+        float* const run_descriptor = descriptor.data_ptr<float>() + begin * width;
+        runs.output_and_cotangent(
+            stream, begin, count, run_descriptor, run_descriptor, width,
+            node_type.data_ptr<long>() + begin, seed.data_ptr<double>() + begin,
+            raw_energy.data_ptr<double>() + begin);
+      }
+      descriptor.addcmul_(charge_jacobian, charge_gradient);
+    } else {
+      for (long begin = 0; begin < node_count; begin += run) {
+        const long count = std::min(run, node_count - begin);
+        float* const run_descriptor = descriptor.data_ptr<float>() + begin * width;
+        runs.output_and_cotangent(
+            stream, begin, count, run_descriptor, run_descriptor, width,
+            node_type.data_ptr<long>() + begin, seed.data_ptr<double>() + begin,
+            raw_energy.data_ptr<double>() + begin,
+            charge_jacobian.data_ptr<float>() + begin * width,
+            charge_gradient_f.data_ptr<float>() + begin);
+      }
     }
-    // The energy fitting above already folded J * v into the descriptor
-    // cotangent; no separate addcmul pass.
   }
 
   // === Step 5. Descriptor backward and force assembly ===

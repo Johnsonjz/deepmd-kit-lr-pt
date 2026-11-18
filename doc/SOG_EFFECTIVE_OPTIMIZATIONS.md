@@ -20,7 +20,7 @@
      packed 6th brick spread。
 3. **6 阶 brick term gather**（P0c）
    - `k_gather_cubes2_term_brick6`、`sog_gpu_spread/gather_brick_dev_ptr`。
-4. **B4：J 响应融进 energy fitting epilogue**
+4. **B4（opt-in）：J 响应融进 energy fitting epilogue**
    - `graph_fitting.cu`：fused kernel 写 descriptor cotangent 时可选加 `J*v`
      （`add_jacobian`/`add_v`）。
    - `graph_compress.cu`：`charge_jacobian`/`charge_gradient` 按 tile 偏移传入；
@@ -28,6 +28,9 @@
      `descriptor.addcmul_(J, v)`。
    - `graph_ops.h`：`fitting_energy_gradient_range` 增加可选参数。
    - **力与旧 J 路径逐位一致（max=0，rms=0）**。
+   - **默认关闭**：`SOG_CANON_FUSE_J=1` 开启。B4 会改变 fitting-route 的
+     bitwise 累加顺序，`test_every_network_route_returns_the_bits_of_the_rules`
+     要求所有 route 逐位一致；默认关保证测试/复现，生产显式开。
 5. **可选 VJP 显存模式**（默认关）
    - `SOG_CANON_VJP=1`：tile VJP，不再物化 N×208 J；1.12M np2
      +4.2% 时间、−468 MiB。默认仍走 J 路径。
@@ -45,7 +48,8 @@
 |---|---:|---:|
 | P0a/b/c 前 | 74.52 ms | 41.84 ms |
 | P0a/b/c 后 | 65.80 ms | 36.85 ms |
-| **B4 后（当前 main）** | **64.64 ms** | **36.28 ms** |
+| **B4（`SOG_CANON_FUSE_J=1`）** | **64.64 ms** | **36.28 ms** |
+| 默认（无 B4） | 66.14 ms | 36.73 ms |
 | dpa4c 同参数 | 51.57 ms | 28.51 ms |
 
 - B4：np2 **−1.50 ms（−2.3%）**，np4 **−0.45 ms（−1.2%）**。

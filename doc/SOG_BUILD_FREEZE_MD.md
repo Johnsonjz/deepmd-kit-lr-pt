@@ -220,6 +220,8 @@ $MPI --oversubscribe -np 4 \
 - **replicated**：不设 `SOG_MIDTOWN_SLAB`（或显式 `=0`）。只建议 1 卡/小体系；
   4 卡 replicated 比 slab 慢约 25%（1.12M 实测 48.72 vs 36.28 ms）。
 - `SOG_SLAB_TIME=1` 可选，打印长程分项时间。
+- `SOG_CANON_FUSE_J=1` 可选，开启 B4（J 融合进 energy fitting，1.12M np2
+  约 −1.5 ms）；默认关，因为 B4 改变 fitting-route 的逐位累加顺序。
 - `SOG_CANON_VJP=1` 可选，走 VJP 显存模式（时间 +4.2%，显存 −468 MiB）；
   生产默认不用。
 
