@@ -478,10 +478,16 @@ def descrpt_dpa4c_args() -> list[Argument]:
     return [
         Argument(
             "rcut",
-            float,
+            [float, list[float]],
             optional=True,
             default=6.0,
-            doc="The outer cutoff radius.",
+            doc=(
+                "The cutoff radius shared by every message-passing block, or "
+                "a list of one non-increasing cutoff per block whose length "
+                "equals `n_blocks`. The first cutoff is the cutoff of the "
+                "neighbor graph and of the radial representation; the cutoff "
+                "of every further block bounds the edges its messages act on."
+            ),
         ),
         Argument(
             "channels",
@@ -538,6 +544,22 @@ def descrpt_dpa4c_args() -> list[Argument]:
                 "each pair with a rescaled copy of one shared radial "
                 "function; larger values let each pair select its own radial "
                 "shape."
+            ),
+        ),
+        Argument(
+            "n_blocks",
+            int,
+            optional=True,
+            default=1,
+            doc=(
+                "Number of message-passing blocks. One block is the one-hop "
+                "descriptor. Every further block reads the features of the "
+                "edge sources in the previous block, widens the receptive "
+                "field by one cutoff and exchanges one node feature across "
+                "ranks. A model with several blocks extrapolates poorly in "
+                "pair contacts closer than about 0.45 of the covalent bond "
+                "length and should enable `bridging_method` wherever such "
+                "contacts can occur."
             ),
         ),
         Argument(
@@ -4424,7 +4446,10 @@ def sezm_model_args() -> Argument:
         "symbolic make_fx and torch.compile in the DPA4/SeZM model. "
         "This path may still expose PyTorch compiler bugs, but can improve "
         "training speed by roughly 2-3x on supported workloads. "
-        "Requires torch==2.11. NVIDIA GPUs require CUDA >= 12.6. "
+        "Requires a PyTorch release listed in "
+        ":data:`deepmd.pt.utils.compile_compat.SUPPORTED_COMPILE_TORCH` "
+        "(currently 2.11.x, 2.12.x, and 2.13.x). "
+        "NVIDIA GPUs require CUDA >= 12.6. "
         "Apple Silicon Macs are also supported. Tested with Python 3.13."
     )
     doc_enable_tf32 = (

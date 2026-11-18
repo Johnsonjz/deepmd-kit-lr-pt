@@ -29,6 +29,7 @@ class TempFile;
 class ChargeStateFold;
 class GraphReplay;
 class PinnedCell;
+struct HaloTensors;
 }  // namespace deepmd::ptexpt
 
 namespace torch::inductor {
@@ -393,14 +394,12 @@ class DeepPotPTExpt : public DeepPotBackend {
                                    const std::int64_t* d_source_order,
                                    const double* d_coord,
                                    void* world,
+                                   const DP_HaloExchange* halo,
                                    const double* box,
                                    const std::int64_t nloc,
                                    const std::int64_t nall_nodes,
                                    const std::int64_t edge_storage,
-                                   void* stream,
-                                   const InputNlist* comm_nlist = nullptr,
-                                   const std::vector<int>* node_map = nullptr)
-      override;
+                                   void* stream) override;
   /**
    * @brief FP32 edge-vector overload for compressed graph artifacts.
    *
@@ -430,8 +429,8 @@ class DeepPotPTExpt : public DeepPotBackend {
   bool uses_fp32_edge_vectors() const override;
   bool uses_canonical_graph_inference() const override;
   bool canonical_graph_requires_source_csr() const override;
+  bool canonical_graph_requires_halo() const override;
   bool has_long_range() const override;
-  bool has_message_passing() const override;
 
  private:
   template <typename EDGE_TYPE>
@@ -462,13 +461,12 @@ class DeepPotPTExpt : public DeepPotBackend {
       const std::int64_t* d_source_order,
       const double* d_coord,
       void* world,
+      const DP_HaloExchange* halo,
       const double* box,
       const std::int64_t nloc,
       const std::int64_t nall_nodes,
       const std::int64_t edge_storage,
-      void* stream,
-      const InputNlist* comm_nlist,
-      const std::vector<int>* node_map);
+      void* stream);
   bool inited;
   // Every width below is a property of the loaded archive.  They read as zero
   // until ``init`` has run, so that a query on an uninitialised backend
@@ -706,11 +704,15 @@ class DeepPotPTExpt : public DeepPotBackend {
    * model with a long-range module and ignored otherwise.
    * @param[in] world The MPI communicator (a pointer to an ``MPI_Comm``) of the
    * ranks a decomposed system spans, or NULL for a system that one rank holds
-   * whole; a model with a long-range module receives it after the positions.
+   * whole; a model with a long-range module receives it after the positions,
+   * and a model with further message-passing blocks before its halo exchange.
    * @param[in] cell The cell, a float64 CPU tensor of shape ``(1, 9)``: the
    * row-major cell of a periodic frame, or zero for a non-periodic one; a
    * model with a long-range module receives it after the communicator, and
    * every other model ignores it.
+   * @param[in] halo The halo exchange of the node set, which a model with
+   * further message-passing blocks receives after the communicator and every
+   * other model ignores.
    */
   std::vector<torch::Tensor> run_model_canonical_graph(
       const torch::Tensor& atype,
@@ -723,38 +725,9 @@ class DeepPotPTExpt : public DeepPotBackend {
       const torch::Tensor& source_order,
       const torch::Tensor& coord,
       const void* world,
-      const torch::Tensor& cell);
-
-  /**
-   * @brief Run the compact canonical with-comm artifact of this model.
-   *
-   * The eight comm tensors follow the compact ABI — and, for a model with a
-   * long-range module, follow the positions and the cells that sit between
-   * them — so the descriptor's blocks exchange ghost features across the
-   * ranks of the payload's communicator. That communicator serves the
-   * long-range module too, so the compact with-comm ABI carries one MPI
-   * handle rather than two.
-   *
-   * @param[in] atype, n_node, n_local, source, edge_vec, destination_row_ptr,
-   * source_row_ptr, source_order The compact graph tensors.
-   * @param[in] coord Node positions, empty without a long-range module.
-   * @param[in] cell The cell of the frame, empty without a long-range module.
-   * @param[in] comm_tensors The eight comm tensors of the border exchange.
-   * @return The outputs of the with-comm artifact, under their public keys.
-   */
-  std::vector<torch::Tensor> run_model_canonical_graph_with_comm(
-      const torch::Tensor& atype,
-      const torch::Tensor& n_node,
-      const torch::Tensor& n_local,
-      const torch::Tensor& source,
-      const torch::Tensor& edge_vec,
-      const torch::Tensor& destination_row_ptr,
-      const torch::Tensor& source_row_ptr,
-      const torch::Tensor& source_order,
-      const torch::Tensor& coord,
-      const void* world,
       const torch::Tensor& cell,
-      const std::vector<at::Tensor>& comm_tensors);
+      const ptexpt::HaloTensors& halo);
+
 
   /**
    * @brief Evaluate the long-range module on a rank that holds no node.

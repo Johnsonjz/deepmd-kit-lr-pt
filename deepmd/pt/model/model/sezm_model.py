@@ -667,9 +667,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
     standard neighbor list and traces the local graph with ``make_fx`` for
     higher-order force training. Evaluation/inference compile usage is
     controlled by the `DP_COMPILE_INFER` environment variable read at model
-    initialization time. This path is experimental, requires ``torch==2.11``,
-    may still expose PyTorch compiler bugs, and can improve training speed by
-    roughly 2-3x on supported workloads.
+    initialization time. This path is experimental and requires a PyTorch
+    release listed in :data:`deepmd.pt.utils.compile_compat.SUPPORTED_COMPILE_TORCH`
+    and CUDA >= 12.6 on NVIDIA GPUs. It may still expose PyTorch compiler bugs
+    and can improve training speed by roughly 2-3x on supported workloads.
     """
 
     model_type = "SeZM"
@@ -2672,11 +2673,13 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             def _inductor_inference_compiler(
                 fx_gm: torch.fx.GraphModule, fx_inputs: list[Any]
             ) -> Any:
+                # This callback lowers the forward-only AOTAutograd inference
+                # graph (the eval branch below owns it; training compiles
+                # through the separate torch.compile branch above).
                 # ``compile_options`` already includes ``triton.max_tiles=1``
-                # from ``build_inductor_compile_options``, so the 1D launch-grid
-                # constraint applies to both the training and evaluation graphs.
+                # from ``build_inductor_compile_options``.
                 with _ind_cfg.patch(compile_options):
-                    return compile_fx_inner(fx_gm, fx_inputs)
+                    return compile_fx_inner(fx_gm, fx_inputs, is_inference=True)
 
             # select_decomp_table keeps the decomposition set aligned with
             # Inductor's fallback set (a mismatch raises an aten._to_copy

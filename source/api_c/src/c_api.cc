@@ -1832,15 +1832,42 @@ void DP_DPA4ComputeCanonicalGraphGPU(DP_DeepPot* dp,
                                      const double* d_coord,
                                      void* world,
                                      const double* box,
-                                     const int64_t nloc,
-                                     const int64_t nall_nodes,
-                                     const int64_t edge_storage,
+                                     int64_t nloc,
+                                     int64_t nall_nodes,
+                                     int64_t edge_storage,
                                      void* stream) {
+  DP_DPA4ComputeCanonicalGraphGPU2(
+      dp, d_atom_energy, d_force, d_virial, d_atom_virial, d_atype, d_source,
+      index_width, d_edge_vec, d_destination_row_ptr, d_source_row_ptr,
+      d_source_order, d_coord, world, nullptr, box, nloc, nall_nodes,
+      edge_storage, stream);
+}
+
+void DP_DPA4ComputeCanonicalGraphGPU2(DP_DeepPot* dp,
+                                      double* d_atom_energy,
+                                      double* d_force,
+                                      double* d_virial,
+                                      double* d_atom_virial,
+                                      const int64_t* d_atype,
+                                      const void* d_source,
+                                      DP_CanonicalIndexWidth index_width,
+                                      const float* d_edge_vec,
+                                      const int64_t* d_destination_row_ptr,
+                                      const int64_t* d_source_row_ptr,
+                                      const int64_t* d_source_order,
+                                      const double* d_coord,
+                                      void* world,
+                                      const DP_HaloExchange* halo,
+                                      const double* box,
+                                      const int64_t nloc,
+                                      const int64_t nall_nodes,
+                                      const int64_t edge_storage,
+                                      void* stream) {
   DP_REQUIRES_OK(
       dp, dp->dp.compute_canonical_graph_gpu(
               d_atom_energy, d_force, d_virial, d_atom_virial, d_atype,
               d_source, index_width, d_edge_vec, d_destination_row_ptr,
-              d_source_row_ptr, d_source_order, d_coord, world, box, nloc,
+              d_source_row_ptr, d_source_order, d_coord, world, halo, box, nloc,
               nall_nodes, edge_storage, stream));
 }
 
@@ -1880,6 +1907,15 @@ bool DP_DeepPotCanonicalGraphRequiresSourceCSR(DP_DeepPot* dp) {
   }
 }
 
+bool DP_DeepPotCanonicalGraphRequiresHalo(DP_DeepPot* dp) {
+  try {
+    return dp->dp.canonical_graph_requires_halo();
+  } catch (deepmd::deepmd_exception& ex) {
+    dp->exception = std::string(ex.what());
+    return false;
+  }
+}
+
 bool DP_DeepPotHasLongRange(DP_DeepPot* dp) {
   try {
     return dp->dp.has_long_range();
@@ -1889,14 +1925,6 @@ bool DP_DeepPotHasLongRange(DP_DeepPot* dp) {
   }
 }
 
-bool DP_DeepPotHasMessagePassing(DP_DeepPot* dp) {
-  try {
-    return dp->dp.has_message_passing();
-  } catch (deepmd::deepmd_exception& ex) {
-    dp->exception = std::string(ex.what());
-    return false;
-  }
-}
 
 // multiple frames
 void DP_DeepPotCompute2(DP_DeepPot* dp,
@@ -2254,21 +2282,57 @@ void DP_DPA4SpinComputeCanonicalGraphGPU(DP_DeepSpin* dp,
                                          const int64_t* d_source_row_ptr,
                                          const int64_t* d_source_order,
                                          const float* d_spin,
-                                         const int64_t nloc,
-                                         const int64_t nall_nodes,
-                                         const int64_t edge_storage,
+                                         int64_t nloc,
+                                         int64_t nall_nodes,
+                                         int64_t edge_storage,
                                          void* stream) {
+  DP_DPA4SpinComputeCanonicalGraphGPU2(
+      dp, d_atom_energy, d_force, d_force_mag, d_virial, d_atom_virial, d_atype,
+      d_source, index_width, d_edge_vec, d_destination_row_ptr,
+      d_source_row_ptr, d_source_order, d_spin, nullptr, nullptr, nloc,
+      nall_nodes, edge_storage, stream);
+}
+
+void DP_DPA4SpinComputeCanonicalGraphGPU2(DP_DeepSpin* dp,
+                                          double* d_atom_energy,
+                                          double* d_force,
+                                          double* d_force_mag,
+                                          double* d_virial,
+                                          double* d_atom_virial,
+                                          const int64_t* d_atype,
+                                          const void* d_source,
+                                          DP_CanonicalIndexWidth index_width,
+                                          const float* d_edge_vec,
+                                          const int64_t* d_destination_row_ptr,
+                                          const int64_t* d_source_row_ptr,
+                                          const int64_t* d_source_order,
+                                          const float* d_spin,
+                                          void* world,
+                                          const DP_HaloExchange* halo,
+                                          const int64_t nloc,
+                                          const int64_t nall_nodes,
+                                          const int64_t edge_storage,
+                                          void* stream) {
   DP_REQUIRES_OK(
       dp, dp->dp.compute_canonical_graph_gpu(
               d_atom_energy, d_force, d_force_mag, d_virial, d_atom_virial,
               d_atype, d_source, index_width, d_edge_vec, d_destination_row_ptr,
-              d_source_row_ptr, d_source_order, d_spin, nloc, nall_nodes,
-              edge_storage, stream));
+              d_source_row_ptr, d_source_order, d_spin, world, halo, nloc,
+              nall_nodes, edge_storage, stream));
 }
 
 bool DP_DeepSpinUsesCanonicalGraphInference(DP_DeepSpin* dp) {
   try {
     return dp->dp.uses_canonical_graph_inference();
+  } catch (deepmd::deepmd_exception& ex) {
+    dp->exception = std::string(ex.what());
+    return false;
+  }
+}
+
+bool DP_DeepSpinCanonicalGraphRequiresHalo(DP_DeepSpin* dp) {
+  try {
+    return dp->dp.canonical_graph_requires_halo();
   } catch (deepmd::deepmd_exception& ex) {
     dp->exception = std::string(ex.what());
     return false;

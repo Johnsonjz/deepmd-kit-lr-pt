@@ -94,10 +94,6 @@ class PairDeepMDKokkos : public PairDeepMD, public KokkosBase {
   Kokkos::View<int*, DeviceType>
       d_model_type;  // (nnode_model) edge-input type per model node
   bool multi_rank;   // domain-decomposed run -> extended (local+ghost) node set
-  // The descriptor is message passing, so a decomposed frame refreshes its
-  // halo node features across ranks inside the forward pass; a local
-  // descriptor never exchanges anything.
-  bool message_passing;
   Kokkos::View<double*, DeviceType>
       d_coord_model;  // (3 * nnode_model), model-unit positions of nodes
 
@@ -137,11 +133,16 @@ class PairDeepMDKokkos : public PairDeepMD, public KokkosBase {
   // The canonical artifact reads the source CSR on every call, not only for
   // the per-atom virial.
   bool canonical_source_csr;
+  // The canonical artifact reads features of the ghost nodes of an extended
+  // node set from their owners through its halo exchange.
+  bool canonical_halo;
   bool device_path_ok;     // resolved once in init_style
   bool reverse_virial;     // reverse communication operates on centroid virial
   bool reverse_used_host;  // the host pack/unpack overrides ran
   // Device-packed fold that replaces the host reverse communication.
   CompactCanonicalGhostFold<DeviceType, DeepMDKokkosCommBuffer> ghost_fold;
+  // Halo exchange of the extended node set for ``canonical_halo``.
+  CompactCanonicalHalo<DeviceType> halo_exchange;
 };
 
 }  // namespace LAMMPS_NS
