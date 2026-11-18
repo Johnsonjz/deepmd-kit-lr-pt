@@ -1,8 +1,9 @@
 # 与上游 `deepmd-kit` 同步：合并冲突地图
 
-> 状态：2026-11-13。`main` 相对 `upstream/master` 是 **42 ahead / 10 behind**，
+> 状态：2026-11-18。`main` 相对 `upstream/master` 是 **49 ahead / 14 behind**，
 > merge base 为 `0edeaef56`。直接 `git merge upstream/master` 会在 8 个文件、
-> 16 个 hunk 上冲突。本文记录冲突位置、根因和建议的解法，供真正做同步时对照。
+> 16 个 hunk 上冲突。本文记录冲突位置、根因和建议的解法；多卡策略的逐项对比
+> 见 [UPSTREAM_MULTIRANK_COMPARE.md](UPSTREAM_MULTIRANK_COMPARE.md)。
 
 ## 1. 复现
 

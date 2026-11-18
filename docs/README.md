@@ -10,6 +10,7 @@
 |---|---|
 | [PR_SUBMISSION.md](PR_SUBMISSION.md) | PR 的拆分（A/B/C/D）、编译与测试命令、可直接粘贴的英文正文 |
 | [UPSTREAM_SYNC.md](UPSTREAM_SYNC.md) | 与上游同步的合并冲突地图（8 个文件、16 个 hunk）与建议解法 |
+| [UPSTREAM_MULTIRANK_COMPARE.md](UPSTREAM_MULTIRANK_COMPARE.md) | 上游 #6127 的 canonical halo 多卡 vs 本分支的 slab/comm_dict，以及 PR 拆分 |
 | [LONG_RANGE_PORT.md](LONG_RANGE_PORT.md) | 上游 `long_range` → pt backend 的接口映射与有意偏差 |
 | [BUILD_AND_TEST.md](BUILD_AND_TEST.md) | 两棵树、两条链的全套编译、安装布局与测试流程 |
 
