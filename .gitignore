@@ -74,8 +74,3 @@ frozen_model.*
 # Test system directories
 system/
 *.expected
-
-# Local development build trees (MPI / gcc variants) and vendored LAMMPS source
-/build-*/
-/lammps_src/
-/log.lammps
