@@ -52,6 +52,15 @@
 |---|---|
 | [PAIR_DEEPMD_KK_SOG.md](PAIR_DEEPMD_KK_SOG.md) | `pair_style deepmd/kk` 如何驱动 SOG 长程模型（关键字、环境、失败模式） |
 
+## 运行手册与报告
+
+| 文档 | 内容 |
+|---|---|
+| [SOG_BUILD_FREEZE_MD.md](SOG_BUILD_FREEZE_MD.md) | 编译、冻结与 LAMMPS MD 运行手册（CubeS₂-6 + slab + compressed canonical） |
+| [SOG_EFFECTIVE_OPTIMIZATIONS.md](SOG_EFFECTIVE_OPTIMIZATIONS.md) | 已合并到 main 的有效优化与实测收益 |
+| [QUADS_STENCIL.md](QUADS_STENCIL.md) | QuadS axis-stencil brick 实现、正确性与结论 |
+| [TEST_REPORT_20261118.md](TEST_REPORT_20261118.md) | B4/QuadS 补充测试报告 |
+
 ## 复现与脚本
 
 - [MESH_ENGINE_TEST_REPRO.md](MESH_ENGINE_TEST_REPRO.md)：网格引擎的编译、冻结工件
