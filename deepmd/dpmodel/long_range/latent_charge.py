@@ -499,6 +499,18 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             ),
             **charge_net_config,
         )
+        # The network predicts the deviation from the per-type bias, so its
+        # output layer starts at zero and the initial charge equals
+        # ``bias_atom_q`` exactly.  A random output layer lets the first
+        # forward swamp the bias (measured as |q| = 0.34 e and a +10 eV/atom
+        # long-range constant on one dataset), which defeats the purpose of
+        # initialising the bias to physical charges.  The output layer is never
+        # square, so ``resnet_dt`` adds no residual there and the zero holds.
+        for ii in range(1 if charge_net.mixed_types else charge_net.ntypes):
+            out_layer = charge_net.nets[ii].layers[-1]
+            out_layer.w[...] = 0.0
+            if out_layer.b is not None:
+                out_layer.b[...] = 0.0
         return cls(
             charge_net,
             kernel_cls(**kernel_config),
