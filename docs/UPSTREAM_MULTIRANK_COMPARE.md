@@ -15,7 +15,7 @@
 | | 值 |
 |---|---|
 | merge base | `0edeaef56`（2026-11-06） |
-| 我们的 `main` | `f3d4b77e4`（2026-11-18），**49 ahead / 14 behind** |
+| 我们的 `main` | `fadb995dd`（2026-11-18，含 B4/QuadS 测试报告），**50 ahead / 14 behind** |
 | 上游 tip | `511b5c836`（2026-11-18） |
 | 关键上游提交 | `7477c9aea` **#6127** DPA4C multi-block + compressed deployment |
 | 其他新提交 | #6138、#6136、#6129、#6056、#6052、#6046、#6041、#6030、#5980、#5956、#5834、#6051、#6040 |
@@ -150,7 +150,8 @@ python -m pytest source/tests/pt_expt/kernels/test_mesh_backend.py \
 - **SeZM compact canonical + with-comm**：与上游 #6127 的 `BorderPlan` 直接
   重复。生产不用它；先留在本地分支，等上游问起再单独提。
 - **`doc/SOG_BUILD_FREEZE_MD.md`、`doc/SOG_EFFECTIVE_OPTIMIZATIONS.md`、
-  `doc/QUADS_STENCIL.md`**：内部 runbook，不属于上游 `doc/` 的 toctree。
+  `doc/QUADS_STENCIL.md`、`doc/TEST_REPORT_20261118.md`**：内部 runbook/报告，
+  不属于上游 `doc/` 的 toctree。
   移到 `docs-notes`，PR 里只保留对 `doc/model/long-range.md` 的用户向补充。
 - **`kspace sog/kk` 旧链**：新 runbook 已用 compressed canonical 替代。
 
