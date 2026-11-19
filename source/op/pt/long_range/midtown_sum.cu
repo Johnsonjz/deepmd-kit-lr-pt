@@ -752,9 +752,14 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         charge_gradient.narrow(0, begin, count).data_ptr<float>(),
         atom_virial.narrow(0, begin, count).data_ptr<float>());
 
-    // The frame virial, from the same six sums, in one nine-thread kernel.
-    k_midtown_virial<<<1, 32,0,stream>>>(red, 0.5 * volume * prefactor,
-                                virial.data_ptr<float>() + 9 * f);
+    // The frame virial is the sum of the per-node shares of this call's
+    // owners: each node already carries mom + (W - sum_all)/N, so a rank
+    // returns its share and the ranks add up to W (ops.cc).
+    virial.narrow(0, f, 1)
+        .copy_(atom_virial.narrow(0, owner_begin, owner_count)
+                   .sum(0)
+                   .reshape({1, 9})
+                   .to(at::kFloat));
 
     tm.mark("finish");
     begin += count;
@@ -970,12 +975,9 @@ ChargeSumOutputs midtown_sum_local(
       c_f.data_ptr<double>(), red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
   atom_energy.copy_(energy_f.reshape({count, 1}));
-  static const int64_t kSym[9] = {0, 3, 4, 3, 1, 5, 4, 5, 2};
-  auto sym_index = at::from_blob(const_cast<int64_t*>(kSym), {9}, at::kLong)
-                       .clone()
-                       .to(coord.device());
-  auto w = vscale.index_select(0, sym_index).reshape({3, 3});
-  virial.copy_(w.reshape({1, 9}).to(at::kFloat));
+  // The frame virial is the sum of the per-node shares of this rank; the
+  // ranks add up to W (ops.cc).
+  virial.copy_(atom_virial.sum(0).reshape({1, 9}));
   return {atom_energy, charge_gradient, force, atom_virial, virial};
 }
 
@@ -1551,8 +1553,9 @@ ChargeSumOutputs midtown_sum_slab(
       count_d.data_ptr<double>(), d_force.data_ptr<double>(),
       c_f.data_ptr<double>(), red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
-  k_midtown_virial<<<1, 32>>>(red.data_ptr<double>(), 0.5 * volume * prefactor,
-                              virial.data_ptr<float>());
+  // The frame virial is the sum of the per-node shares of this rank; the
+  // ranks add up to W (ops.cc).
+  virial.copy_(atom_virial.sum(0).reshape({1, 9}));
   return {atom_energy, charge_gradient, force_out, atom_virial, virial};
 }
 
