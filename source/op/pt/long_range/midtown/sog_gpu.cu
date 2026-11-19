@@ -8,6 +8,8 @@
 // below must be confirmed by the run-0 bit-match once the GPU frees). See sog-progress.md §8.
 #include "sog_gpu.cuh"
 #include <algorithm>
+#include <array>
+#include <random>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -15,6 +17,7 @@
 #include "sog_spline.h"     // CubeS2 node tables + xi constants (single source of truth)
 #include <cufft.h>
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cstdio>
 #include <cmath>
 
@@ -46,6 +49,13 @@ struct SogGpuState {
   float *f_rho_r=nullptr, *f_pot_r=nullptr;
   unsigned long long *f_rho_fx=nullptr;  // fixed-point charge mesh (2^40)
   cufftComplex *f_spec=nullptr;
+  // ik-mode buffers: three gradient meshes and a half-spectrum scratch, reused
+  // across the three inverse transforms (allocated on demand by ensure_ik_grads).
+  float *f_gradx_r=nullptr, *f_grady_r=nullptr, *f_gradz_r=nullptr;
+  cufftComplex *f_grad_spec=nullptr;
+  // QuadS ik-mode buffers: the QuadS solve keeps a full complex spectrum, so
+  // the three Fourier gradients and their scratch spectrum are full grids.
+  cufftComplex *f_qgx=nullptr, *f_qgy=nullptr, *f_qgz=nullptr, *f_qgspec=nullptr;
   cufftHandle f_plan_r2c=0, f_plan_c2r=0;
   // One work area shared by the R2C and C2R plans (they never run at the same
   // time); cuFFT would otherwise keep one per plan, 4 B per grid point each.
@@ -56,7 +66,8 @@ struct SogGpuState {
   // (The bare K and K_v "self" tables are gone: the self term is closed-form,
   //  see self_coeff in sog_gpu_solve_dev, so no per-mode table is uploaded.)
   double *d_x=nullptr, *d_q=nullptr, *d_force=nullptr, *d_vpot=nullptr;  // per-atom
-  double *d_brick=nullptr;             // local owned+ghost scalar brick
+  float *d_brick=nullptr;              // local owned+ghost FLOAT potential brick
+  unsigned long long *s_brick_fx=nullptr;  // local owned+ghost fixed-point (2^40) density brick
   size_t cap_brick=0;
   double *d_boxlo=nullptr;           // 3 doubles, box origin (persistent device buffer)
   // Triclinic: A^{-1} of the cell (row-major, row d = fractional axis), the
@@ -77,20 +88,40 @@ struct SogGpuState {
   cudaEvent_t evt_gather_start=0, evt_gather_stop=0;
   double acc_spread=0, acc_fftfwd=0, acc_kspace=0, acc_fftinv=0, acc_gather=0;
   int timing_count=0, timing_interval=100;  // report every N steps
+  // The four-term AD gather is available when its host-side self-check passed.
+  int term_ok=0;
 
   // ── slab (distributed) mode ──
-  // In this mode the grid buffers are sized for ONE rank's slab (n_g/np) and
-  // the green tables hold only this rank's y-slice, instead of the full grid.
+  // Same precision contract as the replicated solve: a float32 mesh, a 64-bit
+  // fixed-point (2^40) density accumulation, a compact half spectrum (R2C) and
+  // a packed (green energy, green virial) float table.  The fp64 d_rho / d_pot
+  // grid set belongs to the LAMMPS replicated-grid entry points alone; the slab
+  // keeps its own s_* buffers so the two never alias across a mode switch.
   bool slab_mode=false;
   int slab_Y=0;                 // this rank's y length (pencil slab)
-  size_t slab_cap=0;            // complex elements in d_rho / d_pot
-  size_t slab_gn=0;             // doubles in each of d_ge / d_gf / d_gv
-  // scratch for uploading a received halo plane before adding it on the device
-  double *d_halo=nullptr;
-  size_t cap_halo=0;
-  // aligned real scratch for D2Z/Z2D when the brick offset is not 16-aligned
-  double *d_real=nullptr;
+  size_t slab_cap=0;            // complex elements in s_rho / s_pot
+  size_t slab_gn=0;             // float2 entries in s_gp
+  cufftComplex *s_rho=nullptr, *s_pot=nullptr;  // packed blocks / z pencil
+  // ik force mode keeps the green-multiplied potential spectrum (the z pencil,
+  // before its inverse transform) so the three Fourier gradients can each be
+  // built from it and pushed through the same transpose.  One extra pencil;
+  // the block buffers s_rho / s_pot are reused for every component in turn.
+  cufftComplex *s_pot2=nullptr;
+  // The one gradient brick of an ik solve: the three components are gathered
+  // one at a time, so a single extra brick serves all of them.
+  float *d_gbrick=nullptr;
+  size_t cap_gbrick=0;
+  float2 *s_gp=nullptr;         // (green energy, green virial), compact half spectrum
+  // scratch for uploading a received halo plane before it is folded in
+  void *d_halo=nullptr;
+  size_t cap_halo=0;            // capacity in 8-byte elements
+  // aligned FLOAT scratch for R2C/C2R when the brick offset is not 16-aligned
+  float *s_real=nullptr;
   size_t cap_real=0;
+
+  // Per-atom fractional coordinates of the replicated solve (k_midtown_frac).
+  void *d_frac=nullptr;
+  int cap_frac=0;
 
 };
 
@@ -175,6 +206,179 @@ __device__ __forceinline__ void quads6_wd(double t,double*w,double*dw){
   dw[4]=q_dc2_6(t,x2,x4); dw[5]=q_dc3_6(t,x2,x4);
 }
 
+// Sorted QuadS stencil table: the (2nu)^3 tensor-product nodes with their
+// grid offsets (dx,dy,dz) and their 1-D weight indices (a,b,c), ordered with x
+// fastest.  A warp reads consecutive entries, so the lanes of one round touch
+// adjacent mesh cells; this mirrors the CubeS2 c_nodes*s tables and removes the
+// per-node div/mod decode that dominated the naive gather.
+struct QNodeS { signed char dx,dy,dz,a,b,c,pad0,pad1; };  // 8 B, aligned
+__constant__ QNodeS c_qnodes4s[64];
+__constant__ QNodeS c_qnodes6s[216];
+
+// The 1-D weights are identical for every lane of a warp (all lanes share the
+// atom), so evaluate them once on lane 0 and broadcast.  For order 6 the
+// degree-5 polynomials cost far more than the shuffles; computing them in all
+// 32 lanes was the dominant per-node cost.
+// float weights: the mesh is float and the accumulate stays double; keeping
+// the 3x2xNORD arrays in float halves the register footprint, which is what
+// limits occupancy of the warp gather.
+template<int NORD>
+__device__ __forceinline__ void bcast_quads_w(double t,double*w,int lane){
+  double W[NORD]={0.0};
+  if(lane==0){ if(NORD==4) quads4_w(t,W); else quads6_w(t,W); }
+  #pragma unroll
+  for(int i=0;i<NORD;++i) w[i]=__shfl_sync(0xffffffffu,W[i],0);
+}
+template<int NORD>
+__device__ __forceinline__ void bcast_quads_wd(double t,double*w,double*dw,
+                                               int lane){
+  double W[NORD]={0.0},D[NORD]={0.0};
+  if(lane==0){ if(NORD==4) quads4_wd(t,W,D); else quads6_wd(t,W,D); }
+  #pragma unroll
+  for(int i=0;i<NORD;++i){
+    w[i] =__shfl_sync(0xffffffffu,W[i],0);
+    dw[i]=__shfl_sync(0xffffffffu,D[i],0);
+  }
+}
+
+// ── fp32 QuadS basis and its per-atom table ─────────────────────────────
+//
+// QuadS is separable: the 3-D weight is a product of three 1-D weights over the
+// offsets 1-nu..nu, so a per-atom table of those 1-D values and slopes replaces
+// every polynomial evaluation inside the spread and the gathers, exactly as
+// the CubeS2 kernels already do with Cs2Tab/Cs2Tab4 and as the B-spline engine
+// does with AxisStencil.  The literals carry an `f`: an unsuffixed double
+// promotes the whole polynomial to the fp64 pipe, which is 1/64 of the fp32 one
+// on the cards this runs on (the same defect measured at 1.0 vs 0.24 ms in the
+// CubeS2 gather comment above).
+
+template<int NORD>
+__device__ __forceinline__ float qf_base(float t, int i, bool deriv);
+
+template<>
+__device__ __forceinline__ float qf_base<4>(float t, int i, bool deriv){
+  // xi^2 = 1/3
+  constexpr float x2=1.f/3.f;
+  if(i==0){
+    return deriv ? (-1.5f*t*t + t - (3.f*x2-2.f)/2.f)
+                 : (-0.5f*t*t*t + 0.5f*t*t - (3.f*x2-2.f)/2.f*t + 0.5f*x2);
+  }
+  return deriv ? (0.5f*t*t + (3.f*x2-1.f)/6.f)
+               : ((1.f/6.f)*t*t*t + (3.f*x2-1.f)/6.f*t);
+}
+
+template<>
+__device__ __forceinline__ float qf_base<6>(float t, int i, bool deriv){
+  constexpr float xi=0.72879488f;
+  constexpr float x2=xi*xi, x4=x2*x2;
+  if(i==0){
+    const float t2=t*t,t3=t2*t,t4=t3*t,t5=t4*t;
+    return deriv ? ((5.f/12.f)*t4-(2.f/3.f)*t3+(10.f*x2-7.f)/4.f*t2
+                   -2.f*(3.f*x2-2.f)/3.f*t+(5.f*x4-7.f*x2+4.f)/4.f)
+                 : ((1.f/12.f)*t5-(1.f/6.f)*t4+(10.f*x2-7.f)/12.f*t3
+                    -(3.f*x2-2.f)/3.f*t2+(5.f*x4-7.f*x2+4.f)/4.f*t
+                    -(3.f*x4-4.f*x2)/6.f);
+  }
+  if(i==1){
+    const float t2=t*t,t3=t2*t,t4=t3*t,t5=t4*t;
+    return deriv ? (-(5.f/24.f)*t4+(1.f/6.f)*t3-(10.f*x2-7.f)/8.f*t2
+                   +(6.f*x2-1.f)/12.f*t-(5.f*x4-7.f*x2+2.f)/8.f)
+                 : (-(1.f/24.f)*t5+(1.f/24.f)*t4-(10.f*x2-7.f)/24.f*t3
+                    +(6.f*x2-1.f)/24.f*t2-(5.f*x4-7.f*x2+2.f)/8.f*t
+                    +(3.f*x4-x2)/24.f);
+  }
+  const float t2=t*t,t3=t2*t,t4=t3*t,t5=t4*t;
+  return deriv ? ((5.f/120.f)*t4+(2.f*x2-1.f)/8.f*t2
+                 +(15.f*x4-15.f*x2+4.f)/120.f)
+               : ((1.f/120.f)*t5+(2.f*x2-1.f)/24.f*t3
+                  +(15.f*x4-15.f*x2+4.f)/120.f*t);
+}
+
+// The k-th 1-D weight (k = 0..NORD-1, offset o = 1 - NORD/2 + k) and, when
+// asked, its slope.  The negative offsets reflect theta -> 1 - theta and use
+// the base polynomial b_{1-o}: c_o = b_{1-o}(1 - theta), which in zero-based
+// form is base index -o; the positive ones use c_o = b_o, zero-based o - 1.
+template<int NORD>
+__device__ __forceinline__ float quads_w1d(float t, int k, bool deriv){
+  const int o = 1 - NORD/2 + k;
+  const bool refl = (o <= 0);
+  const int i = refl ? (-o) : (o - 1);      // zero-based base polynomial
+  const float arg = refl ? (1.f - t) : t;
+  const float v = qf_base<NORD>(arg, i, deriv);
+  return (refl && deriv) ? -v : v;
+}
+
+// Per-atom table of one warp: value[v][k] and slope[d][k] per axis, plus the
+// flat mesh offset off[ax][k] of that node, already wrapped.  The offsets are
+// what the B-spline stencil buys (AxisStencil.offset) and what the gather and
+// spread need: with them the node loop is a load plus FMAs, with no per-node
+// wrap_near and no two-integer-multiply address computation.  Measured at
+// 108^3 / 98k atoms, adding them is the difference between a 2.5 and a
+// 0.5 ns-per-node gather.
+// Lane schedule of a separable stencil, the construct mesh_sum.cu uses: a lane
+// takes one (y, x) pair and walks z inside it, so the y and x weights, their
+// products with the x/y slopes, and the column offset of the pair leave the
+// inner loop.  A node then costs three shared reads (the z weight, its slope,
+// the z offset), one mesh read and four multiply-adds; before, each node also
+// re-read the y and x weights, i.e. nine shared reads, and that shared-memory
+// throughput -- not the address arithmetic -- was what made the QuadS gather
+// eight times the B-spline's at the same node count.
+template<int P>
+struct QSlots {
+  static constexpr int kPairs = P * P;
+  static constexpr int kGroups = (kPairs >= 32) ? 1 : (32 / kPairs);
+  static constexpr int kSlots = kGroups * kPairs;
+  static constexpr int kRounds = (kSlots + 31) / 32;
+};
+
+template<int NORD>
+struct QuadsTab {
+  float v[3][NORD];
+  float d[3][NORD];
+  int off[3][NORD];
+};
+
+// Values and slopes only: the brick kernels clip each node against the local
+// band (brick_coord), so their flat offset depends on the clip and cannot be
+// precomputed per axis.
+template<int NORD>
+__device__ __forceinline__ void quads_fill_tab_values(QuadsTab<NORD>& T,
+                                                      const float t[3],
+                                                      int lane){
+  constexpr int m = 2*NORD;
+  #pragma unroll
+  for(int s=lane; s<3*m; s+=32){
+    const int ax = s / m, r = s - ax*m;
+    if(r < NORD) T.v[ax][r] = quads_w1d<NORD>(t[ax], r, false);
+    else         T.d[ax][r-NORD] = quads_w1d<NORD>(t[ax], r-NORD, true);
+  }
+}
+
+template<int NORD>
+__device__ __forceinline__ void quads_fill_tab(QuadsTab<NORD>& T,
+                                               const float t[3],
+                                               const int base[3],
+                                               const int n[3],
+                                               const int stride[3], int lane){
+  // Offsets: item s in [0, 3*NORD), one wrap per axis node.
+  #pragma unroll
+  for(int s=lane; s<3*NORD; s+=32){
+    const int ax = s / NORD, k = s - ax*NORD;
+    int g = base[ax] - NORD/2 + 1 + k;      // offset 1 - NORD/2 + k
+    if(g < 0) g += n[ax]; else if(g >= n[ax]) g -= n[ax];
+    T.off[ax][k] = g * stride[ax];
+  }
+  // Values and slopes: item s in [0, 6*NORD).
+  constexpr int m = 2*NORD;
+  #pragma unroll
+  for(int s=lane; s<3*m; s+=32){
+    const int ax = s / m, r = s - ax*m;
+    if(r < NORD) T.v[ax][r] = quads_w1d<NORD>(t[ax], r, false);
+    else         T.d[ax][r-NORD] = quads_w1d<NORD>(t[ax], r-NORD, true);
+  }
+}
+
+
 // ── CubeS₂ device port — EXACT port of sog_spline.h (bit-matches CPU sog.cpp) ──
 // Node tables live in __constant__ memory (uploaded once at create). GpuNode layout == CubeS2Node4.
 typedef LAMMPS_NS::CubeS2Node4 GpuNode;
@@ -185,6 +389,14 @@ __constant__ GpuNode c_nodes6[88];
 // touch adjacent mesh cells, whose atomics and loads coalesce into a few cache
 // lines instead of scattering over the whole mesh.
 __constant__ GpuNode c_nodes4s[32];
+// The same nodes with the class as the primary sort key.  A CubeS2 weight is a
+// five-class expression and the class branch is taken per node; with the table
+// sorted by class every warp round holds one or two classes, so the branch is
+// nearly warp-uniform instead of up to five-way divergent.  The two replicated
+// gathers read these; the spreads keep the offset-sorted tables, where
+// adjacency of the scatter is what matters.
+__constant__ GpuNode c_nodes4c[32];
+__constant__ GpuNode c_nodes6c[88];
 __constant__ GpuNode c_nodes6s[88];
 __device__ const double kXi4 = 0.5773502691896258;   // 1/√3  (kCubes2Xi4)
 __device__ const double kXi6 = 0.6503998764035732;   // kCubes2Xi6
@@ -250,12 +462,17 @@ __device__ __forceinline__ GpuWeightGrad ga(GpuWeightGrad a,GpuWeightGrad b){ret
 __device__ __forceinline__ GpuWeightGrad gs(GpuWeightGrad a,GpuWeightGrad b){return gg(a.v-b.v,a.dx-b.dx,a.dy-b.dy,a.dz-b.dz);}
 __device__ __forceinline__ GpuWeightGrad gm(GpuWeightGrad a,GpuWeightGrad b){return gg(a.v*b.v,a.dx*b.v+a.v*b.dx,a.dy*b.v+a.v*b.dy,a.dz*b.v+a.v*b.dz);}
 __device__ __forceinline__ GpuWeightGrad gc(float a,GpuWeightGrad b){return gg(a*b.v,a*b.dx,a*b.dy,a*b.dz);}
-__device__ __forceinline__ GpuWeightGrad gL(GpuWeightGrad t,float xi){auto t2=gm(t,t),t3=gm(t2,t);return ga(ga(gc(-.5,t3),gc(.5,t2)),ga(gc(-(9*xi*xi-2)/6,t),gg(.5*xi*xi)));}
-__device__ __forceinline__ GpuWeightGrad gR(GpuWeightGrad t,float xi){return ga(gc(1.0/6.0,gm(gm(t,t),t)),gc((3*xi*xi-1)/6,t));}
-__device__ __forceinline__ GpuWeightGrad gL111(GpuWeightGrad t,float xi){float x2=xi*xi,x4=x2*x2;auto t2=gm(t,t),t3=gm(t2,t),t4=gm(t3,t),t5=gm(t4,t);return ga(ga(ga(gc(1.0/12,t5),gc(-1.0/6,t4)),ga(gc((10*x2-1)/12,t3),gc(-(6*x2-1)/6,t2))),ga(gc((5*x4-x2)/4,t),gg(-(3*x4-x2)/6)));}
-__device__ __forceinline__ GpuWeightGrad gL311(GpuWeightGrad t,float xi){float x2=xi*xi,x4=x2*x2;auto t3=gm(gm(t,t),t),t5=gm(gm(t3,t),t);return ga(ga(gc(1.0/120,t5),gc((2*x2-1)/24,t3)),gc((15*x4-15*x2+4)/120,t));}
-__device__ __forceinline__ GpuWeightGrad gL211(GpuWeightGrad t,float xi){return gs(gc(-.25,gL111(t,xi)),gc(2.5,gL311(t,xi)));}
-__device__ __forceinline__ GpuWeightGrad gS6(GpuWeightGrad t,float xi){auto t2=gm(t,t),t3=gm(t2,t);return ga(ga(gc(-.5,t3),gc(.5,t2)),ga(gc(-(3*xi*xi-2)/2,t),gg(.5*xi*xi)));}
+// fp32 literals throughout: these run once per node of every atom in the
+// gather, and a double literal promotes the whole polynomial to the fp64 pipe,
+// which is 1/64 of the fp32 one on the cards this runs on.  Measured on a 4090
+// at 250^3 / 196608 atoms, the fp64 form costs 1.0 ms and the fp32 form 0.24 ms
+// for the same 88 evaluations per atom.
+__device__ __forceinline__ GpuWeightGrad gL(GpuWeightGrad t,float xi){auto t2=gm(t,t),t3=gm(t2,t);return ga(ga(gc(-.5f,t3),gc(.5f,t2)),ga(gc(-(9.f*xi*xi-2.f)/6.f,t),gg(.5f*xi*xi)));}
+__device__ __forceinline__ GpuWeightGrad gR(GpuWeightGrad t,float xi){return ga(gc(1.f/6.f,gm(gm(t,t),t)),gc((3.f*xi*xi-1.f)/6.f,t));}
+__device__ __forceinline__ GpuWeightGrad gL111(GpuWeightGrad t,float xi){float x2=xi*xi,x4=x2*x2;auto t2=gm(t,t),t3=gm(t2,t),t4=gm(t3,t),t5=gm(t4,t);return ga(ga(ga(gc(1.f/12.f,t5),gc(-1.f/6.f,t4)),ga(gc((10.f*x2-1.f)/12.f,t3),gc(-(6.f*x2-1.f)/6.f,t2))),ga(gc((5.f*x4-x2)/4.f,t),gg(-(3.f*x4-x2)/6.f)));}
+__device__ __forceinline__ GpuWeightGrad gL311(GpuWeightGrad t,float xi){float x2=xi*xi,x4=x2*x2;auto t3=gm(gm(t,t),t),t5=gm(gm(t3,t),t);return ga(ga(gc(1.f/120.f,t5),gc((2.f*x2-1.f)/24.f,t3)),gc((15.f*x4-15.f*x2+4.f)/120.f,t));}
+__device__ __forceinline__ GpuWeightGrad gL211(GpuWeightGrad t,float xi){return gs(gc(-.25f,gL111(t,xi)),gc(2.5f,gL311(t,xi)));}
+__device__ __forceinline__ GpuWeightGrad gS6(GpuWeightGrad t,float xi){auto t2=gm(t,t),t3=gm(t2,t);return ga(ga(gc(-.5f,t3),gc(.5f,t2)),ga(gc(-(3.f*xi*xi-2.f)/2.f,t),gg(.5f*xi*xi)));}
 __device__ __forceinline__ GpuWeightGrad gcoord(float v,int a,bool refl=false){return gg(v,a==0?(refl?-1:1):0,a==1?(refl?-1:1):0,a==2?(refl?-1:1):0);}
 __device__ __forceinline__ GpuWeightGrad geta(const GpuWeightGrad*c,const int*o,int a){return o[a]==1?c[a]:gcoord(1-c[a].v,a,true);}
 __device__ __forceinline__ GpuWeightGrad cs2_wg4(float tx,float ty,float tz,const GpuNode&nd,float xi){
@@ -271,75 +488,70 @@ __device__ __forceinline__ GpuWeightGrad cs2_wg6(float tx,float ty,float tz,cons
   auto ex=(nd.sp_is_neg&1)?gcoord(1-tx,0,true):c[0];auto ey=(nd.sp_is_neg&2)?gcoord(1-ty,1,true):c[1];auto ez=(nd.sp_is_neg&4)?gcoord(1-tz,2,true):c[2];return gm(gm(gR(ex,xi),gR(ey,xi)),gR(ez,xi));
 }
 
-// Zero a single-precision real mesh.
-__global__ void k_zero_real(size_t n,float*p){
-  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
-  if(i<n) p[i]=0.f;
+// ── fp32 1-D basis of the order-4 transfer function ─────────────────────
+//
+// The literals above are ``double``, so an evaluation of cs2_L or cs2_R
+// promotes to the fp64 pipe, which runs at 1/64 of the fp32 one on the cards
+// this runs on.  The order-4 spread builds its per-atom table from these
+// instead.
+__device__ __forceinline__ float cs2_fL(float t,float x2){
+  return -0.5f*t*t*t + 0.5f*t*t - (9.0f*x2-2.0f)/6.0f*t + 0.5f*x2; }
+__device__ __forceinline__ float cs2_fR(float t,float x2){
+  return (1.0f/6.0f)*t*t*t + (3.0f*x2-1.0f)/6.0f*t; }
+
+// ── Per-atom 1-D table of the order-4 spread ────────────────────────────
+//
+// The order-4 transfer function is a sum of products of three 1-D functions
+// (one per node class), so a table of the 1-D values of an atom's own (t, 1-t)
+// replaces one polynomial evaluation per node.  The pack evaluates the table
+// once per atom in fp32 and scatters 32 nodes from it, which is what the order
+// 6 pack already did: without it the order-4 spread cost 1.11 ms at 250^3 /
+// 196608 atoms, more than the order-6 spread despite having a third of the
+// nodes, because its per-node `cs2_w4` ran in fp64.
+//
+// Layout, per axis a, at base = a * 10: kind*2 + e for kind 0 elt, 1 L, 2 R,
+// e = 0 reading f(t) and e = 1 f(1-t); then eta[i], i = offset + 1 in [0, 4).
+struct Cs2Tab4 { float d[30]; };
+
+#define CS2_4V(b,k,a,e) ((b).d[(a)*10 + (k)*2 + (e)])
+#define CS2_4E(b,a,i)   ((b).d[(a)*10 + 6 + (i)])
+
+__device__ __forceinline__ void cs2_fill_tab4(Cs2Tab4& b, const float* t,
+                                              float xi, int lane) {
+  if (lane >= 30) return;
+  const float x2 = xi*xi;
+  const int a = lane / 10, r = lane - a*10;
+  const float v = t[a], u = 1.f - v;
+  float out;
+  if (r < 6) {
+    const int kind = r >> 1, e = r & 1;
+    const float arg = e ? u : v;
+    out = (kind == 0) ? arg : (kind == 1 ? cs2_fL(arg, x2) : cs2_fR(arg, x2));
+  } else {
+    const int i = r - 6;
+    out = (i == 2) ? v : u;
+  }
+  b.d[lane] = out;
+}
+
+__device__ __forceinline__ float cs2_w4_tab(const Cs2Tab4& b, const GpuNode& nd) {
+  const int o[3] = {nd.dx + 1, nd.dy + 1, nd.dz + 1};
+  if (nd.cls == 0) {
+    const int ix = 1-nd.dx, iy = 1-nd.dy, iz = 1-nd.dz;
+    const float ex = CS2_4V(b,0,0,ix), ey = CS2_4V(b,0,1,iy), ez = CS2_4V(b,0,2,iz);
+    return CS2_4V(b,1,0,ix)*ey*ez + CS2_4V(b,1,1,iy)*ez*ex
+         + CS2_4V(b,1,2,iz)*ex*ey;
+  }
+  const int sp = nd.sp_axis;
+  int n1 = (sp+1)%3, n2 = (sp+2)%3;
+  const int neg = nd.sp_is_neg ? 1 : 0;
+  return CS2_4V(b,2,sp,neg) * CS2_4E(b,n1,o[n1]) * CS2_4E(b,n2,o[n2]);
 }
 
 // Zero a single-precision mesh.
 __global__ void k_zero_complex_f(size_t n,cufftComplex*rho){
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   if(i<n){ rho[i].x=0.f; rho[i].y=0.f; }
-}
-
-// CubeS2 spread: 1 thread/atom, loop 32/88 nodes, atomicAdd into d_rho.real.
-template<int ORD>
-__global__ void k_spread_cubes2(int nlocal,const double*x,const double*boxlo,
-    double lx,double ly,double lz,const double*q,double rho_scale,
-    int nx,int ny,int nz,cufftDoubleComplex*rho){
-  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
-  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
-  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
-  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
-  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0, qs=rho_scale*q[i];
-  const int NN=(ORD==4)?32:88; const double xi=(ORD==4)?kXi4:kXi6;
-  for(int k=0;k<NN;++k){
-    GpuNode nd=(ORD==4)?c_nodes4[k]:c_nodes6[k];
-    double w=(ORD==4)?cs2_w4(tx,ty,tz,nd,xi):cs2_w6(tx,ty,tz,nd,xi);
-    if(w==0.0) continue;
-    int gx=wrap(ix0+nd.dx,nx),gy=wrap(iy0+nd.dy,ny),gz=wrap(iz0+nd.dz,nz);
-    atomicAdd(&rho[midx(gx,gy,gz,nx,ny)].x, qs*w);
-  }
-}
-
-template<int ORD>
-__global__ void k_gather_cubes2(int nlocal,const double*x,const double*boxlo,
-    double lx,double ly,double lz,const double*q,double qscale,
-    int nx,int ny,int nz,const cufftDoubleComplex*gx,const cufftDoubleComplex*gy,
-    const cufftDoubleComplex*gz,const cufftDoubleComplex*pot,int want_pot,
-    double*force,double*vpot,double*red){
-  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
-  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
-  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
-  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
-  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
-  const int NN=(ORD==4)?32:88; const double xi=(ORD==4)?kXi4:kXi6;
-  double dtx=0,dty=0,dtz=0,gp=0;
-  for(int k=0;k<NN;++k){
-    GpuNode nd=(ORD==4)?c_nodes4[k]:c_nodes6[k];
-    GpuWeightGrad wg=(ORD==4)?cs2_wg4(tx,ty,tz,nd,xi):cs2_wg6(tx,ty,tz,nd,xi);
-    double w=wg.v; if(w==0.0) continue;
-    int gxi=wrap(ix0+nd.dx,nx),gyi=wrap(iy0+nd.dy,ny),gzi=wrap(iz0+nd.dz,nz);
-    size_t id=midx(gxi,gyi,gzi,nx,ny);
-    double u=pot[id].x;
-    dtx+=wg.dx*u; dty+=wg.dy*u; dtz+=wg.dz*u; gp+=w*u;
-  }
-  double qi=q[i];
-  double fxs=-qscale*qi*dtx*nx/lx, fys=-qscale*qi*dty*ny/ly, fzs=-qscale*qi*dtz*nz/lz;
-  force[3*i+0]=fxs; force[3*i+1]=fys; force[3*i+2]=fzs;
-  vpot[i]=qscale*gp;
-  // r⊗F virial: exact, captures all position-dependent strain effects
-  // that the analytic Fourier formula misses (matching CPU vv_rf).
-  // red[14..19] holds Σ r_iα · F_iβ.
-  atomicAdd(&red[14], x[3*i+0]*fxs);  // r_x * F_x (xx)
-  atomicAdd(&red[15], x[3*i+1]*fys);  // r_y * F_y (yy)
-  atomicAdd(&red[16], x[3*i+2]*fzs);  // r_z * F_z (zz)
-  atomicAdd(&red[17], x[3*i+0]*fys);  // r_x * F_y (xy)
-  atomicAdd(&red[18], x[3*i+0]*fzs);  // r_x * F_z (xz)
-  atomicAdd(&red[19], x[3*i+1]*fzs);  // r_y * F_z (yz)
 }
 
 // CubeS2 weights from a per-atom table of one-dimensional values.
@@ -488,6 +700,46 @@ __global__ void k_fx_to_float(size_t n,const unsigned long long*p,float*out,doub
   if(i<n) out[i]=(float)(inv*(double)(long long)p[i]);
 }
 
+// ── The fractional coordinate of every atom, once ─────────────────────────
+//
+// Placing an atom on the mesh takes three fp64 divisions, three floors and
+// three subtractions -- about twenty fp64 instructions.  Inside the gather the
+// whole warp computes the SAME atom's coordinate, so the pipeline executes
+// those twenty instructions for one atom at a time: an fp64 warp instruction
+// occupies the fp64 pipe whatever the number of its active lanes, and on a card
+// whose fp64 pipe runs at 1/64 of its fp32 pipe that is the single largest term
+// of the gather.  Measured on a 4090 over the two CubeS2 orders, the
+// part of the gather that does not scale with the node count is 0.64 ms of
+// 1.00 ms at 250^3 / 196608 atoms.
+//
+// One thread per atom puts thirty-two atoms in one warp instruction instead:
+// the same twenty instructions now place 32 atoms rather than 1.  The pack
+// (0.75 ms at the same size) and the gather both read the result back from
+// L1 -- all lanes of a warp read the same 24-byte entry, which is a broadcast.
+struct FracNode { int i[3]; float t[3]; };
+
+__global__ void k_midtown_frac(int nlocal,const double*x,const double*boxlo,
+    double ilx,double ily,double ilz,int nx,int ny,int nz,FracNode*out){
+  const int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>=nlocal) return;
+  const double fx=periodic_frac_i(x[3*i+0],boxlo[0],ilx)*nx;
+  const double fy=periodic_frac_i(x[3*i+1],boxlo[1],ily)*ny;
+  const double fz=periodic_frac_i(x[3*i+2],boxlo[2],ilz)*nz;
+  FracNode& o=out[i];
+  o.i[0]=(int)floor(fx); o.i[1]=(int)floor(fy); o.i[2]=(int)floor(fz);
+  o.t[0]=(float)(fx-o.i[0]); o.t[1]=(float)(fy-o.i[1]); o.t[2]=(float)(fz-o.i[2]);
+}
+
+// The buffer of k_midtown_frac, grown to hold ``nlocal`` atoms.
+static FracNode* ensure_frac(SogGpuState*s,int nlocal){
+  if(nlocal > s->cap_frac){
+    cudaFree(s->d_frac);
+    s->cap_frac = nlocal > 0 ? nlocal : 1;
+    CK(cudaMalloc(&s->d_frac, (size_t)s->cap_frac * sizeof(FracNode)));
+  }
+  return static_cast<FracNode*>(s->d_frac);
+}
+
 template<int ORD>
 __global__ void k_spread_cubes2_warp_fx(int nlocal,const double*x,const double*boxlo,
     double lx,double ly,double lz,const double*q,double rho_scale,
@@ -546,9 +798,8 @@ constexpr int kSpreadWarps = 8;
 
 template <int ORD>
 __global__ void __launch_bounds__(kSpreadWarps * 32)
-    k_spread_cubes2_warp_fx_packed(int nlocal, const double* x,
-                                   const double* boxlo, double ilx, double ily,
-                                   double ilz, const double* q, double rho_scale,
+    k_spread_cubes2_warp_fx_packed(int nlocal, const FracNode* fr,
+                                   const double* q, double rho_scale,
                                    int nx, int ny, int nz,
                                    unsigned long long* rho) {
   constexpr int PACK = kSpreadPack;
@@ -578,16 +829,14 @@ __global__ void __launch_bounds__(kSpreadWarps * 32)
   if (lane < PACK) {
     const int i = a0 + lane;
     if (i < nlocal) {
-      const double fx = periodic_frac_i(x[3 * i + 0], boxlo[0], ilx) * nx;
-      const double fy = periodic_frac_i(x[3 * i + 1], boxlo[1], ily) * ny;
-      const double fz = periodic_frac_i(x[3 * i + 2], boxlo[2], ilz) * nz;
-      const int ix0 = (int)floor(fx), iy0 = (int)floor(fy), iz0 = (int)floor(fz);
+      const FracNode& o = fr[i];
+      const int ix0 = o.i[0], iy0 = o.i[1], iz0 = o.i[2];
       sh_ix[warp][lane] = ix0;
       sh_iy[warp][lane] = iy0;
       sh_iz[warp][lane] = iz0;
-      sh_t[warp][lane][0] = (float)(fx - ix0);
-      sh_t[warp][lane][1] = (float)(fy - iy0);
-      sh_t[warp][lane][2] = (float)(fz - iz0);
+      sh_t[warp][lane][0] = o.t[0];
+      sh_t[warp][lane][1] = o.t[1];
+      sh_t[warp][lane][2] = o.t[2];
       sh_qs[warp][lane] = (float)rho_scale * (float)q[i];
       // The stencil reaches -2..+3 on every axis: an atom this far from the
       // boundary never wraps, so its scatter needs no per-node modulo.
@@ -676,68 +925,102 @@ __global__ void __launch_bounds__(kSpreadWarps * 32)
   }
 }
 
+// Order 4 has no packed kernel: its spread used to evaluate the branchy
+// cs2_w4 once per node, per lane, in fp64, which made its per-node cost higher
+// than order 6's despite having a third of the nodes.  One warp per atom with
+// a per-warp table is enough here, because the 32 nodes are exactly one round
+// of a warp.
+__global__ void __launch_bounds__(kSpreadWarps * 32)
+    k_spread_cubes2_warp_fx_tab4(int nlocal, const FracNode* fr,
+                                 const double* q, double rho_scale,
+                                 int nx, int ny, int nz,
+                                 unsigned long long* rho) {
+  constexpr int NN = 32;
+  __shared__ GpuNode sh_nodes[NN];
+  __shared__ Cs2Tab4 sh_tab[kSpreadWarps];
+  for (int t = threadIdx.x; t < NN; t += blockDim.x) {
+    sh_nodes[t] = c_nodes4s[t];
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int i = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (i >= nlocal) return;
+  const FracNode& o = fr[i];
+  const int ix0 = o.i[0], iy0 = o.i[1], iz0 = o.i[2];
+  const float tf[3] = {o.t[0], o.t[1], o.t[2]};
+  cs2_fill_tab4(sh_tab[warp], tf, (float)kXi4, lane);
+  __syncwarp();
+  const GpuNode& nd = sh_nodes[lane];
+  const float w = cs2_w4_tab(sh_tab[warp], nd);
+  if (w == 0.f) return;
+  const float qs = (float)rho_scale * (float)q[i];
+  const int gx = wrap_near(ix0 + nd.dx, nx), gy = wrap_near(iy0 + nd.dy, ny),
+            gz = wrap_near(iz0 + nd.dz, nz);
+  atomicAdd(&rho[midx(gx, gy, gz, nx, ny)],
+            (unsigned long long)(long long)__float2ll_rn(qs * w * (float)kFxScale));
+}
+
 // ── Half-spectrum (real-to-complex) path ─────────────────────────────────
 // The charge mesh and the potential mesh are real, so the transforms are R2C
 // and C2R and the spectrum holds only the positive half of the fastest axis
 // (x here, the contiguous one).  The k-space pass then visits half the modes
 // and weighs the interior ones twice, which is exactly the full sum.
-template<int ORD>
-__global__ void k_spread_cubes2_warp_r(int nlocal,const double*x,const double*boxlo,
-    double lx,double ly,double lz,const double*q,double rho_scale,
-    int nx,int ny,int nz,float*rho){
-  const int NN=(ORD==4)?32:88;
-  __shared__ GpuNode sh_nodes[88];
-  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
-    sh_nodes[t]=(ORD==4)?c_nodes4s[t]:c_nodes6s[t];
-  __syncthreads();
-  const int lane=threadIdx.x&31;
-  const int i=(blockIdx.x*(blockDim.x>>5))+(threadIdx.x>>5);
-  if(i>=nlocal) return;
-  const double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
-  const double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
-  const double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
-  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  const double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
-  const double xi=(ORD==4)?kXi4:kXi6;
-  Cs2Tab tab;
-  if (ORD==6) cs2_fill_tab(tab,(float)tx,(float)ty,(float)tz,(float)kXi6);
-  const double qs=rho_scale*q[i];
-  for(int k=lane;k<NN;k+=32){
-    const GpuNode& nd=sh_nodes[k];
-    const double w=(double)((ORD==4)?cs2_w4(tx,ty,tz,nd,xi):cs2_w6_tab(tab,nd));
-    if(w==0.0) continue;
-    const int gx=wrap_near(ix0+nd.dx,nx),gy=wrap_near(iy0+nd.dy,ny),gz=wrap_near(iz0+nd.dz,nz);
-    atomicAdd(&rho[midx(gx,gy,gz,nx,ny)], (float)(qs*w));
-  }
-}
 
 template<int ORD>
-__global__ void k_gather_cubes2_warp_r(int nlocal,const double*x,const double*boxlo,
+__global__ void k_gather_cubes2_warp_r(int nlocal,const FracNode*fr,
     double ilx,double ily,double ilz,const double*q,double qscale,
     int nx,int ny,int nz,const float*pot,int want_pot,
     double*force,double*vpot,double*red){
-  const int NN=(ORD==4)?32:88;
+  constexpr int NN=(ORD==4)?32:88;
+  constexpr int kRounds=(NN+31)/32;
   __shared__ GpuNode sh_nodes[88];
-  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
-    sh_nodes[t]=(ORD==4)?c_nodes4s[t]:c_nodes6s[t];
+  // The flat offset of every node, WITHOUT the atom's base and WITHOUT the
+  // wrap: it depends only on the mesh shape, so it is filled once per block.
+  // An atom whose stencil lies inside the mesh then reaches its 88 cells with
+  // one base add, instead of three wrap_near and two integer multiplies per
+  // node -- the per-node address arithmetic the B-spline stencil eliminates.
+  __shared__ long long sh_off[88];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x){
+    const GpuNode nd=(ORD==4)?c_nodes4c[t]:c_nodes6c[t];
+    sh_nodes[t]=nd;
+    sh_off[t]=static_cast<long long>(nd.dx)+
+              static_cast<long long>(nx)*(nd.dy+static_cast<long long>(ny)*nd.dz);
+  }
   __syncthreads();
   const int lane=threadIdx.x&31;
-  const int i=(blockIdx.x*(blockDim.x>>5))+(threadIdx.x>>5);
+  const int warp=threadIdx.x>>5;
+  const int i=(blockIdx.x*(blockDim.x>>5))+warp;
   if(i>=nlocal) return;
-  const double fx=periodic_frac_i(x[3*i+0],boxlo[0],ilx)*nx;
-  const double fy=periodic_frac_i(x[3*i+1],boxlo[1],ily)*ny;
-  const double fz=periodic_frac_i(x[3*i+2],boxlo[2],ilz)*nz;
-  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  const double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
-  const double xi=(ORD==4)?kXi4:kXi6;
-  double dtx=0,dty=0,dtz=0,gp=0;
-  for(int k=lane;k<NN;k+=32){
-    const GpuNode& nd=sh_nodes[k];
-    GpuWeightGrad wg=(ORD==4)?cs2_wg4(tx,ty,tz,nd,xi):cs2_wg6((double)tx,(double)ty,(double)tz,nd,xi);
-    const double w=wg.v; if(w==0.0) continue;
-    const int gxi=wrap_near(ix0+nd.dx,nx),gyi=wrap_near(iy0+nd.dy,ny),gzi=wrap_near(iz0+nd.dz,nz);
-    const double u=(double)pot[midx(gxi,gyi,gzi,nx,ny)];
-    dtx+=wg.dx*u; dty+=wg.dy*u; dtz+=wg.dz*u; gp+=w*u;
+  const FracNode& fo=fr[i];
+  const int ix0=fo.i[0],iy0=fo.i[1],iz0=fo.i[2];
+  const float tf[3]={fo.t[0],fo.t[1],fo.t[2]};
+  // A stencil reaches -2..+3 on every axis, so this atom wraps nothing.
+  const bool interior=(ix0>=2&&ix0+3<nx&&iy0>=2&&iy0+3<ny&&iz0>=2&&iz0+3<nz);
+  const long long base=interior
+      ? static_cast<long long>(ix0)+
+        static_cast<long long>(nx)*(iy0+static_cast<long long>(ny)*iz0)
+      : 0;
+  float dtx=0.f,dty=0.f,dtz=0.f,gp=0.f;
+  // A lane past the end of the table re-reads the last node with a zero
+  // potential instead of breaking out of the loop: the break would stop the
+  // compiler from unrolling, which is what keeps the scattered potential reads
+  // of one lane in flight together.
+  #pragma unroll
+  for(int round=0;round<kRounds;++round){
+    const int k=lane+32*round;
+    const bool live=(k<NN);
+    const GpuNode& nd=sh_nodes[live?k:(NN-1)];
+    const GpuWeightGrad wg=(ORD==4)
+        ?cs2_wg4(tf[0],tf[1],tf[2],nd,(float)kXi4)
+        :cs2_wg6(tf[0],tf[1],tf[2],nd,(float)kXi6);
+    const long long m=interior
+        ? base+sh_off[live?k:(NN-1)]
+        : static_cast<long long>(midx(wrap_near(ix0+nd.dx,nx),
+                                      wrap_near(iy0+nd.dy,ny),
+                                      wrap_near(iz0+nd.dz,nz),nx,ny));
+    const float u=live?pot[m]:0.f;
+    dtx+=wg.dx*u; dty+=wg.dy*u; dtz+=wg.dz*u; gp+=wg.v*u;
   }
   #pragma unroll
   for(int off=16;off>0;off>>=1){
@@ -750,6 +1033,193 @@ __global__ void k_gather_cubes2_warp_r(int nlocal,const double*x,const double*bo
   const double qi=q[i];
   const double fxs=-qscale*qi*dtx*nx*ilx, fys=-qscale*qi*dty*ny*ily, fzs=-qscale*qi*dtz*nz*ilz;
   force[3*i+0]=fxs; force[3*i+1]=fys; force[3*i+2]=fzs;
+  vpot[i]=qscale*gp;
+}
+
+// ── ik-mode (Fourier differentiation) path ───────────────────────────────
+// Instead of gathering the weight derivatives (the AD path above), multiply the
+// potential half-spectrum by i·k_a and invert, which yields dphi/dr_a on the
+// mesh directly.  The gather then reads the three gradient meshes with the
+// value-only weights, so the force is -qscale·q_i·(dphi/dr) with no nx/lx
+// rescale (the derivative is already in physical units).  p_F = 2ν, one order
+// above the AD path, at the cost of three extra C2R transforms.
+
+__global__ void k_mul_ik(int nx,int ny,int nz,double kfx,double kfy,double kfz,
+                         const cufftComplex*spec,cufftComplex*out,int axis){
+  const int nh=nx/2+1;
+  const size_t total=(size_t)nh*ny*nz;
+  const size_t idx=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if(idx>=total) return;
+  // cuFFT's R2C output of a (nz, ny, nx) real array is (nz, ny, nh) complex,
+  // row-major, with the half axis kh CONTIGUOUS.  Same layout k_kspace_h
+  // walks, and getting it transposed silently applies the wrong k to every
+  // mode.
+  const int kh=(int)(idx%nh);
+  const int iy=(int)((idx/nh)%ny);
+  const int iz=(int)(idx/((size_t)nh*ny));
+  const int my=iy-(2*iy>=ny?ny:0);
+  const int mz=iz-(2*iz>=nz?nz:0);
+  const int even_nx=(2*nh-1!=nx)?1:0;
+  // Self-conjugate points (k == -k): there the coefficient of a real field is
+  // real, so i*k_a*phi_hat is pure imaginary and cannot stay Hermitian -- the
+  // mode must be dropped.  Only these points; every other point of a Nyquist
+  // plane is a genuine conjugate pair inside the half spectrum and must stay.
+  const bool kx_self=(kh==0)||(even_nx&&kh==nh-1);
+  const bool ky_self=(iy==0)||((ny%2)==0&&iy==ny/2);
+  const bool kz_self=(iz==0)||((nz%2)==0&&iz==nz/2);
+  const bool self=kx_self&&ky_self&&kz_self;
+  double ka;
+  if(axis==0) ka=kfx*kh;
+  else if(axis==1) ka=kfy*my;
+  else ka=kfz*mz;
+  if(self || ka==0.0){ out[idx].x=0.f; out[idx].y=0.f; return; }
+  // (rx + i ry) · i·ka = -ka·ry + i·ka·rx
+  const double rx=(double)spec[idx].x, ry=(double)spec[idx].y;
+  out[idx].x=(float)(-ka*ry);
+  out[idx].y=(float)( ka*rx);
+}
+
+// Table bytes per atom of the ik gather's shared value table: the order-4
+// table holds 30 floats, the order-6 one 60 (see Cs2Tab4 / Cs2Tab).
+template<int ORD> struct Cs2TabFloats { static constexpr int value = (ORD==4)?30:60; };
+
+template<int ORD>
+__global__ void k_gather_cubes2_warp_r_ik(int nlocal,const FracNode*fr,
+    const double*q,double qscale,int nx,int ny,int nz,
+    const float*pot,const float*gradx,const float*grady,const float*gradz,
+    int want_pot,double*force,double*vpot){
+  constexpr int NN=(ORD==4)?32:88;
+  constexpr int kRounds=(NN+31)/32;
+  __shared__ GpuNode sh_nodes[88];
+  __shared__ long long sh_off[88];
+  // One per-atom value table per warp, in dynamic shared memory (the launch
+  // sizes it for the block's warps).
+  extern __shared__ float sh_tab[];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x){
+    const GpuNode nd=(ORD==4)?c_nodes4c[t]:c_nodes6c[t];
+    sh_nodes[t]=nd;
+    sh_off[t]=static_cast<long long>(nd.dx)+
+              static_cast<long long>(nx)*(nd.dy+static_cast<long long>(ny)*nd.dz);
+  }
+  __syncthreads();
+  const int lane=threadIdx.x&31;
+  const int warp=threadIdx.x>>5;
+  const int i=(blockIdx.x*(blockDim.x>>5))+warp;
+  if(i>=nlocal) return;
+  const FracNode& fo=fr[i];
+  const int ix0=fo.i[0],iy0=fo.i[1],iz0=fo.i[2];
+  const float tf[3]={fo.t[0],fo.t[1],fo.t[2]};
+  const bool interior=(ix0>=2&&ix0+3<nx&&iy0>=2&&iy0+3<ny&&iz0>=2&&iz0+3<nz);
+  const long long base=interior
+      ? static_cast<long long>(ix0)+
+        static_cast<long long>(nx)*(iy0+static_cast<long long>(ny)*iz0)
+      : 0;
+  // The atom's 1-D values, once, by the whole warp.  Evaluating cs2_w4/cs2_w6
+  // per node re-runs 32/88 polynomial evaluations whose literals are double,
+  // so the whole stencil landed on the fp64 pipe: measured 3.43 ms of the step
+  // at 108^3 / 98k atoms, against 0.13 ms for the same node count in the
+  // spread, which fills this table once per atom.
+  constexpr int kTabFloats = Cs2TabFloats<ORD>::value;
+  float* slot = sh_tab + warp * kTabFloats;
+  if(ORD==4){
+    Cs2Tab4& T=*reinterpret_cast<Cs2Tab4*>(slot);
+    cs2_fill_tab4(T,tf,(float)kXi4,lane);
+  } else {
+    Cs2Tab& T=*reinterpret_cast<Cs2Tab*>(slot);
+    cs2_fill_tab_par(T,tf[0],tf[1],tf[2],(float)kXi6,lane);
+  }
+  __syncwarp();
+  const Cs2Tab4* T4=reinterpret_cast<const Cs2Tab4*>(slot);
+  const Cs2Tab* T6=reinterpret_cast<const Cs2Tab*>(slot);
+  float dtx=0.f,dty=0.f,dtz=0.f,gp=0.f;
+  #pragma unroll
+  for(int round=0;round<kRounds;++round){
+    const int k=lane+32*round;
+    const bool live=(k<NN);
+    const GpuNode& nd=sh_nodes[live?k:(NN-1)];
+    const float w=live?((ORD==4)?cs2_w4_tab(*T4,nd):cs2_w6_tab(*T6,nd)):0.f;
+    const long long m=interior
+        ? base+sh_off[live?k:(NN-1)]
+        : static_cast<long long>(midx(wrap_near(ix0+nd.dx,nx),
+                                      wrap_near(iy0+nd.dy,ny),
+                                      wrap_near(iz0+nd.dz,nz),nx,ny));
+    const float ux=live?gradx[m]:0.f, uy=live?grady[m]:0.f, uz=live?gradz[m]:0.f;
+    const float u=live?pot[m]:0.f;
+    dtx+=w*ux; dty+=w*uy; dtz+=w*uz; gp+=w*u;
+  }
+  #pragma unroll
+  for(int off=16;off>0;off>>=1){
+    dtx+=__shfl_down_sync(0xffffffffu,dtx,off);
+    dty+=__shfl_down_sync(0xffffffffu,dty,off);
+    dtz+=__shfl_down_sync(0xffffffffu,dtz,off);
+    gp +=__shfl_down_sync(0xffffffffu,gp ,off);
+  }
+  if(lane!=0) return;
+  const double qi=q[i];
+  force[3*i+0]=-qscale*qi*dtx; force[3*i+1]=-qscale*qi*dty; force[3*i+2]=-qscale*qi*dtz;
+  vpot[i]=qscale*gp;
+}
+
+// ── QuadS ik path: the same three Fourier gradients on the FULL complex grid ──
+// QuadS spreads on a full complex mesh (no R2C half spectrum), so the ik
+// multiply walks all nx*ny*nz modes.  The self-conjugate points (k == -k) are
+// the only ones where i*k_a*phi_hat cannot stay Hermitian; they are dropped,
+// exactly as k_mul_ik does on the half spectrum.
+__global__ void k_mul_ik_full(int nx,int ny,int nz,double kfx,double kfy,
+                              double kfz,const cufftComplex*spec,
+                              cufftComplex*out,int axis){
+  const size_t total=(size_t)nx*ny*nz;
+  const size_t idx=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if(idx>=total) return;
+  const int ix=(int)(idx%(size_t)nx);
+  const int iy=(int)((idx/(size_t)nx)%(size_t)ny);
+  const int iz=(int)(idx/((size_t)nx*(size_t)ny));
+  const int mx=ix-(2*ix>=nx?nx:0);
+  const int my=iy-(2*iy>=ny?ny:0);
+  const int mz=iz-(2*iz>=nz?nz:0);
+  const bool sx=(ix==0)||((nx%2)==0&&ix==nx/2);
+  const bool sy=(iy==0)||((ny%2)==0&&iy==ny/2);
+  const bool sz=(iz==0)||((nz%2)==0&&iz==nz/2);
+  double ka;
+  if(axis==0) ka=kfx*mx;
+  else if(axis==1) ka=kfy*my;
+  else ka=kfz*mz;
+  if((sx&&sy&&sz) || ka==0.0){ out[idx].x=0.f; out[idx].y=0.f; return; }
+  const double rx=(double)spec[idx].x, ry=(double)spec[idx].y;
+  out[idx].x=(float)(-ka*ry);
+  out[idx].y=(float)( ka*rx);
+}
+
+// Value-only QuadS gather for the ik path: the gradient meshes already carry
+// dphi/dr in physical units, so there is no nx/lx rescale and no weight
+// derivative.  The k-space virial comes from k_kspace_f, so no r⊗F loop.
+template<int ORD>
+__global__ void k_gather_quads_ik(int nlocal,const double*x,const double*boxlo,
+    double lx,double ly,double lz,const double*q,double qscale,
+    int nx,int ny,int nz,const cufftComplex*pot,const cufftComplex*gx,
+    const cufftComplex*gy,const cufftComplex*gz,int want_pot,
+    double*force,double*vpot){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  double fx=periodic_frac(x[3*i+0],boxlo[0],lx)*nx;
+  double fy=periodic_frac(x[3*i+1],boxlo[1],ly)*ny;
+  double fz=periodic_frac(x[3*i+2],boxlo[2],lz)*nz;
+  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
+  double wx[ORD],wy[ORD],wz[ORD];
+  if(ORD==4){ quads4_w(tx,wx); quads4_w(ty,wy); quads4_w(tz,wz); }
+  else      { quads6_w(tx,wx); quads6_w(ty,wy); quads6_w(tz,wz); }
+  const int off=(ORD==4)?-1:-2;
+  double dx=0,dy=0,dz=0,gp=0;
+  for(int a=0;a<ORD;++a){int gxi=wrap(ix0+off+a,nx);
+    for(int b=0;b<ORD;++b){int gyi=wrap(iy0+off+b,ny);
+      for(int c=0;c<ORD;++c){int gzi=wrap(iz0+off+c,nz);
+        size_t id=midx(gxi,gyi,gzi,nx,ny);
+        double w=wx[a]*wy[b]*wz[c];
+        dx+=w*gx[id].x; dy+=w*gy[id].x; dz+=w*gz[id].x;
+        gp+=w*pot[id].x; }}}
+  double qi=q[i];
+  force[3*i+0]=-qscale*qi*dx; force[3*i+1]=-qscale*qi*dy;
+  force[3*i+2]=-qscale*qi*dz;
   vpot[i]=qscale*gp;
 }
 // One pass over the half spectrum: multiply by the influence function, write
@@ -838,12 +1308,16 @@ __global__ void k_kspace_h(int nx,int ny,int nz,double kfx,double kfy,double kfz
           const double ky = 2 * M_PI * (hinv[3] * mx + hinv[4] * myd + hinv[5] * mzd);
           const double kz = 2 * M_PI * (hinv[6] * mx + hinv[7] * myd + hinv[8] * mzd);
           const float2 g = gp0[j];
-          const double rr = (double)sp[j].x, ri = (double)sp[j].y;
+          // Both operands are float32 already (a float2 table entry and a
+          // float spectrum value), so the fp64 product only bought fp64-pipe
+          // issue slots.
+          const float rr = sp[j].x, ri = sp[j].y;
           if (want_pot) {
-            sp[j].x = (float)(scaleinv * (double)g.x * rr);
-            sp[j].y = (float)(scaleinv * (double)g.x * ri);  // gee, not gvv
+            const float sg = (float)scaleinv * g.x;
+            sp[j].x = sg * rr;
+            sp[j].y = sg * ri;  // gee, not gvv
           }
-          const float p = ms2[j] * ((float)rr * (float)rr + (float)ri * (float)ri);
+          const float p = ms2[j] * (rr * rr + ri * ri);
           const float pg = p * g.x, pv = p * g.y;
           acc[j][0] += pg;
           acc[j][1] = fmaf(-pv, (float)(kx * kx), acc[j][1] + pg);
@@ -858,12 +1332,16 @@ __global__ void k_kspace_h(int nx,int ny,int nz,double kfx,double kfy,double kfz
         for (int j = 0; j < MS; ++j) {
           if (j >= nm) break;
           const float2 g = gp0[j];
-          const double rr = (double)sp[j].x, ri = (double)sp[j].y;
+          // Both operands are float32 already (a float2 table entry and a
+          // float spectrum value), so the fp64 product only bought fp64-pipe
+          // issue slots.
+          const float rr = sp[j].x, ri = sp[j].y;
           if (want_pot) {
-            sp[j].x = (float)(scaleinv * (double)g.x * rr);
-            sp[j].y = (float)(scaleinv * (double)g.x * ri);  // gee, not gvv
+            const float sg = (float)scaleinv * g.x;
+            sp[j].x = sg * rr;
+            sp[j].y = sg * ri;  // gee, not gvv
           }
-          const float p = ms2[j] * ((float)rr * (float)rr + (float)ri * (float)ri);
+          const float p = ms2[j] * (rr * rr + ri * ri);
           const float pg = p * g.x, pv = p * g.y;
           // The diagonal carries gee; the off-diagonal does not.
           acc[j][0] += pg;
@@ -1005,6 +1483,168 @@ __global__ void k_spread_quads(int nlocal,const double*x,const double*boxlo,
     for(int b=0;b<NORD;++b){int gy=wrap(iy0+off+b,ny); double wab=wa*wy[b];
       for(int c=0;c<NORD;++c){int gz=wrap(iz0+off+c,nz);
         atomicAdd(&rho[midx(gx,gy,gz,nx,ny)].x, wab*wz[c]); }}}
+}
+
+// ── Warp-cooperative QuadS kernels on the real / half-spectrum path ──
+// The full-complex, one-thread-per-atom kernels above are the reference; these
+// mirror the B-spline / CubeS2 core: a real density mesh, R2C/C2R transforms,
+// and one warp per atom that strides the (2ν)^3 separable stencil across its 32
+// lanes.  The node table c_qnodes4s/c_qnodes6s carries each node's offsets and
+// its three 1-D indices, sorted so consecutive lanes touch adjacent cells, so
+// the per-node work is three table reads and two multiplies -- the per-atom
+// table QuadsTab holds the 1-D values and slopes.
+template<int NORD>
+__global__ void k_spread_quads_warp_r(int nlocal,const FracNode* fr,
+    const double*q,double rho_scale,int nx,int ny,int nz,
+    unsigned long long*rho){
+  using SL=QSlots<NORD>;
+  constexpr int P=NORD, kTab=9*P;
+  extern __shared__ float sh_tab[];
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  const FracNode& o=fr[i];
+  const int ix0=o.i[0],iy0=o.i[1],iz0=o.i[2];
+  const float tf[3]={o.t[0],o.t[1],o.t[2]};
+  const int base[3]={ix0,iy0,iz0}, n3[3]={nx,ny,nz}, stride[3]={1,nx,nx*ny};
+  QuadsTab<NORD>& T=*reinterpret_cast<QuadsTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_tab<NORD>(T,tf,base,n3,stride,lane);
+  __syncwarp();
+  // Fixed-point (2^40) integer atomics, exactly as the CubeS2 replicated and
+  // the brick spreads: the sum does not depend on the order of the atomics, so
+  // np=1 and np>1 agree bitwise, and the accumulation runs on the fp32 pipe.
+  const float qs=(float)rho_scale*(float)q[i];
+  const float kfs=(float)kFxScale;
+  #pragma unroll
+  for(int round=0;round<SL::kRounds;++round){
+    const int slot=lane+32*round;
+    const bool live=(slot<SL::kSlots);
+    const int ss=live?slot:(SL::kSlots-1);
+    const int g=ss/SL::kPairs, pair=ss-g*SL::kPairs;
+    const int kc=pair%P, kb=pair/P;          // kc = x, kb = y
+    const float vxy=T.v[1][kb]*T.v[0][kc];
+    const int col=T.off[0][kc]+T.off[1][kb];
+    #pragma unroll
+    for(int ka=g;ka<P;ka+=SL::kGroups){
+      if(!live) break;
+      const size_t m=(size_t)col+(size_t)T.off[2][ka];
+      atomicAdd(&rho[m],
+                (unsigned long long)(long long)__float2ll_rn(
+                    qs*vxy*T.v[2][ka]*kfs));
+    }
+  }
+}
+
+// AD gather: value + weight-derivative accumulation, warp-reduced.  The
+// derivative keeps the nx/lx rescale because it differentiates the mesh
+// weights, not the potential.
+template<int NORD>
+__global__ void k_gather_quads_warp_r(int nlocal,const FracNode* fr,
+    const double*q,double qscale,double ilx,double ily,double ilz,int nx,
+    int ny,int nz,const float*pot,int want_pot,double*force,double*vpot,
+    double*red){
+  using SL=QSlots<NORD>;
+  constexpr int P=NORD, kTab=9*P;
+  extern __shared__ float sh_tab[];
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  const FracNode& o=fr[i];
+  const int ix0=o.i[0],iy0=o.i[1],iz0=o.i[2];
+  const float tf[3]={o.t[0],o.t[1],o.t[2]};
+  const int base[3]={ix0,iy0,iz0}, n3[3]={nx,ny,nz}, stride[3]={1,nx,nx*ny};
+  QuadsTab<NORD>& T=*reinterpret_cast<QuadsTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_tab<NORD>(T,tf,base,n3,stride,lane);
+  __syncwarp();
+  // float32 accumulators, as interpolate_owners does: the potential mesh is
+  // float32 and the sums are of O(1) terms.
+  float dtx=0.f,dty=0.f,dtz=0.f,gp=0.f;
+  #pragma unroll
+  for(int round=0;round<SL::kRounds;++round){
+    const int slot=lane+32*round;
+    const bool live=(slot<SL::kSlots);
+    const int ss=live?slot:(SL::kSlots-1);
+    const int g=ss/SL::kPairs, pair=ss-g*SL::kPairs;
+    const int kc=pair%P, kb=pair/P;          // kc = x, kb = y
+    const float vx=T.v[0][kc], vy=T.v[1][kb];
+    const float vxy=vx*vy;
+    const float h0=T.d[0][kc]*vy;            // d/dx weight, y and z hoisted
+    const float h1=vx*T.d[1][kb];            // d/dy weight, x and z hoisted
+    const int col=T.off[0][kc]+T.off[1][kb];
+    #pragma unroll
+    for(int ka=g;ka<P;ka+=SL::kGroups){
+      const float vz=T.v[2][ka];
+      const size_t m=(size_t)col+(size_t)T.off[2][ka];
+      const float u=live?pot[m]:0.f;
+      dtx+=h0*vz*u;
+      dty+=h1*vz*u;
+      dtz+=vxy*T.d[2][ka]*u;
+      gp +=vxy*vz*u;
+    }
+  }
+  #pragma unroll
+  for(int off2=16;off2>0;off2>>=1){
+    dtx+=__shfl_down_sync(0xffffffffu,dtx,off2);
+    dty+=__shfl_down_sync(0xffffffffu,dty,off2);
+    dtz+=__shfl_down_sync(0xffffffffu,dtz,off2);
+    gp +=__shfl_down_sync(0xffffffffu,gp ,off2);
+  }
+  if(lane!=0) return;
+  const double qi=q[i];
+  const double fxs=-qscale*qi*dtx*(double)nx*ilx;
+  const double fys=-qscale*qi*dty*(double)ny*ily;
+  const double fzs=-qscale*qi*dtz*(double)nz*ilz;
+  force[3*i+0]=fxs; force[3*i+1]=fys; force[3*i+2]=fzs;
+  vpot[i]=qscale*gp;
+  (void)red;
+}
+
+// ik gather: the three gradient meshes already hold dphi/dr, so the gather is
+// value-only with no rescale (matching k_gather_cubes2_warp_r_ik).
+template<int NORD>
+__global__ void k_gather_quads_warp_r_ik(int nlocal,const FracNode* fr,
+    const double*q,double qscale,int nx,int ny,int nz,const float*pot,
+    const float*gx,const float*gy,const float*gz,int want_pot,
+    double*force,double*vpot){
+  using SL=QSlots<NORD>;
+  constexpr int P=NORD, kTab=9*P;
+  extern __shared__ float sh_tab[];
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  const FracNode& o=fr[i];
+  const int ix0=o.i[0],iy0=o.i[1],iz0=o.i[2];
+  const float tf[3]={o.t[0],o.t[1],o.t[2]};
+  const int base[3]={ix0,iy0,iz0}, n3[3]={nx,ny,nz}, stride[3]={1,nx,nx*ny};
+  QuadsTab<NORD>& T=*reinterpret_cast<QuadsTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_tab<NORD>(T,tf,base,n3,stride,lane);
+  __syncwarp();
+  float dx=0.f,dy=0.f,dz=0.f,gp=0.f;
+  #pragma unroll
+  for(int round=0;round<SL::kRounds;++round){
+    const int slot=lane+32*round;
+    const bool live=(slot<SL::kSlots);
+    const int ss=live?slot:(SL::kSlots-1);
+    const int g=ss/SL::kPairs, pair=ss-g*SL::kPairs;
+    const int kc=pair%P, kb=pair/P;
+    const float vxy=T.v[1][kb]*T.v[0][kc];
+    const int col=T.off[0][kc]+T.off[1][kb];
+    #pragma unroll
+    for(int ka=g;ka<P;ka+=SL::kGroups){
+      const size_t m=(size_t)col+(size_t)T.off[2][ka];
+      const float w=live?vxy*T.v[2][ka]:0.f;
+      dx+=w*gx[m]; dy+=w*gy[m]; dz+=w*gz[m]; gp+=w*pot[m];
+    }
+  }
+  #pragma unroll
+  for(int off2=16;off2>0;off2>>=1){
+    dx+=__shfl_down_sync(0xffffffffu,dx,off2);
+    dy+=__shfl_down_sync(0xffffffffu,dy,off2);
+    dz+=__shfl_down_sync(0xffffffffu,dz,off2);
+    gp+=__shfl_down_sync(0xffffffffu,gp,off2);
+  }
+  if(lane!=0) return;
+  const double qi=q[i];
+  force[3*i+0]=-qscale*qi*dx; force[3*i+1]=-qscale*qi*dy;
+  force[3*i+2]=-qscale*qi*dz;
+  vpot[i]=qscale*gp;
 }
 
 // green-multiply: 1 thread/grid-point. Builds ik*gf*rho grad meshes + ge*rho potential mesh,
@@ -1201,10 +1841,12 @@ __global__ void k_kspace_f(int nx,int ny,int nz,double lx,double ly,double lz,
 // Nyquist column kh=Nh-1 have no partner (weight 1).  The green tables remain
 // FULL-size in x, so the table index uses the original `nx` stride at column
 // kh (the table only depends on kx^2).
+// Reads the SAME single-precision representations as the replicated solve: a
+// cufftComplex pencil and the packed (green energy, green virial) float2 table.
 __global__ void k_green_pencil(int Nh,int nx,int ny,int nz,int ylo,int YL,
     double lx,double ly,double lz,
-    const cufftDoubleComplex*rho,const double*ge,const double*gf,const double*gv,
-    cufftDoubleComplex*pot,double scaleinv,double*red){
+    const cufftComplex*rho,const float2*gp,
+    cufftComplex*pot,double scaleinv,double*red){
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   const size_t nloc=(size_t)nz*(size_t)Nh*(size_t)YL;
   const bool in_range = (i < nloc);
@@ -1224,8 +1866,8 @@ __global__ void k_green_pencil(int Nh,int nx,int ny,int nz,int ylo,int YL,
   // kx uses the +kh representative; the green table and every acc term depend
   // on kx^2 (or the pair-symmetric kx*ky / kx*kz), so the sign is immaterial.
   double kx=2*M_PI/lx*kh, ky=2*M_PI/ly*kym, kz=2*M_PI/lz*kzm;
-  double geff=gf[gi], gee=ge[gi], gvv=gv[gi];
-  double rr=rho[i].x, ri=rho[i].y, rho2=rr*rr+ri*ri;
+  double gee=(double)gp[gi].x, gvv=(double)gp[gi].y;
+  double rr=(double)rho[i].x, ri=(double)rho[i].y, rho2=rr*rr+ri*ri;
   double s2=scaleinv*scaleinv;
   double acc[7];
   acc[0] = s2*gee*rho2;
@@ -1258,6 +1900,39 @@ __global__ void k_green_pencil(int Nh,int nx,int ny,int nz,int ylo,int YL,
   if(in_range){ pot[i].x=scaleinv*gee*rr; pot[i].y=scaleinv*gee*ri; }
 }
 
+// i*k_a applied to the potential spectrum in the Z-PENCIL layout (same
+// indexing as k_green_pencil: iz fastest, then kh, then this rank's ky slice).
+// This is the slab counterpart of k_mul_ik: the pencil holds every kx (half
+// spectrum) and every kz, with only ky restricted to the rank's y-band, so all
+// three Cartesian multipliers are available here -- which is why the slab
+// differentiates x and y here too instead of after the transpose, where the
+// half spectrum would no longer carry the full 3-D Hermitian partner that the
+// self-conjugate test below needs.
+__global__ void k_ik_pencil(int Nh,int nx,int ny,int nz,int ylo,int YL,
+    double lx,double ly,double lz,const cufftComplex*in,cufftComplex*out,
+    int axis){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  const size_t nloc=(size_t)nz*(size_t)Nh*(size_t)YL;
+  if(i>=nloc) return;
+  const int iz=(int)(i % nz);
+  const int kh=(int)((i/nz) % Nh);
+  const int iyl=(int)(i/((size_t)nz*Nh));
+  const int iy=ylo+iyl;
+  const int kym=iy-ny*((2*iy)/ny), kzm=iz-nz*((2*iz)/nz);
+  const int even_nx=(2*Nh-1!=nx)?1:0;
+  const bool kx_self=(kh==0)||(even_nx&&kh==Nh-1);
+  const bool ky_self=(iy==0)||((ny%2)==0&&iy==ny/2);
+  const bool kz_self=(iz==0)||((nz%2)==0&&iz==nz/2);
+  double ka;
+  if(axis==0) ka=2*M_PI/lx*kh;
+  else if(axis==1) ka=2*M_PI/ly*kym;
+  else ka=2*M_PI/lz*kzm;
+  if((kx_self&&ky_self&&kz_self)||ka==0.0){ out[i].x=0.f; out[i].y=0.f; return; }
+  // (rx + i ry) . i ka = -ka ry + i ka rx, exactly as k_mul_ik.
+  const double rx=(double)in[i].x, ry=(double)in[i].y;
+  out[i].x=(float)(-ka*ry); out[i].y=(float)(ka*rx);
+}
+
 // ── Transpose pack/unpack on the device ────────────────────────────────────
 // The host used to repack the mesh with three nested loops per direction; at a
 // 150^3 mesh that is ~0.5 GB of strided host traffic per step.  These kernels
@@ -1268,7 +1943,7 @@ __global__ void k_green_pencil(int Nh,int nx,int ny,int nz,int ylo,int YL,
 // d owns y in [d*ny/np, (d+1)*ny/np); sender r owns z in [r*nz/np, (r+1)*nz/np).
 // A block is laid out [yl][ix][z_local] with z fastest.
 __global__ void k_pack_xy_to_blocks(int Nh,int ny,int nz,int ZL,int np,
-    const cufftDoubleComplex*cur,cufftDoubleComplex*snd){
+    const cufftComplex*cur,cufftComplex*snd){
   size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   const size_t ntot=(size_t)Nh*ny*ZL;
   if(t>=ntot) return;
@@ -1282,7 +1957,7 @@ __global__ void k_pack_xy_to_blocks(int Nh,int ny,int nz,int ZL,int np,
 }
 
 __global__ void k_unpack_blocks_to_pen(int Nh,int ny,int nz,int np,int YL,
-    const cufftDoubleComplex*rcv,cufftDoubleComplex*pen){
+    const cufftComplex*rcv,cufftComplex*pen){
   size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   const size_t ntot=(size_t)nz*Nh*YL;
   if(t>=ntot) return;
@@ -1297,7 +1972,7 @@ __global__ void k_unpack_blocks_to_pen(int Nh,int ny,int nz,int np,int YL,
 }
 
 __global__ void k_pack_pen_to_blocks(int Nh,int ny,int nz,int np,int YL,
-    const cufftDoubleComplex*pen,cufftDoubleComplex*snd){
+    const cufftComplex*pen,cufftComplex*snd){
   size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   const size_t ntot=(size_t)nz*Nh*YL;
   if(t>=ntot) return;
@@ -1312,7 +1987,7 @@ __global__ void k_pack_pen_to_blocks(int Nh,int ny,int nz,int np,int YL,
 }
 
 __global__ void k_unpack_blocks_to_xy(int Nh,int ny,int ZL,int np,
-    const cufftDoubleComplex*back,cufftDoubleComplex*cur2){
+    const cufftComplex*back,cufftComplex*cur2){
   size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   const size_t ntot=(size_t)Nh*ny*ZL;
   if(t>=ntot) return;
@@ -1379,77 +2054,250 @@ __device__ __forceinline__ size_t bidx(int ix,int iy,int iz,int nx,int ny){
   return (size_t)iz*ny*nx+(size_t)iy*nx+ix;
 }
 
+// Packed 6th-order CubeS2 spread for the distributed brick.  Same 4-atoms/warp
+// table structure as the replicated packed kernel; the brick-local fast path
+// replaces the global-mesh base and falls back to brick_coord at the z halo.
+__global__ void __launch_bounds__(kSpreadWarps * 32)
+k_spread_cubes2_brick_packed6(int nlocal, const FracNode* fr, const double* q,
+                              double rho_scale, int nx, int ny, int nz,
+                              int bxlo, int bxhi, int bylo, int byhi,
+                              int bzlo, int bzhi, unsigned long long* rho) {
+  constexpr int PACK = kSpreadPack;
+  constexpr int NN = 88;
+  const int bnx = bxhi - bxlo + 1, bny = byhi - bylo + 1;
+  __shared__ GpuNode sh_nodes[NN];
+  __shared__ long long sh_off[NN];
+  __shared__ Cs2Tab sh_tab[kSpreadWarps][PACK];
+  __shared__ float sh_t[kSpreadWarps][PACK][3];
+  __shared__ float sh_qs[kSpreadWarps][PACK];
+  __shared__ int sh_ix[kSpreadWarps][PACK];
+  __shared__ int sh_iy[kSpreadWarps][PACK];
+  __shared__ int sh_iz[kSpreadWarps][PACK];
+  __shared__ int sh_intr[kSpreadWarps][PACK];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int t = threadIdx.x; t < NN; t += blockDim.x) {
+    const GpuNode nd = c_nodes6s[t];
+    sh_nodes[t] = nd;
+    sh_off[t] = (long long)nd.dx + (long long)bnx *
+                ((long long)nd.dy + (long long)bny * nd.dz);
+  }
+  __syncthreads();
+  const int a0 = (blockIdx.x * kSpreadWarps + warp) * PACK;
+  if (lane < PACK) {
+    const int i = a0 + lane;
+    if (i < nlocal) {
+      const FracNode& o = fr[i];
+      const int ix0 = o.i[0], iy0 = o.i[1], iz0 = o.i[2];
+      sh_ix[warp][lane] = ix0; sh_iy[warp][lane] = iy0; sh_iz[warp][lane] = iz0;
+      sh_t[warp][lane][0] = o.t[0]; sh_t[warp][lane][1] = o.t[1];
+      sh_t[warp][lane][2] = o.t[2];
+      sh_qs[warp][lane] = (float)rho_scale * (float)q[i];
+      sh_intr[warp][lane] =
+          (ix0 >= 2 && ix0 + 3 < nx && iy0 >= 2 && iy0 + 3 < ny &&
+           iz0 - 2 >= bzlo && iz0 + 3 <= bzhi) ? 1 : 0;
+    } else {
+      sh_ix[warp][lane] = sh_iy[warp][lane] = sh_iz[warp][lane] = 0;
+      sh_t[warp][lane][0] = sh_t[warp][lane][1] = sh_t[warp][lane][2] = 0.f;
+      sh_qs[warp][lane] = 0.f;
+      sh_intr[warp][lane] = 0;
+    }
+  }
+  __syncwarp();
+  if (lane < 6 * PACK) {
+    const int a = lane / 6, q6 = lane - a * 6;
+    const int ax = q6 >> 1, e = q6 & 1;
+    const float tv = sh_t[warp][a][ax];
+    const float arg = e ? (1.f - tv) : tv;
+    const float xi = (float)kXi6;
+    Cs2Tab& T = sh_tab[warp][a];
+    T.elt[ax][e] = arg;
+    T.L111[ax][e] = cs2_L111_6(arg, xi);
+    T.L311[ax][e] = cs2_L311_6(arg, xi);
+    T.S6[ax][e] = cs2_S6(arg, xi);
+    T.R[ax][e] = cs2_R(arg, xi);
+    T.L211[ax][e] = (float)(-0.25 * (double)T.L111[ax][e] -
+                            2.5 * (double)T.L311[ax][e]);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int src = (i == 2) ? 0 : 1;
+      T.eta[ax][i] = T.elt[ax][src];
+      T.S6eta[ax][i] = T.S6[ax][src];
+    }
+  }
+  __syncwarp();
+  const float kfs = (float)kFxScale;
+  #pragma unroll
+  for (int a = 0; a < PACK; ++a) {
+    const float qs = sh_qs[warp][a];
+    if (qs == 0.f) continue;
+    const Cs2Tab& T = sh_tab[warp][a];
+    const int ix0 = sh_ix[warp][a], iy0 = sh_iy[warp][a], iz0 = sh_iz[warp][a];
+    const bool interior = sh_intr[warp][a] != 0;
+    const long long base = (long long)(ix0 - bxlo) + (long long)bnx *
+        ((long long)(iy0 - bylo) + (long long)bny * (iz0 - bzlo));
+    #pragma unroll
+    for (int k = lane; k < NN; k += 32) {
+      const GpuNode& nd = sh_nodes[k];
+      const float w = cs2_w6_tab(T, nd);
+      if (w == 0.f) continue;
+      const unsigned long long val =
+          (unsigned long long)(long long)__float2ll_rn(qs * w * kfs);
+      if (interior) {
+        atomicAdd(&rho[base + sh_off[k]], val);
+      } else {
+        const int gx = brick_coord(ix0 + nd.dx, nx, bxlo, bxhi);
+        const int gy = brick_coord(iy0 + nd.dy, ny, bylo, byhi);
+        const int gz = brick_coord(iz0 + nd.dz, nz, bzlo, bzhi);
+        if (gx < 0 || gy < 0 || gz < 0) continue;
+        atomicAdd(&rho[bidx(gx, gy, gz, bnx, bny)], val);
+      }
+    }
+  }
+}
+
 template<int ORD>
-__global__ void k_spread_cubes2_brick(int nlocal,const double*x,
-    double xlo,double ylo,double zlo,double lx,double ly,double lz,
+__global__ void k_spread_cubes2_brick(int nlocal,const FracNode* fr,
     const double*q,double rho_scale,int nx,int ny,int nz,
-    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,double*rho){
-  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
-  double fx=periodic_frac(x[3*i+0],xlo,lx)*nx;
-  double fy=periodic_frac(x[3*i+1],ylo,ly)*ny;
-  double fz=periodic_frac(x[3*i+2],zlo,lz)*nz;
-  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0,qs=rho_scale*q[i];
-  int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
-  const int NN=(ORD==4)?32:88; const double xi=(ORD==4)?kXi4:kXi6;
-  for(int k=0;k<NN;++k){
-    GpuNode nd=(ORD==4)?c_nodes4[k]:c_nodes6[k];
-    double w=(ORD==4)?cs2_w4(tx,ty,tz,nd,xi):cs2_w6(tx,ty,tz,nd,xi);
-    if(w==0.0) continue;
-    int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
-    int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
-    int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
-    if(gx>=0&&gy>=0&&gz>=0) atomicAdd(&rho[bidx(gx,gy,gz,bnx,bny)],qs*w);
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,
+    unsigned long long*rho){
+  // One warp per atom with the per-atom value table, the structure of the
+  // replicated spread.  The one-thread-per-atom form this used to have
+  // evaluated cs2_w4/cs2_w6 once per node per atom (whose literals are double,
+  // so on the fp64 pipe) and gave each atom a single thread to hide 88
+  // dependent loads behind.
+  constexpr int NN=(ORD==4)?32:88, kTabF=(ORD==4)?30:60;
+  __shared__ GpuNode sh_nodes[88];
+  extern __shared__ float sh_tab[];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
+    sh_nodes[t]=(ORD==4)?c_nodes4s[t]:c_nodes6s[t];
+  __syncthreads();
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  float* slot=sh_tab+warp*kTabF;
+  if(ORD==4){
+    Cs2Tab4& T=*reinterpret_cast<Cs2Tab4*>(slot);
+    cs2_fill_tab4(T,tf,(float)kXi4,lane);
+  } else {
+    Cs2Tab& T=*reinterpret_cast<Cs2Tab*>(slot);
+    cs2_fill_tab_par(T,tf[0],tf[1],tf[2],(float)kXi6,lane);
+  }
+  __syncwarp();
+  const Cs2Tab4* T4=reinterpret_cast<const Cs2Tab4*>(slot);
+  const Cs2Tab* T6=reinterpret_cast<const Cs2Tab*>(slot);
+  // Fixed-point (2^40) integer atomics, exactly as the replicated spread: the
+  // accumulation is reproducible and runs on the fp32 pipe.
+  const float qs=(float)rho_scale*(float)q[i];
+  const float kfs=(float)kFxScale;
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  for(int k=lane;k<NN;k+=32){
+    const GpuNode& nd=sh_nodes[k];
+    const float w=(ORD==4)?cs2_w4_tab(*T4,nd):cs2_w6_tab(*T6,nd);
+    if(w==0.f) continue;
+    const int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
+    const int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
+    const int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
+    if(gx>=0&&gy>=0&&gz>=0)
+      atomicAdd(&rho[bidx(gx,gy,gz,bnx,bny)],
+                (unsigned long long)(long long)__float2ll_rn(qs*w*kfs));
   }
 }
 
 template<int NORD>
-__global__ void k_spread_quads_brick(int nlocal,const double*x,
-    double xlo,double ylo,double zlo,double lx,double ly,double lz,
+__global__ void k_spread_quads_brick(int nlocal,const FracNode* fr,
     const double*q,double rho_scale,int nx,int ny,int nz,
-    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,double*rho){
-  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
-  double fx=periodic_frac(x[3*i+0],xlo,lx)*nx;
-  double fy=periodic_frac(x[3*i+1],ylo,ly)*ny;
-  double fz=periodic_frac(x[3*i+2],zlo,lz)*nz;
-  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0,qs=rho_scale*q[i];
-  double wx[NORD],wy[NORD],wz[NORD];
-  if(NORD==4){quads4_w(tx,wx);quads4_w(ty,wy);quads4_w(tz,wz);}
-  else {quads6_w(tx,wx);quads6_w(ty,wy);quads6_w(tz,wz);}
-  int off=(NORD==4)?-1:-2,bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
-  for(int a=0;a<NORD;++a){int gx=brick_coord(ix0+off+a,nx,bxlo,bxhi);if(gx<0)continue;
-    for(int b=0;b<NORD;++b){int gy=brick_coord(iy0+off+b,ny,bylo,byhi);if(gy<0)continue;
-      for(int c=0;c<NORD;++c){int gz=brick_coord(iz0+off+c,nz,bzlo,bzhi);if(gz<0)continue;
-        atomicAdd(&rho[bidx(gx,gy,gz,bnx,bny)],qs*wx[a]*wy[b]*wz[c]);}}}
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,
+    unsigned long long*rho){
+  constexpr int P=NORD, NN=P*P*P, kTab=9*P;
+  __shared__ QNodeS sh_nodes[216];
+  extern __shared__ float sh_tab[];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
+    sh_nodes[t]=(NORD==4)?c_qnodes4s[t]:c_qnodes6s[t];
+  __syncthreads();
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  QuadsTab<NORD>& T=*reinterpret_cast<QuadsTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_tab_values<NORD>(T,tf,lane);
+  __syncwarp();
+  const float qs=(float)rho_scale*(float)q[i];
+  const float kfs=(float)kFxScale;
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  for(int k=lane;k<NN;k+=32){
+    const QNodeS& nd=sh_nodes[k];
+    const float w=T.v[0][nd.a]*T.v[1][nd.b]*T.v[2][nd.c];
+    if(w==0.f) continue;
+    const int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
+    const int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
+    const int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
+    if(gx>=0&&gy>=0&&gz>=0)
+      atomicAdd(&rho[bidx(gx,gy,gz,bnx,bny)],
+                (unsigned long long)(long long)__float2ll_rn(qs*w*kfs));
+  }
 }
 
 template<int ORD>
-__global__ void k_gather_cubes2_brick(int nlocal,const double*x,
-    double xlo,double ylo,double zlo,double lx,double ly,double lz,
+__global__ void k_gather_cubes2_brick(int nlocal,const FracNode* fr,
+    double lx,double ly,double lz,
     const double*q,double qscale,int nx,int ny,int nz,
-    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,const double*u,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,const float*u,
     double*force,double*vpot){
-  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
-  double fx=periodic_frac(x[3*i+0],xlo,lx)*nx;
-  double fy=periodic_frac(x[3*i+1],ylo,ly)*ny;
-  double fz=periodic_frac(x[3*i+2],zlo,lz)*nz;
-  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0,dtx=0,dty=0,dtz=0,gp=0;
-  int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
-  const int NN=(ORD==4)?32:88; const double xi=(ORD==4)?kXi4:kXi6;
-  for(int k=0;k<NN;++k){
-    GpuNode nd=(ORD==4)?c_nodes4[k]:c_nodes6[k];
-    GpuWeightGrad wg=(ORD==4)?cs2_wg4(tx,ty,tz,nd,xi):cs2_wg6(tx,ty,tz,nd,xi);
-    if(wg.v==0.0) continue;
-    int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
-    int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
-    int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
+  constexpr int NN=(ORD==4)?32:88;
+  __shared__ GpuNode sh_nodes[88];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
+    sh_nodes[t]=(ORD==4)?c_nodes4s[t]:c_nodes6s[t];
+  __syncthreads();
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  float dtx=0.f,dty=0.f,dtz=0.f,gp=0.f;
+  for(int k=lane;k<NN;k+=32){
+    const GpuNode& nd=sh_nodes[k];
+    const GpuWeightGrad wg=(ORD==4)
+        ?cs2_wg4(tf[0],tf[1],tf[2],nd,(float)kXi4)
+        :cs2_wg6(tf[0],tf[1],tf[2],nd,(float)kXi6);
+    if(wg.v==0.f) continue;
+    const int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
+    const int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
+    const int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
     if(gx<0||gy<0||gz<0) continue;
-    double up=u[bidx(gx,gy,gz,bnx,bny)];
+    const float up=u[bidx(gx,gy,gz,bnx,bny)];
     dtx+=wg.dx*up;dty+=wg.dy*up;dtz+=wg.dz*up;gp+=wg.v*up;
   }
-  double qi=q[i];
+  #pragma unroll
+  for(int off=16;off>0;off>>=1){
+    dtx+=__shfl_down_sync(0xffffffffu,dtx,off);
+    dty+=__shfl_down_sync(0xffffffffu,dty,off);
+    dtz+=__shfl_down_sync(0xffffffffu,dtz,off);
+    gp +=__shfl_down_sync(0xffffffffu,gp ,off);
+  }
+  if(lane!=0) return;
+  const double qi=q[i];
   force[3*i+0]=-qscale*qi*dtx*nx/lx;
   force[3*i+1]=-qscale*qi*dty*ny/ly;
   force[3*i+2]=-qscale*qi*dtz*nz/lz;
@@ -1457,28 +2305,55 @@ __global__ void k_gather_cubes2_brick(int nlocal,const double*x,
 }
 
 template<int NORD>
-__global__ void k_gather_quads_brick(int nlocal,const double*x,
-    double xlo,double ylo,double zlo,double lx,double ly,double lz,
+__global__ void k_gather_quads_brick(int nlocal,const FracNode* fr,
+    double lx,double ly,double lz,
     const double*q,double qscale,int nx,int ny,int nz,
-    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,const double*u,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,const float*u,
     double*force,double*vpot){
-  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
-  double fx=periodic_frac(x[3*i+0],xlo,lx)*nx;
-  double fy=periodic_frac(x[3*i+1],ylo,ly)*ny;
-  double fz=periodic_frac(x[3*i+2],zlo,lz)*nz;
-  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
-  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0,dtx=0,dty=0,dtz=0,gp=0;
-  double wx[NORD],wy[NORD],wz[NORD],dwx[NORD],dwy[NORD],dwz[NORD];
-  if(NORD==4){quads4_wd(tx,wx,dwx);quads4_wd(ty,wy,dwy);quads4_wd(tz,wz,dwz);}
-  else {quads6_wd(tx,wx,dwx);quads6_wd(ty,wy,dwy);quads6_wd(tz,wz,dwz);}
-  int off=(NORD==4)?-1:-2,bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
-  for(int a=0;a<NORD;++a){int gx=brick_coord(ix0+off+a,nx,bxlo,bxhi);if(gx<0)continue;
-    for(int b=0;b<NORD;++b){int gy=brick_coord(iy0+off+b,ny,bylo,byhi);if(gy<0)continue;
-      for(int c=0;c<NORD;++c){int gz=brick_coord(iz0+off+c,nz,bzlo,bzhi);if(gz<0)continue;
-        double up=u[bidx(gx,gy,gz,bnx,bny)];
-        dtx+=dwx[a]*wy[b]*wz[c]*up;dty+=wx[a]*dwy[b]*wz[c]*up;
-        dtz+=wx[a]*wy[b]*dwz[c]*up;gp+=wx[a]*wy[b]*wz[c]*up;}}}
-  double qi=q[i];
+  constexpr int P=NORD, NN=P*P*P, kTab=9*P;
+  __shared__ QNodeS sh_nodes[216];
+  extern __shared__ float sh_tab[];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
+    sh_nodes[t]=(NORD==4)?c_qnodes4s[t]:c_qnodes6s[t];
+  __syncthreads();
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  QuadsTab<NORD>& T=*reinterpret_cast<QuadsTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_tab_values<NORD>(T,tf,lane);
+  __syncwarp();
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  float dtx=0.f,dty=0.f,dtz=0.f,gp=0.f;
+  for(int k=lane;k<NN;k+=32){
+    const QNodeS& nd=sh_nodes[k];
+    const int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
+    const int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
+    const int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
+    if(gx<0||gy<0||gz<0) continue;
+    const float up=u[bidx(gx,gy,gz,bnx,bny)];
+    const float vx=T.v[0][nd.a],vy=T.v[1][nd.b],vz=T.v[2][nd.c];
+    dtx+=T.d[0][nd.a]*vy*vz*up;
+    dty+=vx*T.d[1][nd.b]*vz*up;
+    dtz+=vx*vy*T.d[2][nd.c]*up;
+    gp +=vx*vy*vz*up;
+  }
+  #pragma unroll
+  for(int off=16;off>0;off>>=1){
+    dtx+=__shfl_down_sync(0xffffffffu,dtx,off);
+    dty+=__shfl_down_sync(0xffffffffu,dty,off);
+    dtz+=__shfl_down_sync(0xffffffffu,dtz,off);
+    gp +=__shfl_down_sync(0xffffffffu,gp ,off);
+  }
+  if(lane!=0) return;
+  const double qi=q[i];
   force[3*i+0]=-qscale*qi*dtx*nx/lx;
   force[3*i+1]=-qscale*qi*dty*ny/ly;
   force[3*i+2]=-qscale*qi*dtz*nz/lz;
@@ -1488,6 +2363,655 @@ __global__ void k_gather_quads_brick(int nlocal,const double*x,
 __global__ void k_zero_complex(cufftDoubleComplex*a,size_t n){
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i<n){a[i].x=0;a[i].y=0;}
 }
+
+// ── ik gather on the local brick ──
+// The Fourier-differentiated force reads the gradient meshes with the VALUE
+// weights only: dphi/dr_a is already in physical units, so there is no nx/lx
+// factor here (the AD gather above multiplies its fractional-space derivative
+// by nx/lx instead).  One component per launch: the solve keeps a single
+// gradient brick and reuses it for x, y and z in turn.
+template<int ORD>
+__global__ void k_gather_cubes2_brick_ik(int nlocal,const FracNode* fr,
+    const double*q,double qscale,int nx,int ny,int nz,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,
+    const float*u,const float*g,int comp,int want_pot,
+    double*force,double*vpot){
+  constexpr int NN=(ORD==4)?32:88, kTabF=(ORD==4)?30:60;
+  __shared__ GpuNode sh_nodes[88];
+  extern __shared__ float sh_tab[];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
+    sh_nodes[t]=(ORD==4)?c_nodes4s[t]:c_nodes6s[t];
+  __syncthreads();
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  float* slot=sh_tab+warp*kTabF;
+  if(ORD==4){
+    Cs2Tab4& T=*reinterpret_cast<Cs2Tab4*>(slot);
+    cs2_fill_tab4(T,tf,(float)kXi4,lane);
+  } else {
+    Cs2Tab& T=*reinterpret_cast<Cs2Tab*>(slot);
+    cs2_fill_tab_par(T,tf[0],tf[1],tf[2],(float)kXi6,lane);
+  }
+  __syncwarp();
+  const Cs2Tab4* T4=reinterpret_cast<const Cs2Tab4*>(slot);
+  const Cs2Tab* T6=reinterpret_cast<const Cs2Tab*>(slot);
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  float s=0.f,gp=0.f;
+  for(int k=lane;k<NN;k+=32){
+    const GpuNode& nd=sh_nodes[k];
+    const float w=(ORD==4)?cs2_w4_tab(*T4,nd):cs2_w6_tab(*T6,nd);
+    if(w==0.f) continue;
+    const int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
+    const int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
+    const int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
+    if(gx<0||gy<0||gz<0) continue;
+    const size_t m=bidx(gx,gy,gz,bnx,bny);
+    s+=w*g[m];
+    if(want_pot) gp+=w*u[m];
+  }
+  #pragma unroll
+  for(int off=16;off>0;off>>=1){
+    s +=__shfl_down_sync(0xffffffffu,s ,off);
+    gp+=__shfl_down_sync(0xffffffffu,gp,off);
+  }
+  if(lane!=0) return;
+  force[3*i+comp]=-qscale*q[i]*s;
+  if(want_pot) vpot[i]=qscale*gp;
+}
+
+template<int NORD>
+__global__ void k_gather_quads_brick_ik(int nlocal,const FracNode* fr,
+    const double*q,double qscale,int nx,int ny,int nz,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,
+    const float*u,const float*g,int comp,int want_pot,
+    double*force,double*vpot){
+  constexpr int P=NORD, NN=P*P*P, kTab=9*P;
+  __shared__ QNodeS sh_nodes[216];
+  extern __shared__ float sh_tab[];
+  for(int t=threadIdx.x;t<NN;t+=blockDim.x)
+    sh_nodes[t]=(NORD==4)?c_qnodes4s[t]:c_qnodes6s[t];
+  __syncthreads();
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  QuadsTab<NORD>& T=*reinterpret_cast<QuadsTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_tab_values<NORD>(T,tf,lane);
+  __syncwarp();
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  float s=0.f,gp=0.f;
+  for(int k=lane;k<NN;k+=32){
+    const QNodeS& nd=sh_nodes[k];
+    const int gx=brick_coord(ix0+nd.dx,nx,bxlo,bxhi);
+    const int gy=brick_coord(iy0+nd.dy,ny,bylo,byhi);
+    const int gz=brick_coord(iz0+nd.dz,nz,bzlo,bzhi);
+    if(gx<0||gy<0||gz<0) continue;
+    const float w=T.v[0][nd.a]*T.v[1][nd.b]*T.v[2][nd.c];
+    if(w==0.f) continue;
+    const size_t m=bidx(gx,gy,gz,bnx,bny);
+    s+=w*g[m];
+    if(want_pot) gp+=w*u[m];
+  }
+  #pragma unroll
+  for(int off=16;off>0;off>>=1){
+    s +=__shfl_down_sync(0xffffffffu,s ,off);
+    gp+=__shfl_down_sync(0xffffffffu,gp,off);
+  }
+  if(lane!=0) return;
+  force[3*i+comp]=-qscale*q[i]*s;
+  if(want_pot) vpot[i]=qscale*gp;
+}
+
+// ── B-spline brick stencils (cardinal B-spline of order NORD) ──────────────
+// Ported from the deployed LAMMPS GPU B-spline path; same Cox-de Boor
+// recurrence as the CPU mesh_sum.cu weights, so the slab solve and the
+// replicated SPME evaluate the same assignment.  The B-spline reaches NORD
+// points per axis starting at floor(u) - (NORD-1)/2, matching the
+// assignment factor |D_d(m)|^-2 that build_green_slab_half inverts.
+template<int N>
+__device__ __forceinline__ void bspline_w1d(double frac,double*w){
+  w[0]=1.0-frac; w[1]=frac;
+  #pragma unroll
+  for(int j=2;j<N;++j) w[j]=0.0;
+  #pragma unroll
+  for(int k=3;k<=N;++k){
+    const double inv=1.0/(double)(k-1);
+    double wp[8];
+    #pragma unroll
+    for(int j=0;j<N;++j) wp[j]=w[j];
+    w[k-1]=frac*wp[k-2]*inv;
+    #pragma unroll
+    for(int j=1;j<=k-2;++j)
+      w[k-1-j]=((frac+(double)j)*wp[k-2-j]+((double)(k-j)-frac)*wp[k-1-j])*inv;
+    w[0]=(1.0-frac)*wp[0]*inv;
+  }
+}
+
+template<int N>
+__device__ __forceinline__ void bspline_w1d_d(double frac,double*w,double*dw){
+  w[0]=1.0-frac; dw[0]=-1.0;
+  w[1]=frac;     dw[1]=1.0;
+  #pragma unroll
+  for(int j=2;j<N;++j){ w[j]=0.0; dw[j]=0.0; }
+  #pragma unroll
+  for(int k=3;k<=N;++k){
+    const double inv=1.0/(double)(k-1);
+    double wp[8],dwp[8];
+    #pragma unroll
+    for(int j=0;j<N;++j){ wp[j]=w[j]; dwp[j]=dw[j]; }
+    w[k-1]=frac*wp[k-2]*inv;
+    dw[k-1]=(wp[k-2]+frac*dwp[k-2])*inv;
+    #pragma unroll
+    for(int j=1;j<=k-2;++j){
+      w[k-1-j]=((frac+(double)j)*wp[k-2-j]+((double)(k-j)-frac)*wp[k-1-j])*inv;
+      dw[k-1-j]=(wp[k-2-j]+(frac+(double)j)*dwp[k-2-j]
+                 -wp[k-1-j]+((double)(k-j)-frac)*dwp[k-1-j])*inv;
+    }
+    w[0]=(1.0-frac)*wp[0]*inv;
+    dw[0]=(-wp[0]+(1.0-frac)*dwp[0])*inv;
+  }
+}
+
+template<int NORD>
+__global__ void k_spread_bspline_brick(int nlocal,const FracNode* fr,
+    const double*q,double rho_scale,int nx,int ny,int nz,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,
+    unsigned long long*rho){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
+  const float qs=(float)rho_scale*(float)q[i];
+  const float kfs=(float)kFxScale;
+  double wx[NORD],wy[NORD],wz[NORD];
+  bspline_w1d<NORD>(tx,wx); bspline_w1d<NORD>(ty,wy); bspline_w1d<NORD>(tz,wz);
+  const int half=(NORD-1)/2, bnx=bxhi-bxlo+1, bny=byhi-bylo+1;
+  for(int a=0;a<NORD;++a){ int gx=brick_coord(ix0-half+a,nx,bxlo,bxhi); if(gx<0)continue;
+    for(int b=0;b<NORD;++b){ int gy=brick_coord(iy0-half+b,ny,bylo,byhi); if(gy<0)continue;
+      for(int c=0;c<NORD;++c){ int gz=brick_coord(iz0-half+c,nz,bzlo,bzhi); if(gz<0)continue;
+        atomicAdd(&rho[bidx(gx,gy,gz,bnx,bny)],
+                  (unsigned long long)(long long)__float2ll_rn(
+                      qs*(float)(wx[a]*wy[b]*wz[c])*kfs)); } } }
+}
+
+template<int NORD>
+__global__ void k_gather_bspline_brick(int nlocal,const FracNode* fr,
+    double lx,double ly,double lz,
+    const double*q,double qscale,int nx,int ny,int nz,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,const float*u,
+    double*force,double*vpot){
+  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=nlocal) return;
+  // The fractional coordinate comes from the per-step FracNode cache: three
+  // fp64 divisions per atom in this prologue were, on a card whose fp64 pipe is
+  // 1/32 of the fp32 one, the dominant cost of the distributed kernels.
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  double tx=fx-ix0,ty=fy-iy0,tz=fz-iz0;
+  double wx[NORD],wy[NORD],wz[NORD],dwx[NORD],dwy[NORD],dwz[NORD];
+  bspline_w1d_d<NORD>(tx,wx,dwx); bspline_w1d_d<NORD>(ty,wy,dwy);
+  bspline_w1d_d<NORD>(tz,wz,dwz);
+  const int half=(NORD-1)/2, bnx=bxhi-bxlo+1, bny=byhi-bylo+1;
+  double dtx=0,dty=0,dtz=0,gp=0;
+  for(int a=0;a<NORD;++a){ int gx=brick_coord(ix0-half+a,nx,bxlo,bxhi); if(gx<0)continue;
+    for(int b=0;b<NORD;++b){ int gy=brick_coord(iy0-half+b,ny,bylo,byhi); if(gy<0)continue;
+      for(int c=0;c<NORD;++c){ int gz=brick_coord(iz0-half+c,nz,bzlo,bzhi); if(gz<0)continue;
+        double up=(double)u[bidx(gx,gy,gz,bnx,bny)];
+        double wyz=wy[b]*wz[c], wxz=wx[a]*wz[c], wxy=wx[a]*wy[b];
+        gp+=wx[a]*wyz*up; dtx+=dwx[a]*wyz*up; dty+=dwy[b]*wxz*up; dtz+=dwz[c]*wxy*up; } } }
+  double qi=q[i];
+  force[3*i+0]=-qscale*qi*dtx*nx/lx;
+  force[3*i+1]=-qscale*qi*dty*ny/ly;
+  force[3*i+2]=-qscale*qi*dtz*nz/lz;
+  vpot[i]=qscale*gp;
+}
+
+
+// ── CubeS2 four-term AD gather ─────────────────────────────────────────────
+// The non-separable CubeS2 window is a sum of at most four products of 1-D
+// functions.  Evaluate those 1-D values and slopes once per atom into a
+// shared table, then contract four terms per node with no class branch.  The
+// per-node table is a packed uint4 of four (kind, e) triples.  The generator
+// below checks itself against sog_spline.h at create time.
+struct Cs2Factor { int kind; int e; };
+struct Cs2Term { Cs2Factor f[3]; };
+
+__constant__ uint4 c_cs2_terms[2][96];
+__constant__ float c_poly[2][7][6];
+__constant__ float c_dpoly[2][7][6];
+
+struct Cs2Basis {
+  float v[7][3][2];
+  float d[7][3][2];
+};
+
+__device__ __forceinline__ void fill_cs2_basis(Cs2Basis& B, int ord, int kind,
+                                               int axis, int e, float t) {
+  const int oi = (ord == 4) ? 0 : 1;
+  const float x = e ? (1.f - t) : t;
+  const float* c = c_poly[oi][kind];
+  const float* dc = c_dpoly[oi][kind];
+  float v = c[5], d = dc[5];
+  #pragma unroll
+  for (int k = 4; k >= 0; --k) { v = fmaf(v, x, c[k]); d = fmaf(d, x, dc[k]); }
+  const float s = e ? -1.f : 1.f;
+  B.v[kind][axis][e] = v;
+  B.d[kind][axis][e] = d * s;
+}
+
+template <int ORD>
+__global__ void __launch_bounds__(256)
+k_gather_cubes2_term(int nlocal, const FracNode* fr, const double* q,
+                     double qscale, double ilx, double ily, double ilz,
+                     int nx, int ny, int nz, const float* pot, int want_pot,
+                     double* force, double* vpot) {
+  constexpr int NN = (ORD == 4) ? 32 : 88;
+  __shared__ GpuNode sh_nodes[88];
+  __shared__ long long sh_off[88];
+  __shared__ uint4 sh_T[96];
+  __shared__ Cs2Basis sh_basis[8];
+  __shared__ float sh_t[8][3];
+  __shared__ int sh_i[8][3];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int i = blockIdx.x * 8 + warp;
+  for (int t = threadIdx.x; t < NN; t += blockDim.x) {
+    const GpuNode nd = (ORD == 4) ? c_nodes4s[t] : c_nodes6s[t];
+    sh_nodes[t] = nd;
+    sh_off[t] = static_cast<long long>(nd.dx) +
+                static_cast<long long>(nx) *
+                    (nd.dy + static_cast<long long>(ny) * nd.dz);
+  }
+  for (int n = threadIdx.x; n < 96; n += blockDim.x)
+    sh_T[n] = c_cs2_terms[(ORD == 4) ? 0 : 1][n];
+  if (lane < 3) {
+    const int a = warp;
+    sh_t[a][lane] = (i < nlocal) ? fr[i].t[lane] : 0.f;
+    sh_i[a][lane] = (i < nlocal) ? fr[i].i[lane] : 0;
+  }
+  __syncthreads();
+  for (int s = threadIdx.x; s < 8 * 42; s += blockDim.x) {
+    const int a = s / 42, r = s - a * 42;
+    const int kind = r / 6, qt = r - kind * 6;
+    fill_cs2_basis(sh_basis[a], ORD, kind, qt >> 1, qt & 1, sh_t[a][qt >> 1]);
+  }
+  __syncthreads();
+  if (i >= nlocal) return;
+  const int ix0 = sh_i[warp][0], iy0 = sh_i[warp][1], iz0 = sh_i[warp][2];
+  const bool interior = ix0 >= 2 && ix0 + 3 < nx && iy0 >= 2 && iy0 + 3 < ny &&
+                        iz0 >= 2 && iz0 + 3 < nz;
+  const long long base = interior
+      ? static_cast<long long>(ix0) +
+            static_cast<long long>(nx) * (iy0 + static_cast<long long>(ny) * iz0)
+      : 0;
+  const Cs2Basis& B = sh_basis[warp];
+  float dtx = 0.f, dty = 0.f, dtz = 0.f, gp = 0.f;
+  #pragma unroll
+  for (int round = 0; round < 3; ++round) {
+    const int k = lane + 32 * round;
+    const bool live = (k < NN);
+    const int kn = live ? k : (NN - 1);
+    const GpuNode& nd = sh_nodes[kn];
+    const long long m = interior
+        ? base + sh_off[kn]
+        : static_cast<long long>(midx(wrap_near(ix0 + nd.dx, nx),
+                                      wrap_near(iy0 + nd.dy, ny),
+                                      wrap_near(iz0 + nd.dz, nz), nx, ny));
+    const float u = live ? pot[m] : 0.f;
+    const uint4 T = sh_T[live ? k : 95];
+    float w = 0.f, gx = 0.f, gy = 0.f, gz = 0.f;
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const unsigned word = (t == 0) ? T.x : (t == 1) ? T.y : (t == 2) ? T.z : T.w;
+      const int ix = word & 0xff, iy = (word >> 8) & 0xff, iz = (word >> 16) & 0xff;
+      const float ax = B.v[ix & 7][0][(ix >> 3) & 1];
+      const float ay = B.v[iy & 7][1][(iy >> 3) & 1];
+      const float az = B.v[iz & 7][2][(iz >> 3) & 1];
+      w += ax * ay * az;
+      gx += B.d[ix & 7][0][(ix >> 3) & 1] * ay * az;
+      gy += ax * B.d[iy & 7][1][(iy >> 3) & 1] * az;
+      gz += ax * ay * B.d[iz & 7][2][(iz >> 3) & 1];
+    }
+    gp += w * u; dtx += gx * u; dty += gy * u; dtz += gz * u;
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    dtx += __shfl_down_sync(0xffffffffu, dtx, off);
+    dty += __shfl_down_sync(0xffffffffu, dty, off);
+    dtz += __shfl_down_sync(0xffffffffu, dtz, off);
+    gp += __shfl_down_sync(0xffffffffu, gp, off);
+  }
+  if (lane != 0) return;
+  const double qi = q[i];
+  force[3 * i + 0] = -qscale * qi * dtx * nx * ilx;
+  force[3 * i + 1] = -qscale * qi * dty * ny * ily;
+  force[3 * i + 2] = -qscale * qi * dtz * nz * ilz;
+  vpot[i] = qscale * gp;
+}
+
+// Term-table gather for the distributed brick: the same four-term contraction
+// as the replicated order-6 gather, with a brick-local fast path and
+// brick_coord only on the z-halo/slow atoms.
+__global__ void __launch_bounds__(256)
+k_gather_cubes2_term_brick6(int nlocal, const FracNode* fr, const double* q,
+                            double qscale, double lx, double ly, double lz,
+                            int nx, int ny, int nz, int bxlo, int bxhi,
+                            int bylo, int byhi, int bzlo, int bzhi,
+                            const float* pot, double* force, double* vpot) {
+  constexpr int NN = 88;
+  const int bnx = bxhi - bxlo + 1, bny = byhi - bylo + 1;
+  __shared__ GpuNode sh_nodes[NN];
+  __shared__ long long sh_off[NN];
+  __shared__ uint4 sh_T[96];
+  __shared__ Cs2Basis sh_basis[8];
+  __shared__ float sh_t[8][3];
+  __shared__ int sh_i[8][3];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int i = blockIdx.x * 8 + warp;
+  for (int t = threadIdx.x; t < NN; t += blockDim.x) {
+    const GpuNode nd = c_nodes6s[t];
+    sh_nodes[t] = nd;
+    sh_off[t] = (long long)nd.dx + (long long)bnx *
+                ((long long)nd.dy + (long long)bny * nd.dz);
+  }
+  for (int n = threadIdx.x; n < 96; n += blockDim.x)
+    sh_T[n] = c_cs2_terms[1][n];
+  if (lane < 3) {
+    const int a = warp;
+    sh_t[a][lane] = (i < nlocal) ? fr[i].t[lane] : 0.f;
+    sh_i[a][lane] = (i < nlocal) ? fr[i].i[lane] : 0;
+  }
+  __syncthreads();
+  for (int s = threadIdx.x; s < 8 * 42; s += blockDim.x) {
+    const int a = s / 42, r = s - a * 42;
+    const int kind = r / 6, qt = r - kind * 6;
+    fill_cs2_basis(sh_basis[a], 6, kind, qt >> 1, qt & 1, sh_t[a][qt >> 1]);
+  }
+  __syncthreads();
+  if (i >= nlocal) return;
+  const int ix0 = sh_i[warp][0], iy0 = sh_i[warp][1], iz0 = sh_i[warp][2];
+  const bool interior = ix0 >= 2 && ix0 + 3 < nx && iy0 >= 2 && iy0 + 3 < ny &&
+                        iz0 - 2 >= bzlo && iz0 + 3 <= bzhi;
+  const long long base = (long long)(ix0 - bxlo) + (long long)bnx *
+      ((long long)(iy0 - bylo) + (long long)bny * (iz0 - bzlo));
+  const Cs2Basis& B = sh_basis[warp];
+  float dtx = 0.f, dty = 0.f, dtz = 0.f, gp = 0.f;
+  #pragma unroll
+  for (int round = 0; round < 3; ++round) {
+    const int k = lane + 32 * round;
+    const bool live = (k < NN);
+    const int kn = live ? k : (NN - 1);
+    const GpuNode& nd = sh_nodes[kn];
+    long long m = 0;
+    if (interior) {
+      m = base + sh_off[kn];
+    } else {
+      const int gx = brick_coord(ix0 + nd.dx, nx, bxlo, bxhi);
+      const int gy = brick_coord(iy0 + nd.dy, ny, bylo, byhi);
+      const int gz = brick_coord(iz0 + nd.dz, nz, bzlo, bzhi);
+      if (gx < 0 || gy < 0 || gz < 0) continue;
+      m = (long long)bidx(gx, gy, gz, bnx, bny);
+    }
+    const float u = live ? pot[m] : 0.f;
+    const uint4 T = sh_T[live ? k : 95];
+    float w = 0.f, gx = 0.f, gy = 0.f, gz = 0.f;
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const unsigned word = (t == 0) ? T.x : (t == 1) ? T.y : (t == 2) ? T.z : T.w;
+      const int ix = word & 0xff, iy = (word >> 8) & 0xff, iz = (word >> 16) & 0xff;
+      const float ax = B.v[ix & 7][0][(ix >> 3) & 1];
+      const float ay = B.v[iy & 7][1][(iy >> 3) & 1];
+      const float az = B.v[iz & 7][2][(iz >> 3) & 1];
+      w += ax * ay * az;
+      gx += B.d[ix & 7][0][(ix >> 3) & 1] * ay * az;
+      gy += ax * B.d[iy & 7][1][(iy >> 3) & 1] * az;
+      gz += ax * ay * B.d[iz & 7][2][(iz >> 3) & 1];
+    }
+    gp += w * u; dtx += gx * u; dty += gy * u; dtz += gz * u;
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    dtx += __shfl_down_sync(0xffffffffu, dtx, off);
+    dty += __shfl_down_sync(0xffffffffu, dty, off);
+    dtz += __shfl_down_sync(0xffffffffu, dtz, off);
+    gp += __shfl_down_sync(0xffffffffu, gp, off);
+  }
+  if (lane != 0) return;
+  const double qi = q[i];
+  force[3 * i + 0] = -qscale * qi * dtx * nx / lx;
+  force[3 * i + 1] = -qscale * qi * dty * ny / ly;
+  force[3 * i + 2] = -qscale * qi * dtz * nz / lz;
+  vpot[i] = qscale * gp;
+}
+
+// ── host generator and self-check ─────────────────────────────────────────
+namespace cs2gen {
+static inline double val_kind(int kind, double t, double xi, int order) {
+  const double x2 = xi * xi, x4 = x2 * x2;
+  switch (kind) {
+    case 0: return 0.0;
+    case 1: return t;
+    case 2:
+      if (order == 4)
+        return -0.5 * t * t * t + 0.5 * t * t - (9 * x2 - 2) / 6 * t + 0.5 * x2;
+      return (1.0 / 12) * t * t * t * t * t - (1.0 / 6) * t * t * t * t +
+             (10 * x2 - 1) / 12 * t * t * t - (6 * x2 - 1) / 6 * t * t +
+             (5 * x4 - x2) / 4 * t - (3 * x4 - x2) / 6;
+    case 3: {
+      const double l111 = (1.0 / 12) * t * t * t * t * t - (1.0 / 6) * t * t * t * t +
+                          (10 * x2 - 1) / 12 * t * t * t - (6 * x2 - 1) / 6 * t * t +
+                          (5 * x4 - x2) / 4 * t - (3 * x4 - x2) / 6;
+      const double l311 = (1.0 / 120) * t * t * t * t * t +
+                          (2 * x2 - 1) / 24 * t * t * t +
+                          (15 * x4 - 15 * x2 + 4) / 120 * t;
+      return -0.25 * l111 - 2.5 * l311;
+    }
+    case 4:
+      return (1.0 / 120) * t * t * t * t * t + (2 * x2 - 1) / 24 * t * t * t +
+             (15 * x4 - 15 * x2 + 4) / 120 * t;
+    case 5:
+      return -0.5 * t * t * t + 0.5 * t * t - (3 * x2 - 2) / 2 * t + 0.5 * x2;
+    default:
+      return (1.0 / 6) * t * t * t + (3 * x2 - 1) / 6 * t;
+  }
+}
+static inline double der_kind(int kind, double t, double xi, int order) {
+  const double x2 = xi * xi, x4 = x2 * x2;
+  switch (kind) {
+    case 0: return 0.0;
+    case 1: return 1.0;
+    case 2:
+      if (order == 4) return -1.5 * t * t + t - (9 * x2 - 2) / 6;
+      return (5.0 / 12) * t * t * t * t - (2.0 / 3) * t * t * t +
+             (10 * x2 - 1) / 4 * t * t - (6 * x2 - 1) / 3 * t +
+             (5 * x4 - x2) / 4;
+    case 3: {
+      const double d111 = (5.0 / 12) * t * t * t * t - (2.0 / 3) * t * t * t +
+                          (10 * x2 - 1) / 4 * t * t - (6 * x2 - 1) / 3 * t +
+                          (5 * x4 - x2) / 4;
+      const double d311 = (5.0 / 120) * t * t * t * t + (2 * x2 - 1) / 8 * t * t +
+                          (15 * x4 - 15 * x2 + 4) / 120;
+      return -0.25 * d111 - 2.5 * d311;
+    }
+    case 4:
+      return (5.0 / 120) * t * t * t * t + (2 * x2 - 1) / 8 * t * t +
+             (15 * x4 - 15 * x2 + 4) / 120;
+    case 5:
+      return -1.5 * t * t + t - (3 * x2 - 2) / 2;
+    default:
+      return 0.5 * t * t + (3 * x2 - 1) / 6;
+  }
+}
+static inline int e_off(int off) { return off == 1 ? 0 : 1; }
+static std::array<Cs2Term, 4> terms_of(const LAMMPS_NS::CubeS2Node4& nd,
+                                       int order) {
+  std::array<Cs2Term, 4> T{};
+  const int off[3] = {nd.dx, nd.dy, nd.dz};
+  auto set = [&](int t, int axis, int kind, int e) {
+    T[t].f[axis] = Cs2Factor{kind, e};
+  };
+  auto E = [&](int t, int axis) { set(t, axis, 1, e_off(off[axis])); };
+  if (order == 6) {
+    if (nd.cls == 0) {
+      for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+          if (b == a) set(a, b, 2, e_off(off[b])); else E(a, b);
+      for (int a = 0; a < 3; ++a) set(3, a, 5, e_off(off[a]));
+    } else if (nd.cls == 1 || nd.cls == 2) {
+      int n1 = (nd.sp_axis + 1) % 3, n2 = (nd.sp_axis + 2) % 3;
+      if (n1 > n2) std::swap(n1, n2);
+      const int e = nd.sp_is_neg ? 1 : 0;
+      set(0, nd.sp_axis, nd.cls == 1 ? 3 : 4, e);
+      E(0, n1); E(0, n2);
+      if (nd.cls == 1) {
+        set(1, nd.sp_axis, 6, e);
+        set(1, n1, 5, e_off(off[n1])); set(1, n2, 5, e_off(off[n2]));
+      }
+    } else if (nd.cls == 3) {
+      int s1 = (nd.sp_axis + 1) % 3, s2 = (nd.sp_axis + 2) % 3;
+      if (s1 > s2) std::swap(s1, s2);
+      set(0, nd.sp_axis, 5, e_off(off[nd.sp_axis]));
+      set(0, s1, 6, (nd.sp_is_neg & 1) ? 1 : 0);
+      set(0, s2, 6, (nd.sp_is_neg & 2) ? 1 : 0);
+    } else {
+      for (int a = 0; a < 3; ++a) set(0, a, 6, (nd.sp_is_neg >> a) & 1);
+    }
+  } else {
+    if (nd.cls == 0) {
+      for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+          if (b == a) set(a, b, 2, e_off(off[b])); else E(a, b);
+    } else {
+      int n1 = (nd.sp_axis + 1) % 3, n2 = (nd.sp_axis + 2) % 3;
+      if (n1 > n2) std::swap(n1, n2);
+      const int e = nd.sp_is_neg ? 1 : 0;
+      set(0, nd.sp_axis, 6, e);
+      E(0, n1); E(0, n2);
+    }
+  }
+  return T;
+}
+static void poly_coeffs(int order, double xi, float c[7][6], float dc[7][6]) {
+  for (int k = 0; k < 7; ++k)
+    for (int j = 0; j < 6; ++j) c[k][j] = dc[k][j] = 0.f;
+  const double x2 = xi * xi, x4 = x2 * x2;
+  c[1][0] = 0.f; c[1][1] = 1.f; dc[1][0] = 1.f;
+  if (order == 4) {
+    c[2][0] = (float)(0.5 * x2); c[2][1] = (float)(-(9 * x2 - 2) / 6);
+    c[2][2] = 0.5f; c[2][3] = -0.5f;
+    dc[2][0] = (float)(-(9 * x2 - 2) / 6); dc[2][1] = 1.f; dc[2][2] = -1.5f;
+  } else {
+    c[2][0] = (float)(-(3 * x4 - x2) / 6); c[2][1] = (float)((5 * x4 - x2) / 4);
+    c[2][2] = (float)(-(6 * x2 - 1) / 6); c[2][3] = (float)((10 * x2 - 1) / 12);
+    c[2][4] = -1.f / 6; c[2][5] = 1.f / 12;
+    dc[2][0] = (float)((5 * x4 - x2) / 4); dc[2][1] = (float)(-(6 * x2 - 1) / 3);
+    dc[2][2] = (float)((10 * x2 - 1) / 4); dc[2][3] = -2.f / 3; dc[2][4] = 5.f / 12;
+    c[4][1] = (float)((15 * x4 - 15 * x2 + 4) / 120);
+    c[4][3] = (float)((2 * x2 - 1) / 24); c[4][5] = 1.f / 120;
+    dc[4][0] = (float)((15 * x4 - 15 * x2 + 4) / 120); dc[4][2] = (float)((2 * x2 - 1) / 8);
+    dc[4][4] = 5.f / 120;
+    for (int j = 0; j < 6; ++j) {
+      c[3][j] = -0.25f * c[2][j] - 2.5f * c[4][j];
+      dc[3][j] = -0.25f * dc[2][j] - 2.5f * dc[4][j];
+    }
+    c[5][0] = (float)(0.5 * x2); c[5][1] = (float)(-(3 * x2 - 2) / 2);
+    c[5][2] = 0.5f; c[5][3] = -0.5f;
+    dc[5][0] = (float)(-(3 * x2 - 2) / 2); dc[5][1] = 1.f; dc[5][2] = -1.5f;
+  }
+  c[6][1] = (float)((3 * x2 - 1) / 6); c[6][3] = 1.f / 6;
+  dc[6][0] = (float)((3 * x2 - 1) / 6); dc[6][2] = 0.5f;
+}
+static bool build_and_check(float coef[2][7][6], float dcoef[2][7][6],
+                            uint4 table[2][96]) {
+  std::mt19937 rng(20261113);
+  std::uniform_real_distribution<double> uni(0.03, 0.97);
+  for (int oi = 0; oi < 2; ++oi) {
+    const int order = oi == 0 ? 4 : 6;
+    const double xi = order == 4 ? LAMMPS_NS::kCubes2Xi4 : LAMMPS_NS::kCubes2Xi6;
+    poly_coeffs(order, xi, coef[oi], dcoef[oi]);
+    std::vector<LAMMPS_NS::CubeS2Node4> nodes(
+        order == 4 ? LAMMPS_NS::kCubes2Nodes4 : LAMMPS_NS::kCubes2Nodes6,
+        order == 4 ? LAMMPS_NS::kCubes2Nodes4 + 32
+                   : LAMMPS_NS::kCubes2Nodes6 + 88);
+    auto key = [](const LAMMPS_NS::CubeS2Node4& n) {
+      return (long long)(n.dz + 4) * 10000LL + (long long)(n.dy + 4) * 100LL +
+             (long long)(n.dx + 4);
+    };
+    std::sort(nodes.begin(), nodes.end(),
+              [&](const auto& a, const auto& b) { return key(a) < key(b); });
+    double worst = 0.0;
+    for (size_t n = 0; n < nodes.size(); ++n) {
+      const auto T = terms_of(nodes[n], order);
+      uint4 packed{0, 0, 0, 0};
+      unsigned* w = &packed.x;
+      for (int t = 0; t < 4; ++t) {
+        unsigned word = 0;
+        for (int axis = 0; axis < 3; ++axis)
+          word |= ((unsigned)(T[t].f[axis].kind | (T[t].f[axis].e << 3)))
+                  << (8 * axis);
+        w[t] = word;
+      }
+      table[oi][n] = packed;
+      for (int s = 0; s < 300; ++s) {
+        const double tx = uni(rng), ty = uni(rng), tz = uni(rng);
+        const double t[3] = {tx, ty, tz};
+        double vv = 0.0, gg[3] = {0, 0, 0};
+        for (int tr = 0; tr < 4; ++tr) {
+          const int code[3] = {(int)(w[tr] & 0xff), (int)((w[tr] >> 8) & 0xff),
+                               (int)((w[tr] >> 16) & 0xff)};
+          double v[3];
+          for (int a = 0; a < 3; ++a) {
+            const int ca = code[a];
+            v[a] = val_kind(ca & 7, (ca >> 3) ? 1 - t[a] : t[a], xi, order);
+          }
+          vv += v[0] * v[1] * v[2];
+          for (int a = 0; a < 3; ++a) {
+            const int ca = code[a];
+            const double ta = (ca >> 3) ? 1 - t[a] : t[a];
+            const double d = der_kind(ca & 7, ta, xi, order) * ((ca >> 3) ? -1.0 : 1.0);
+            gg[a] += d * v[(a + 1) % 3] * v[(a + 2) % 3];
+          }
+        }
+        LAMMPS_NS::CubeS2WeightGrad ref =
+            order == 4 ? LAMMPS_NS::cubes2_weight_grad_4(tx, ty, tz, nodes[n], xi)
+                       : LAMMPS_NS::cubes2_weight_grad_6(tx, ty, tz, nodes[n], xi);
+        worst = std::max(worst, std::abs(vv - ref.value));
+        for (int a = 0; a < 3; ++a)
+          worst = std::max(worst, std::abs(gg[a] - ref.d[a]));
+      }
+    }
+    if (worst > 1e-9) {
+      std::fprintf(stderr, "[midtown] 4-term table check FAILED order %d: %.3e\n",
+                   order, worst);
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace cs2gen
 
 // ── host API ──
 extern "C" SogGpuState *sog_gpu_create(){
@@ -1509,8 +3033,41 @@ extern "C" SogGpuState *sog_gpu_create(){
               [&](const GpuNode& a, const GpuNode& b) { return key(a) < key(b); });
     cudaMemcpyToSymbol(c_nodes4s, s4.data(), 32*sizeof(GpuNode));
     cudaMemcpyToSymbol(c_nodes6s, s6.data(), 88*sizeof(GpuNode));
+    // Stable sort by class, keeping the offset order inside a class.
+    auto by_class = [](const GpuNode& a, const GpuNode& b) {
+      return a.cls < b.cls;
+    };
+    std::stable_sort(s4.begin(), s4.end(), by_class);
+    std::stable_sort(s6.begin(), s6.end(), by_class);
+    cudaMemcpyToSymbol(c_nodes4c, s4.data(), 32*sizeof(GpuNode));
+    cudaMemcpyToSymbol(c_nodes6c, s6.data(), 88*sizeof(GpuNode));
   }
-  return new SogGpuState();
+  // QuadS tables: (2nu)^3 nodes, x fastest, offsets 1-nu..nu.
+  {
+    std::vector<QNodeS> q4(64), q6(216);
+    int k=0;
+    for(int c=0;c<4;++c) for(int b=0;b<4;++b) for(int a=0;a<4;++a)
+      q4[k++]={ (signed char)(a-1),(signed char)(b-1),(signed char)(c-1),
+                (signed char)a,(signed char)b,(signed char)c };
+    k=0;
+    for(int c=0;c<6;++c) for(int b=0;b<6;++b) for(int a=0;a<6;++a)
+      q6[k++]={ (signed char)(a-2),(signed char)(b-2),(signed char)(c-2),
+                (signed char)a,(signed char)b,(signed char)c };
+    cudaMemcpyToSymbol(c_qnodes4s, q4.data(), 64*sizeof(QNodeS));
+    cudaMemcpyToSymbol(c_qnodes6s, q6.data(), 216*sizeof(QNodeS));
+  }
+  SogGpuState* state = new SogGpuState();
+  {
+    float coef[2][7][6], dcoef[2][7][6];
+    uint4 table[2][96] = {};
+    if (cs2gen::build_and_check(coef, dcoef, table)) {
+      cudaMemcpyToSymbol(c_cs2_terms, table, sizeof(table));
+      cudaMemcpyToSymbol(c_poly, coef, sizeof(coef));
+      cudaMemcpyToSymbol(c_dpoly, dcoef, sizeof(dcoef));
+      state->term_ok = 1;
+    }
+  }
+  return state;
 }
 static void free_grid_buffers(SogGpuState*s);  // defined with the slab setup below
 
@@ -1523,8 +3080,9 @@ extern "C" void sog_gpu_destroy(SogGpuState*s){
   cudaFree(s->d_x);cudaFree(s->d_q);cudaFree(s->d_force);cudaFree(s->d_vpot);cudaFree(s->d_red);
   cudaFree(s->d_boxlo);
   cudaFree(s->d_brick);
+  cudaFree(s->s_brick_fx);
   cudaFree(s->d_halo);
-  cudaFree(s->d_real);
+  cudaFree(s->d_frac);
   delete s;
 }
 
@@ -1555,15 +3113,20 @@ extern "C" int sog_gpu_slab_setup(SogGpuState*s,int nx,int ny,int nz,
   // cuFFT takes sizes SLOWEST -> FASTEST.  Getting this backwards still looks
   // right on cubic grids and aliases once nx != ny; see
   // sog_work/dist_mesh/README.md.
+  //
+  // SINGLE PRECISION, like the replicated solve: cufftComplex spectra and
+  // cufftReal meshes.  The brick is float32 and the density accumulation is
+  // 64-bit fixed point, so the whole slab pipeline shares the replicated
+  // path's precision contract instead of running a fp64 mesh beside it.
   int n2[2]={ny,nx}, rin[2]={ny,nx}, cout[2]={ny,Nh};
   if(cufftPlanMany(&s->plan_xy_rc,2,n2,rin,1,(size_t)nx*ny,cout,1,
-                   (size_t)ny*Nh,CUFFT_D2Z,ZL)!=CUFFT_SUCCESS) return -1;
+                   (size_t)ny*Nh,CUFFT_R2C,ZL)!=CUFFT_SUCCESS) return -1;
   if(cufftPlanMany(&s->plan_xy_cr,2,n2,cout,1,(size_t)ny*Nh,rin,1,
-                   (size_t)nx*ny,CUFFT_Z2D,ZL)!=CUFFT_SUCCESS){
+                   (size_t)nx*ny,CUFFT_C2R,ZL)!=CUFFT_SUCCESS){
     cufftDestroy(s->plan_xy_rc); s->plan_xy_rc=0; return -1;
   }
   int n1[1]={nz}, e1[1]={nz};
-  if(cufftPlanMany(&s->plan_z,1,n1,e1,1,nz,e1,1,nz,CUFFT_Z2Z,Nh*YL)
+  if(cufftPlanMany(&s->plan_z,1,n1,e1,1,nz,e1,1,nz,CUFFT_C2C,Nh*YL)
      !=CUFFT_SUCCESS){
     cufftDestroy(s->plan_xy_rc); cufftDestroy(s->plan_xy_cr);
     s->plan_xy_rc=0; s->plan_xy_cr=0; return -1;
@@ -1584,40 +3147,68 @@ extern "C" int sog_gpu_slab_setup(SogGpuState*s,int nx,int ny,int nz,
 // Device-resident variant: the received blocks are ALREADY in d_rho; the
 // packed inverse blocks are left in d_rho and the local accumulators in d_red.
 extern "C" int sog_gpu_slab_unpack_green_izpack_dev(SogGpuState*s,int nx,int ny,
-    int nz,int ylo,int YL,double lx,double ly,double lz,const double*ge,
-    const double*gf,const double*gv,double scaleinv,int np){
-  if(s->d_rho==nullptr||s->d_pot==nullptr||s->plan_z==0) return -1;
+    int nz,int ylo,int YL,double lx,double ly,double lz,double scaleinv,int np,
+    int keep_spec){
+  if(s->s_rho==nullptr||s->s_pot==nullptr||s->plan_z==0) return -1;
   const int Nh=nx/2+1;
   const size_t nc=(size_t)nz*Nh*YL;              // complex elements each way
   int tb=256; size_t gg=(nc+tb-1)/tb;
-  k_unpack_blocks_to_pen<<<(int)gg,tb>>>(Nh,ny,nz,np,YL,s->d_rho,s->d_pot);
+  k_unpack_blocks_to_pen<<<(int)gg,tb>>>(Nh,ny,nz,np,YL,s->s_rho,s->s_pot);
   CK(cudaGetLastError());
-  if(cufftExecZ2Z(s->plan_z,s->d_pot,s->d_pot,CUFFT_FORWARD)!=CUFFT_SUCCESS)
+  if(cufftExecC2C(s->plan_z,s->s_pot,s->s_pot,CUFFT_FORWARD)!=CUFFT_SUCCESS)
     return -2;
   if(s->d_red==nullptr) CK(cudaMalloc(&s->d_red,20*sizeof(double)));
   CK(cudaMemset(s->d_red,0,20*sizeof(double)));
-  k_green_pencil<<<(int)gg,tb>>>(Nh,nx,ny,nz,ylo,YL,lx,ly,lz,s->d_pot,
-                                s->d_ge,s->d_gf,s->d_gv,s->d_pot,scaleinv,s->d_red);
+  k_green_pencil<<<(int)gg,tb>>>(Nh,nx,ny,nz,ylo,YL,lx,ly,lz,s->s_pot,
+                                s->s_gp,s->s_pot,scaleinv,s->d_red);
   CK(cudaGetLastError());
-  if(cufftExecZ2Z(s->plan_z,s->d_pot,s->d_pot,CUFFT_INVERSE)!=CUFFT_SUCCESS)
+  // The ik force mode needs phi_hat itself (not its inverse transform), so the
+  // caller may ask for a copy before the spectrum is consumed below.
+  if(keep_spec){
+    if(s->s_pot2==nullptr) return -5;
+    CK(cudaMemcpy(s->s_pot2,s->s_pot,nc*sizeof(cufftComplex),
+                  cudaMemcpyDeviceToDevice));
+  }
+  if(cufftExecC2C(s->plan_z,s->s_pot,s->s_pot,CUFFT_INVERSE)!=CUFFT_SUCCESS)
     return -3;
-  k_pack_pen_to_blocks<<<(int)gg,tb>>>(Nh,ny,nz,np,YL,s->d_pot,s->d_rho);
+  k_pack_pen_to_blocks<<<(int)gg,tb>>>(Nh,ny,nz,np,YL,s->s_pot,s->s_rho);
+  CK(cudaGetLastError());
+  return 0;
+}
+
+// ik force mode: build i*k_a*phi_hat from the spectrum saved by the call above,
+// take its inverse z transform and pack it for the same transpose.  Running one
+// component at a time keeps a single block buffer (s_rho) and one pencil
+// scratch (s_pot) in play; the price is one transpose + inverse z per
+// component, which is what this mode costs.
+extern "C" int sog_gpu_slab_grad_izpack_dev(SogGpuState*s,int nx,int ny,int nz,
+    int ylo,int YL,double lx,double ly,double lz,int np,int axis){
+  if(s->s_rho==nullptr||s->s_pot==nullptr||s->s_pot2==nullptr||s->plan_z==0)
+    return -1;
+  const int Nh=nx/2+1;
+  const size_t nc=(size_t)nz*Nh*YL;
+  int tb=256; size_t gg=(nc+tb-1)/tb;
+  k_ik_pencil<<<(int)gg,tb>>>(Nh,nx,ny,nz,ylo,YL,lx,ly,lz,s->s_pot2,s->s_pot,
+                             axis);
+  CK(cudaGetLastError());
+  if(cufftExecC2C(s->plan_z,s->s_pot,s->s_pot,CUFFT_INVERSE)!=CUFFT_SUCCESS)
+    return -3;
+  k_pack_pen_to_blocks<<<(int)gg,tb>>>(Nh,ny,nz,np,YL,s->s_pot,s->s_rho);
   CK(cudaGetLastError());
   return 0;
 }
 // Host-buffer wrapper (MPI fallback path).
 extern "C" int sog_gpu_slab_unpack_green_izpack(SogGpuState*s,int nx,int ny,
-    int nz,int ylo,int YL,double lx,double ly,double lz,const double*ge,
-    const double*gf,const double*gv,double scaleinv,int np,
+    int nz,int ylo,int YL,double lx,double ly,double lz,double scaleinv,int np,
     const double*host_rcv,double*host_snd_back,double*red7){
   const size_t nc=(size_t)nz*(size_t)(nx/2+1)*YL;
-  CK(cudaMemcpy(s->d_rho,host_rcv,2*nc*sizeof(double),cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(s->s_rho,host_rcv,2*nc*sizeof(float),cudaMemcpyHostToDevice));
   const int rc=sog_gpu_slab_unpack_green_izpack_dev(s,nx,ny,nz,ylo,YL,lx,ly,lz,
-                                                    ge,gf,gv,scaleinv,np);
+                                                    scaleinv,np,/*keep_spec=*/0);
   if(rc!=0) return rc;
   double red[20]; CK(cudaMemcpy(red,s->d_red,20*sizeof(double),cudaMemcpyDeviceToHost));
   for(int t=0;t<7;++t) red7[t]=red[t];
-  CK(cudaMemcpy(host_snd_back,s->d_rho,2*nc*sizeof(double),cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(host_snd_back,s->s_rho,2*nc*sizeof(float),cudaMemcpyDeviceToHost));
   return 0;
 }
 
@@ -1658,10 +3249,9 @@ NcclApi &nccl_api(){
   if(e) cands[nc++]=e;
   cands[nc++]="libnccl.so.2";
   cands[nc++]="libnccl.so";
-  // Last resort for this deployment: the NCCL that ships inside the torch
-  // wheel's nvidia/ tree, which is not on LD_LIBRARY_PATH by default.
-  cands[nc++]="/data/home/jiangzhen/.conda/envs/lr/lib/python3.11/"
-              "site-packages/nvidia/nccl/lib/libnccl.so.2";
+  // The NCCL that ships inside the torch wheel's nvidia/ tree is not on
+  // LD_LIBRARY_PATH by default; point SOG_NCCL_LIB at it when the loader
+  // cannot find a system NCCL.
   for(int i=0;i<nc && !a.ok;++i){
     void *lib=dlopen(cands[i],RTLD_NOW|RTLD_LOCAL);
     if(!lib) continue;
@@ -1680,6 +3270,8 @@ NcclApi &nccl_api(){
   return a;
 }
 constexpr int kNcclDouble=8;    // ncclDataType_t: ncclFloat64/ncclDouble
+constexpr int kNcclFloat32=7;   // ncclDataType_t: ncclFloat32/ncclFloat
+constexpr int kNcclUint64=5;    // ncclDataType_t: ncclUint64 (exact integer sum)
 constexpr int kNcclSum=0;       // ncclRedOp_t
 
 // One communicator per process: neutralize/qmean (which have no handle) and
@@ -1716,16 +3308,20 @@ extern "C" int sog_gpu_nccl_init(int np,int me,const void *id){
 extern "C" int sog_gpu_nccl_ok(){ return g_state==1 ? 1 : 0; }
 extern "C" int sog_gpu_nccl_available(){ return nccl_api().ok ? 1 : 0; }
 
-extern "C" int sog_gpu_nccl_alltoall(SogGpuState*s,const double*send,
-    const int*scnt,const int*sdisp,double*recv,const int*rcnt,
+// The packed blocks are cufftComplex (8 bytes).  scnt/rcnt/rdisp count in
+// FLOAT elements (2 per complex), so the byte count and the offsets are the
+// same numbers the fp64 version used: `send + disp` advances disp floats =
+// 4*disp bytes = 8*complex, exactly one cufftComplex per step.
+extern "C" int sog_gpu_nccl_alltoall(SogGpuState*s,const float*send,
+    const int*scnt,const int*sdisp,float*recv,const int*rcnt,
     const int*rdisp,int np){
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1) return -1;
   if(a.group_start()!=0) return -2;
   for(int d=0;d<np;++d)
-    a.send(send+sdisp[d],(size_t)scnt[d],kNcclDouble,d,g_comm,(cudaStream_t)0);
+    a.send(send+sdisp[d],(size_t)scnt[d],kNcclFloat32,d,g_comm,(cudaStream_t)0);
   for(int r=0;r<np;++r)
-    a.recv(recv+rdisp[r],(size_t)rcnt[r],kNcclDouble,r,g_comm,(cudaStream_t)0);
+    a.recv(recv+rdisp[r],(size_t)rcnt[r],kNcclFloat32,r,g_comm,(cudaStream_t)0);
   return a.group_end()==0 ? 0 : -3;
 }
 
@@ -1734,95 +3330,132 @@ extern "C" int sog_gpu_nccl_alltoall(SogGpuState*s,const double*send,
 //   send->prev, recv<-next, send->next, recv<-prev
 // At np=2 the 1st send pairs with the peer's 1st recv and the 2nd with the 2nd;
 // at np>2 each direction has a distinct peer, so the order is irrelevant.
+// `dtype` selects the element width: kNcclDouble for the 8-byte fixed-point
+// density halo, kNcclFloat32 for the 4-byte potential halo.
 extern "C" int sog_gpu_nccl_halo2(SogGpuState*s,int prev,int next,
-    const double*send_prev,int cnt_prev,const double*send_next,int cnt_next,
-    double*recv_prev,double*recv_next){
+    const void*send_prev,int cnt_prev,const void*send_next,int cnt_next,
+    void*recv_prev,void*recv_next,int dtype){
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1) return -1;
   if(a.group_start()!=0) return -2;
-  a.send(send_prev,(size_t)cnt_prev,kNcclDouble,prev,g_comm,(cudaStream_t)0);
-  a.recv(recv_next,(size_t)cnt_next,kNcclDouble,next,g_comm,(cudaStream_t)0);
-  a.send(send_next,(size_t)cnt_next,kNcclDouble,next,g_comm,(cudaStream_t)0);
-  a.recv(recv_prev,(size_t)cnt_prev,kNcclDouble,prev,g_comm,(cudaStream_t)0);
+  a.send(send_prev,(size_t)cnt_prev,dtype,prev,g_comm,(cudaStream_t)0);
+  a.recv(recv_next,(size_t)cnt_next,dtype,next,g_comm,(cudaStream_t)0);
+  a.send(send_next,(size_t)cnt_next,dtype,next,g_comm,(cudaStream_t)0);
+  a.recv(recv_prev,(size_t)cnt_prev,dtype,prev,g_comm,(cudaStream_t)0);
   return a.group_end()==0 ? 0 : -3;
 }
 
 __global__ void k_add_into(double*dst,const double*src,size_t n);  // defined below
+__global__ void k_add_into_u64(unsigned long long*dst,
+                               const unsigned long long*src,size_t n);
 
-// Forward all-to-all: packed forward blocks in d_pot -> received blocks in d_rho.
+// Forward all-to-all: packed forward blocks in s_pot -> received blocks in s_rho.
 extern "C" int sog_gpu_nccl_alltoall_fwd(SogGpuState*s,const int*scnt,
     const int*sdisp,const int*rcnt,const int*rdisp,int np){
-  return sog_gpu_nccl_alltoall(s,(const double*)s->d_pot,scnt,sdisp,
-                               (double*)s->d_rho,rcnt,rdisp,np);
+  return sog_gpu_nccl_alltoall(s,(const float*)s->s_pot,scnt,sdisp,
+                               (float*)s->s_rho,rcnt,rdisp,np);
 }
 // The np == 1 "all-to-all" is the identity permutation: there is one block, it
-// must move d_pot -> d_rho (forward) or d_rho -> d_pot (inverse), and no rank
+// must move s_pot -> s_rho (forward) or s_rho -> s_pot (inverse), and no rank
 // has to talk to anyone -- least of all to itself through NCCL, a path the
-// reference never exercises.  n is in doubles, as scnt/rcnt are.
+// reference never exercises.  n is in FLOAT units (2 per cufftComplex), as
+// scnt/rcnt are.
 extern "C" int sog_gpu_slab_copy_packed(SogGpuState*s,int forward,size_t n){
-  if(s->d_rho==nullptr||s->d_pot==nullptr) return -1;
-  const size_t bytes=n*sizeof(double);
-  CK(cudaMemcpy(forward?(void*)s->d_rho:(void*)s->d_pot,
-                forward?(const void*)s->d_pot:(const void*)s->d_rho,bytes,
+  if(s->s_rho==nullptr||s->s_pot==nullptr) return -1;
+  const size_t bytes=n*sizeof(float);
+  CK(cudaMemcpy(forward?(void*)s->s_rho:(void*)s->s_pot,
+                forward?(const void*)s->s_pot:(const void*)s->s_rho,bytes,
                 cudaMemcpyDeviceToDevice));
   return 0;
 }
-// Inverse: packed inverse blocks in d_rho -> received blocks in d_pot.
+// Inverse: packed inverse blocks in s_rho -> received blocks in s_pot.
 extern "C" int sog_gpu_nccl_alltoall_bwd(SogGpuState*s,const int*scnt,
     const int*sdisp,const int*rcnt,const int*rdisp,int np){
-  return sog_gpu_nccl_alltoall(s,(const double*)s->d_rho,scnt,sdisp,
-                               (double*)s->d_pot,rcnt,rdisp,np);
+  return sog_gpu_nccl_alltoall(s,(const float*)s->s_rho,scnt,sdisp,
+                               (float*)s->s_pot,rcnt,rdisp,np);
 }
 
-// Reverse halo (density overlap-add) on the device brick.  Requires
-// gh_lo == gh_hi (true by construction: both are the interpolation order).
+// Reverse halo (density overlap-add) on the FIXED-POINT device brick: the
+// integer planes are summed exactly, matching the replicated spread's
+// reproducibility.  Requires gh_lo == gh_hi (both are the interpolation order).
 extern "C" int sog_gpu_nccl_halo_rev(SogGpuState*s,int prev,int next,
     size_t plane,int zoff,int ZL,int gh_lo,int gh_hi){
   if(gh_lo!=gh_hi) return -4;
   const size_t n=(size_t)plane*(size_t)gh_lo;
   if(2*n>s->cap_halo){
     if(s->d_halo) cudaFree(s->d_halo);
-    CK(cudaMalloc(&s->d_halo,2*n*sizeof(double)));
+    CK(cudaMalloc(&s->d_halo,2*n*sizeof(unsigned long long)));
     s->cap_halo=2*n;
   }
-  double *recv_prev=s->d_halo, *recv_next=s->d_halo+n;
-  const double *send_lo=s->d_brick;                          // lower ghost
-  const double *send_hi=s->d_brick+(size_t)(zoff+ZL)*plane;  // upper ghost
+  unsigned long long *recv_prev=(unsigned long long*)s->d_halo,
+                     *recv_next=recv_prev+n;
+  const unsigned long long *send_lo=s->s_brick_fx;                    // lower ghost
+  const unsigned long long *send_hi=s->s_brick_fx+(size_t)(zoff+ZL)*plane;  // upper ghost
   if(sog_gpu_nccl_halo2(s,prev,next,send_lo,(int)n,send_hi,(int)n,recv_prev,
-                        recv_next)!=0) return -1;
+                        recv_next,kNcclDouble)!=0) return -1;
   int tb=256; size_t gg=(n+tb-1)/tb;
-  k_add_into<<<(int)gg,tb>>>(s->d_brick+(size_t)zoff*plane,recv_prev,n);
-  k_add_into<<<(int)gg,tb>>>(s->d_brick+(size_t)(zoff+ZL-gh_lo)*plane,recv_next,n);
+  k_add_into_u64<<<(int)gg,tb>>>(s->s_brick_fx+(size_t)zoff*plane,recv_prev,n);
+  k_add_into_u64<<<(int)gg,tb>>>(s->s_brick_fx+(size_t)(zoff+ZL-gh_lo)*plane,
+                                 recv_next,n);
   CK(cudaGetLastError());
   return 0;
 }
-// Forward halo (potential ghosts) on the device brick.
-extern "C" int sog_gpu_nccl_halo_fwd(SogGpuState*s,int prev,int next,
-    size_t plane,int zoff,int ZL,int gh_lo,int gh_hi){
+// Forward halo (potential ghosts) on an arbitrary FLOAT brick.  The ik force
+// mode fills one gradient brick per component and needs the identical
+// ghost-plane exchange on each of them.
+extern "C" int sog_gpu_nccl_halo_fwd_at(SogGpuState*s,float*base,int prev,
+    int next,size_t plane,int zoff,int ZL,int gh_lo,int gh_hi){
   if(gh_lo!=gh_hi) return -4;
   const size_t n=(size_t)plane*(size_t)gh_lo;
-  if(2*n>s->cap_halo){
+  if(n>s->cap_halo){
     if(s->d_halo) cudaFree(s->d_halo);
-    CK(cudaMalloc(&s->d_halo,2*n*sizeof(double)));
-    s->cap_halo=2*n;
+    CK(cudaMalloc(&s->d_halo,2*n*sizeof(float)));
+    s->cap_halo=n;
   }
-  double *recv_prev=s->d_halo, *recv_next=s->d_halo+n;
-  const double *send_first=s->d_brick+(size_t)zoff*plane;           // first owned
-  const double *send_last=s->d_brick+(size_t)(zoff+ZL-gh_lo)*plane; // last owned
+  float *recv_prev=(float*)s->d_halo, *recv_next=recv_prev+n;
+  const float *send_first=base+(size_t)zoff*plane;           // first owned
+  const float *send_last=base+(size_t)(zoff+ZL-gh_lo)*plane; // last owned
   if(sog_gpu_nccl_halo2(s,prev,next,send_first,(int)n,send_last,(int)n,
-                        recv_prev,recv_next)!=0) return -1;
-  CK(cudaMemcpy(s->d_brick,recv_prev,n*sizeof(double),cudaMemcpyDeviceToDevice));
-  CK(cudaMemcpy(s->d_brick+(size_t)(zoff+ZL)*plane,recv_next,n*sizeof(double),
+                        recv_prev,recv_next,kNcclFloat32)!=0) return -1;
+  CK(cudaMemcpy(base,recv_prev,n*sizeof(float),cudaMemcpyDeviceToDevice));
+  CK(cudaMemcpy(base+(size_t)(zoff+ZL)*plane,recv_next,n*sizeof(float),
                 cudaMemcpyDeviceToDevice));
   return 0;
 }
+// Forward halo (potential ghosts) on the FLOAT device brick.
+extern "C" int sog_gpu_nccl_halo_fwd(SogGpuState*s,int prev,int next,
+    size_t plane,int zoff,int ZL,int gh_lo,int gh_hi){
+  return sog_gpu_nccl_halo_fwd_at(s,s->d_brick,prev,next,plane,zoff,ZL,gh_lo,
+                                  gh_hi);
+}
 
-// Generic in-place device all-reduce (double).  Used by neutralize/qmean.
-extern "C" int sog_gpu_nccl_allreduce_dev(void *buf,size_t n){
+// Generic in-place device all-reduce with an explicit element width.  The
+// full-brick path needs the 64-bit fixed-point density (ncclUint64: an exact
+// integer sum, so the global mesh does not depend on the reduction order) and
+// the float potential (ncclFloat32); neutralize/qmean use doubles.
+extern "C" int sog_gpu_nccl_allreduce_dev_dtype(void *buf,size_t n,int dtype){
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1) return -1;
-  return a.all_reduce(buf,buf,n,kNcclDouble,kNcclSum,g_comm,(cudaStream_t)0)==0
+  return a.all_reduce(buf,buf,n,dtype,kNcclSum,g_comm,(cudaStream_t)0)==0
              ? 0 : -2;
+}
+extern "C" int sog_gpu_nccl_allreduce_dev(void *buf,size_t n){
+  return sog_gpu_nccl_allreduce_dev_dtype(buf,n,kNcclDouble);
+}
+
+// full_brick: every rank spread its own atoms over the WHOLE z range, so the
+// rank sum is the global mesh.  `off`/`n` are element counts inside the brick
+// (the owned planes, [gh*plane, (gh+nz)*plane)); the ghost planes are not part
+// of the sum.
+extern "C" int sog_gpu_brick_allreduce_fx(SogGpuState*s,size_t off,size_t n){
+  return sog_gpu_nccl_allreduce_dev_dtype(s->s_brick_fx+off,n,kNcclUint64);
+}
+extern "C" int sog_gpu_brick_allreduce_f_at(SogGpuState*s,float*base,size_t off,
+                                            size_t n){
+  return sog_gpu_nccl_allreduce_dev_dtype(base+off,n,kNcclFloat32);
+}
+extern "C" int sog_gpu_brick_allreduce_f(SogGpuState*s,size_t off,size_t n){
+  return sog_gpu_brick_allreduce_f_at(s,s->d_brick,off,n);
 }
 
 extern "C" int sog_gpu_nccl_allreduce_red(SogGpuState*s){
@@ -1837,16 +3470,16 @@ extern "C" void sog_gpu_red_download(SogGpuState*s,double*host){
   CK(cudaMemcpy(host,s->d_red,7*sizeof(double),cudaMemcpyDeviceToHost));
 }
 
-// cuFFT's D2Z/Z2D wants a 16-byte-aligned pointer.  The brick's slab offset
-// zoff*plane*8 is 16-aligned only when the double offset is even; otherwise
-// stage the contiguous plane run through this scratch.
-static double *ensure_real(SogGpuState*s,size_t n){
+// cuFFT wants a suitably aligned pointer for R2C/C2R.  The brick's slab offset
+// zoff*plane floats is 16-byte aligned only when the float offset is a
+// multiple of 4; otherwise stage the contiguous plane run through this scratch.
+static float *ensure_real_f(SogGpuState*s,size_t n){
   if(n>s->cap_real){
-    if(s->d_real) cudaFree(s->d_real);
-    CK(cudaMalloc(&s->d_real,n*sizeof(double)));
+    if(s->s_real) cudaFree(s->s_real);
+    CK(cudaMalloc(&s->s_real,n*sizeof(float)));
     s->cap_real=n;
   }
-  return s->d_real;
+  return s->s_real;
 }
 
 // ── Device-resident brick staging ──────────────────────────────────────────
@@ -1854,96 +3487,101 @@ static double *ensure_real(SogGpuState*s,size_t n){
 // conversions and the halo overlap-adds run as kernels, and only the few ghost
 // planes cross the bus.  This removes the full-brick D2H/H2D per step and the
 // host rho_ext/u_ext/cur/cur2 buffers.
-__global__ void k_brick_to_slab(int nx,int ny,int ZL,int zoff,
-    const double*brick,cufftDoubleComplex*slab){
-  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
-  const size_t n=(size_t)nx*ny*ZL;
-  if(t>=n) return;
-  const int ix=(int)(t%nx);
-  const int y=(int)((t/nx)%ny);
-  const int z=(int)(t/((size_t)nx*ny));
-  slab[t].x=brick[(size_t)(zoff+z)*nx*ny+(size_t)y*nx+ix];
-  slab[t].y=0.0;
-}
-__global__ void k_slab_to_brick(int nx,int ny,int ZL,int zoff,
-    const cufftDoubleComplex*slab,double*brick){
-  size_t t=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
-  const size_t n=(size_t)nx*ny*ZL;
-  if(t>=n) return;
-  const int ix=(int)(t%nx);
-  const int y=(int)((t/nx)%ny);
-  const int z=(int)(t/((size_t)nx*ny));
-  brick[(size_t)(zoff+z)*nx*ny+(size_t)y*nx+ix]=slab[t].x;
-}
+//   k_add_into      : fp64 scratch, legacy host-add helper
+//   k_add_into_f    : float potential brick, legacy host-add helper
+//   k_add_into_u64  : fixed-point density brick, the np==1 / NCCL reverse halo
 __global__ void k_add_into(double*dst,const double*src,size_t n){
   size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   if(i<n) dst[i]+=src[i];
 }
+__global__ void k_add_into_f(float*dst,const float*src,size_t n){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if(i<n) dst[i]+=src[i];
+}
+__global__ void k_add_into_u64(unsigned long long*dst,
+                               const unsigned long long*src,size_t n){
+  size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if(i<n) dst[i]+=src[i];
+}
 
-// plane ranges are in doubles: off = plane_index * nx*ny
+// plane ranges are in elements: off = plane_index * nx*ny.  The device brick is
+// float; these legacy host helpers convert to/from the fp64 host API.
 extern "C" void sog_gpu_brick_get(SogGpuState*s,double*host,size_t off,size_t n){
-  CK(cudaMemcpy(host,s->d_brick+off,n*sizeof(double),cudaMemcpyDeviceToHost));
+  std::vector<float> h(n);
+  CK(cudaMemcpy(h.data(),s->d_brick+off,n*sizeof(float),cudaMemcpyDeviceToHost));
+  for(size_t i=0;i<n;++i) host[i]=(double)h[i];
 }
 extern "C" void sog_gpu_brick_set(SogGpuState*s,const double*host,size_t off,
     size_t n){
-  CK(cudaMemcpy(s->d_brick+off,host,n*sizeof(double),cudaMemcpyHostToDevice));
+  std::vector<float> h(n);
+  for(size_t i=0;i<n;++i) h[i]=(float)host[i];
+  CK(cudaMemcpy(s->d_brick+off,h.data(),n*sizeof(float),cudaMemcpyHostToDevice));
 }
 extern "C" void sog_gpu_brick_add(SogGpuState*s,const double*host,size_t off,
     size_t n){
+  std::vector<float> h(n);
+  for(size_t i=0;i<n;++i) h[i]=(float)host[i];
   if(n>s->cap_halo){
     if(s->d_halo) cudaFree(s->d_halo);
-    CK(cudaMalloc(&s->d_halo,n*sizeof(double)));
+    CK(cudaMalloc(&s->d_halo,n*sizeof(float)));
     s->cap_halo=n;
   }
-  CK(cudaMemcpy(s->d_halo,host,n*sizeof(double),cudaMemcpyHostToDevice));
+  float *hbuf=(float*)s->d_halo;
+  CK(cudaMemcpy(hbuf,h.data(),n*sizeof(float),cudaMemcpyHostToDevice));
   int tb=256; size_t gg=(n+tb-1)/tb;
-  k_add_into<<<(int)gg,tb>>>(s->d_brick+off,s->d_halo,n);
+  k_add_into_f<<<(int)gg,tb>>>(s->d_brick+off,hbuf,n);
   CK(cudaGetLastError());
 }
 extern "C" void sog_gpu_brick_zero(SogGpuState*s,size_t off,size_t n){
-  CK(cudaMemset(s->d_brick+off,0,n*sizeof(double)));
+  CK(cudaMemset(s->d_brick+off,0,n*sizeof(float)));
 }
 // Device-only plane moves inside the brick.  The np == 1 halo folds used the
 // host get/add pairs, i.e. 4*gh synchronising bus round trips per call: at a
 // 98^2 plane that alone was ~1.9 ms of a 2.2 ms solve.  These keep the data on
-// the device (the offsets are in doubles, i.e. plane index * nx*ny).
+// the device.  add_planes is the DENSITY fold (fixed-point brick); copy_planes
+// is the POTENTIAL fill (float brick).
 extern "C" void sog_gpu_brick_add_planes(SogGpuState*s,size_t src_off,
     size_t dst_off,size_t n){
   int tb=256; size_t gg=(n+tb-1)/tb;
-  k_add_into<<<(int)gg,tb>>>(s->d_brick+dst_off,s->d_brick+src_off,n);
+  k_add_into_u64<<<(int)gg,tb>>>(s->s_brick_fx+dst_off,s->s_brick_fx+src_off,n);
   CK(cudaGetLastError());
+}
+extern "C" void sog_gpu_brick_copy_planes_at(SogGpuState*s,float*base,
+    size_t src_off,size_t dst_off,size_t n){
+  CK(cudaMemcpy(base+dst_off,base+src_off,n*sizeof(float),
+                cudaMemcpyDeviceToDevice));
 }
 extern "C" void sog_gpu_brick_copy_planes(SogGpuState*s,size_t src_off,
     size_t dst_off,size_t n){
-  CK(cudaMemcpy(s->d_brick+dst_off,s->d_brick+src_off,n*sizeof(double),
-                cudaMemcpyDeviceToDevice));
+  sog_gpu_brick_copy_planes_at(s,s->d_brick,src_off,dst_off,n);
 }
 
 // brick (owned planes) -> xy slab complex, then FFT(x,y), pack.  The packed
-// blocks are LEFT IN d_pot so a device all-to-all can send them directly.
+// blocks are LEFT IN s_pot so a device all-to-all can send them directly.
+// The brick's owned planes hold the fixed-point (2^40) density; they are
+// converted to float32 on the fly, exactly as the replicated solve converts
+// f_rho_fx -> f_rho_r before its R2C.
 extern "C" int sog_gpu_slab_xyfft_pack_brick_dev(SogGpuState*s,int nx,int ny,
     int nz,int ZL,int np,int zoff){
-  if(s->d_rho==nullptr||s->d_pot==nullptr||s->plan_xy_rc==0) return -1;
+  if(s->s_rho==nullptr||s->s_pot==nullptr||s->plan_xy_rc==0) return -1;
   const int Nh=nx/2+1;
   const size_t nc=(size_t)Nh*ny*ZL;
   // R2C out of the owned brick planes (x fastest, ny rows, ZL batches).  zoff
-  // is even in the 1-D slab path, but the full-brick path can land the slab
-  // at an odd double offset; then stage it through the aligned scratch.
+  // is even in the 1-D slab path, but the full-brick path can land the slab at
+  // an offset that is not 16-byte aligned; then stage it through the scratch.
   const size_t plane=(size_t)nx*ny;
   const size_t doff=(size_t)zoff*plane;
-  const cufftDoubleReal *rin;
-  if((doff%2)==0){
-    rin=reinterpret_cast<const cufftDoubleReal*>(s->d_brick+doff);
+  const size_t nown=(size_t)ZL*plane;
+  float *rin;
+  if((doff%4)==0){
+    rin=s->d_brick+doff;
   }else{
-    double *tmp=ensure_real(s,(size_t)ZL*plane);
-    CK(cudaMemcpy(tmp,s->d_brick+doff,(size_t)ZL*plane*sizeof(double),
-                  cudaMemcpyDeviceToDevice));
-    rin=reinterpret_cast<const cufftDoubleReal*>(tmp);
+    rin=ensure_real_f(s,nown);
   }
-  if(cufftExecD2Z(s->plan_xy_rc,const_cast<cufftDoubleReal*>(rin),
-                  s->d_rho)!=CUFFT_SUCCESS) return -2;
-  int tb=256; size_t gg=(nc+tb-1)/tb;
-  k_pack_xy_to_blocks<<<(int)gg,tb>>>(Nh,ny,nz,ZL,np,s->d_rho,s->d_pot);
+  int tb=256; size_t gg=(nc+tb-1)/tb, gc=(nown+tb-1)/tb;
+  k_fx_to_float<<<(int)gc,tb>>>(nown,s->s_brick_fx+doff,rin,1.0/kFxScale);
+  if(cufftExecR2C(s->plan_xy_rc,rin,s->s_rho)!=CUFFT_SUCCESS) return -2;
+  k_pack_xy_to_blocks<<<(int)gg,tb>>>(Nh,ny,nz,ZL,np,s->s_rho,s->s_pot);
   CK(cudaGetLastError());
   return 0;
 }
@@ -1952,44 +3590,49 @@ extern "C" int sog_gpu_slab_xyfft_pack_brick(SogGpuState*s,int nx,int ny,
   const int rc=sog_gpu_slab_xyfft_pack_brick_dev(s,nx,ny,nz,ZL,np,zoff);
   if(rc!=0) return rc;
   const size_t nc=(size_t)(nx/2+1)*ny*ZL;
-  CK(cudaMemcpy(host_snd,s->d_pot,2*nc*sizeof(double),cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(host_snd,s->s_pot,2*nc*sizeof(float),cudaMemcpyDeviceToHost));
   return 0;
 }
 
 // blocks -> xy slab, inverse FFT(x,y), then slab -> brick owned planes; the
-// ghost planes are zeroed so the forward halo starts from a clean brick.
-// Device-resident variant: the received blocks are ALREADY in d_pot.
+// ghost planes are zeroed so the forward halo starts from a clean (float)
+// potential brick.  Device-resident variant: the received blocks are ALREADY
+// in s_pot.
 extern "C" int sog_gpu_slab_unpack_ixyfft_to_brick_dev(SogGpuState*s,int nx,
-    int ny,int nz,int ZL,int np,int zoff,int ZB){
-  if(s->d_rho==nullptr||s->d_pot==nullptr||s->plan_xy_cr==0) return -1;
+    int ny,int nz,int ZL,int np,int zoff,int ZB,float*out){
+  if(s->s_rho==nullptr||s->s_pot==nullptr||s->plan_xy_cr==0) return -1;
+  float *brick = (out!=nullptr) ? out : s->d_brick;
   const int Nh=nx/2+1;
   const size_t nc=(size_t)Nh*ny*ZL;
   int tb=256; size_t gg=(nc+tb-1)/tb;
-  k_unpack_blocks_to_xy<<<(int)gg,tb>>>(Nh,ny,ZL,np,s->d_pot,s->d_rho);
+  k_unpack_blocks_to_xy<<<(int)gg,tb>>>(Nh,ny,ZL,np,s->s_pot,s->s_rho);
   CK(cudaGetLastError());
   const size_t plane=(size_t)nx*ny;
   const size_t doff=(size_t)zoff*plane;
-  cufftDoubleReal *rout;
-  if((doff%2)==0){
-    rout=reinterpret_cast<cufftDoubleReal*>(s->d_brick+doff);
+  const size_t nown=(size_t)ZL*plane;
+  float *rout;
+  if((doff%4)==0){
+    rout=brick+doff;
   }else{
-    rout=reinterpret_cast<cufftDoubleReal*>(ensure_real(s,(size_t)ZL*plane));
+    rout=ensure_real_f(s,nown);
   }
-  if(cufftExecZ2D(s->plan_xy_cr,s->d_rho,rout)!=CUFFT_SUCCESS) return -2;
-  if((doff%2)!=0)
-    CK(cudaMemcpy(s->d_brick+doff,s->d_real,(size_t)ZL*plane*sizeof(double),
+  if(cufftExecC2R(s->plan_xy_cr,s->s_rho,rout)!=CUFFT_SUCCESS) return -2;
+  if((doff%4)!=0)
+    CK(cudaMemcpy(brick+doff,s->s_real,nown*sizeof(float),
                   cudaMemcpyDeviceToDevice));
-  if(zoff>0) sog_gpu_brick_zero(s,0,(size_t)zoff*plane);
+  if(zoff>0) CK(cudaMemset(brick,0,(size_t)zoff*plane*sizeof(float)));
   const size_t upper=(size_t)(ZB-zoff-ZL);
-  if(upper>0) sog_gpu_brick_zero(s,(size_t)(zoff+ZL)*plane,upper*plane);
+  if(upper>0)
+    CK(cudaMemset(brick+(size_t)(zoff+ZL)*plane,0,upper*plane*sizeof(float)));
   return 0;
 }
 // Host-buffer wrapper (MPI fallback path).
 extern "C" int sog_gpu_slab_unpack_ixyfft_to_brick(SogGpuState*s,int nx,int ny,
     int nz,int ZL,int np,int zoff,int ZB,const double*host_back){
   const size_t nc=(size_t)(nx/2+1)*ny*ZL;
-  CK(cudaMemcpy(s->d_pot,host_back,2*nc*sizeof(double),cudaMemcpyHostToDevice));
-  return sog_gpu_slab_unpack_ixyfft_to_brick_dev(s,nx,ny,nz,ZL,np,zoff,ZB);
+  CK(cudaMemcpy(s->s_pot,host_back,2*nc*sizeof(float),cudaMemcpyHostToDevice));
+  return sog_gpu_slab_unpack_ixyfft_to_brick_dev(s,nx,ny,nz,ZL,np,zoff,ZB,
+                                                 /*out=*/nullptr);
 }
 
 // Free the grid-sized buffers (full or slab) and the 3D plan.
@@ -2017,18 +3660,35 @@ static void free_grid_buffers(SogGpuState*s){
   if(s->f_rho_fx){cudaFree(s->f_rho_fx);s->f_rho_fx=nullptr;}
   if(s->f_pot_r){cudaFree(s->f_pot_r);s->f_pot_r=nullptr;}
   if(s->f_spec){cudaFree(s->f_spec);s->f_spec=nullptr;}
+  if(s->f_gradx_r){cudaFree(s->f_gradx_r);s->f_gradx_r=nullptr;}
+  if(s->f_grady_r){cudaFree(s->f_grady_r);s->f_grady_r=nullptr;}
+  if(s->f_gradz_r){cudaFree(s->f_gradz_r);s->f_gradz_r=nullptr;}
+  if(s->f_grad_spec){cudaFree(s->f_grad_spec);s->f_grad_spec=nullptr;}
+  if(s->f_qgx){cudaFree(s->f_qgx);s->f_qgx=nullptr;}
+  if(s->f_qgy){cudaFree(s->f_qgy);s->f_qgy=nullptr;}
+  if(s->f_qgz){cudaFree(s->f_qgz);s->f_qgz=nullptr;}
+  if(s->f_qgspec){cudaFree(s->f_qgspec);s->f_qgspec=nullptr;}
   if(s->f_fft_work){cudaFree(s->f_fft_work);s->f_fft_work=nullptr;}
+  // The slab's own single-precision set (see the state struct): complex
+  // spectra, the packed float2 green table and the R2C/C2R alignment scratch.
+  if(s->s_rho){cudaFree(s->s_rho);s->s_rho=nullptr;}
+  if(s->s_pot){cudaFree(s->s_pot);s->s_pot=nullptr;}
+  if(s->s_pot2){cudaFree(s->s_pot2);s->s_pot2=nullptr;}
+  if(s->d_gbrick){cudaFree(s->d_gbrick);s->d_gbrick=nullptr;}
+  s->cap_gbrick=0;
+  if(s->s_gp){cudaFree(s->s_gp);s->s_gp=nullptr;}
+  if(s->s_real){cudaFree(s->s_real);s->s_real=nullptr;s->cap_real=0;}
   s->slab_cap=0;s->slab_gn=0;s->slab_mode=false;s->slab_Y=0;
 }
 
-// Slab-sized setup for the distributed path.  d_rho / d_pot hold the largest
-// slab this rank ever transforms, d_ge/d_gf/d_gv hold only this rank's y-slice
-// of the green tables (indexed ix + nx*(iyl + YL*iz)), and the gradient meshes
-// d_gx/d_gy/d_gz are NOT allocated -- the distributed solve never uses them.
-// Nothing here creates the 3D plan; the slab plans are built by
-// sog_gpu_slab_setup, which needs the shapes.
+// Slab-sized setup for the distributed path.  s_rho / s_pot hold the largest
+// slab this rank ever transforms, s_gp holds only this rank's y-slice of the
+// green table (indexed kh + Nh*(iyl + YL*iz)) packed as (ge, gv) floats, and
+// the gradient meshes d_gx/d_gy/d_gz are NOT allocated -- the distributed solve
+// never uses them.  Nothing here creates the 3D plan; the slab plans are built
+// by sog_gpu_slab_setup, which needs the shapes.
 extern "C" void sog_gpu_setup_slab(SogGpuState*s,int nx,int ny,int nz,int YL,
-    int ZL,const double*ge,const double*gf,const double*gvv,size_t gn){
+    int ZL,const double*ge,const double*gvv,size_t gn){
   const int Nh=nx/2+1;
   const size_t cap=(size_t)((size_t)Nh*ny*ZL > (size_t)nz*Nh*YL
                                 ? (size_t)Nh*ny*ZL : (size_t)nz*Nh*YL);
@@ -2036,22 +3696,24 @@ extern "C" void sog_gpu_setup_slab(SogGpuState*s,int nx,int ny,int nz,int YL,
                        s->slab_cap!=cap || s->slab_gn!=gn || s->slab_Y!=YL;
   if(realloc){
     free_grid_buffers(s);
-    CK(cudaMalloc(&s->d_rho,cap*sizeof(cufftDoubleComplex)));
-    CK(cudaMalloc(&s->d_pot,cap*sizeof(cufftDoubleComplex)));
-    CK(cudaMalloc(&s->d_ge,gn*sizeof(double)));
-    CK(cudaMalloc(&s->d_gf,gn*sizeof(double)));
-    CK(cudaMalloc(&s->d_gv,gn*sizeof(double)));
+    CK(cudaMalloc(&s->s_rho,cap*sizeof(cufftComplex)));
+    CK(cudaMalloc(&s->s_pot,cap*sizeof(cufftComplex)));
+    CK(cudaMalloc(&s->s_pot2,cap*sizeof(cufftComplex)));
+    CK(cudaMalloc(&s->s_gp,gn*sizeof(float2)));
     s->nx=nx;s->ny=ny;s->nz=nz;s->ngrid=(size_t)nx*ny*nz;
     s->slab_cap=cap;s->slab_gn=gn;s->slab_Y=YL;s->slab_mode=true;
   }
-  CK(cudaMemcpy(s->d_ge,ge,gn*sizeof(double),cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(s->d_gf,gf,gn*sizeof(double),cudaMemcpyHostToDevice));
-  CK(cudaMemcpy(s->d_gv,gvv,gn*sizeof(double),cudaMemcpyHostToDevice));
+  // Pack (green energy, green virial) -- the pair the replicated f_gp holds.
+  // The slab's gf == ge by construction (both are kfac*dc), so the third table
+  // is dropped instead of uploaded.
+  std::vector<float2> fgp(gn);
+  for(size_t q=0;q<gn;++q) fgp[q]=make_float2((float)ge[q],(float)gvv[q]);
+  CK(cudaMemcpy(s->s_gp,fgp.data(),gn*sizeof(float2),cudaMemcpyHostToDevice));
   if(getenv("SOG_DIST_DEBUG")){
     size_t fb=0,tb=0; cudaMemGetInfo(&fb,&tb);
     fprintf(stderr,"[sog-mem] slab grid buffers: scratch %.1f MB + green %.1f MB "
             "(full grid would be %.1f MB); device free %.1f MB\n",
-            2.0*cap*16/1048576.0, 3.0*gn*8/1048576.0,
+            2.0*cap*8/1048576.0, 1.0*gn*8/1048576.0,
             (5.0*nx*ny*nz*16 + 3.0*nx*ny*nz*8)/1048576.0, fb/1048576.0);
     fflush(stderr);
   }
@@ -2231,8 +3893,13 @@ extern "C" int sog_gpu_green_form_a(SogGpuState*s,int nord,int nth,double lx,
   if(s->f_gp==nullptr||s->f_plan_r2c==0) return -1;
   // f_rho_r / f_spec may be allocated lazily by the solve; this runs first.
   if(!s->f_rho_r) CK(cudaMalloc(&s->f_rho_r,s->ngrid*sizeof(float)));
-  if(!s->f_spec)  CK(cudaMalloc(&s->f_spec,s->ngrid*sizeof(cufftComplex)));
   const int nx=s->nx, ny=s->ny, nz=s->nz, nh=nx/2+1;
+  // The measurement borrows the fixed-point charge mesh as its spectrum: the
+  // mesh is zero until the next spread and holds ng * 8 B, more than the half
+  // spectrum needs.  Allocating f_spec here used to leave a dead full-grid
+  // complex buffer (8 B per grid point, 2.4 GB at 668^3) alive for the rest of
+  // the run, and CubeS2 never needs f_spec anywhere else.
+  cufftComplex* spec = reinterpret_cast<cufftComplex*>(s->f_rho_fx);
   const size_t nspec=(size_t)nh*ny*nz;
   const size_t ng=s->ngrid;
   const double xi=(nord==6)?LAMMPS_NS::kCubes2Xi6:LAMMPS_NS::kCubes2Xi4;
@@ -2266,10 +3933,10 @@ extern "C" int sog_gpu_green_form_a(SogGpuState*s,int nord,int nth,double lx,
         CK(cudaMemcpy(s->f_rho_r,rho.data(),ng*sizeof(float),
                       cudaMemcpyHostToDevice));
         {
-          const cufftResult cr=cufftExecR2C(s->f_plan_r2c,s->f_rho_r,s->f_spec);
+          const cufftResult cr=cufftExecR2C(s->f_plan_r2c,s->f_rho_r,spec);
           if(cr!=CUFFT_SUCCESS){ cudaFree(acc); return -1000+(int)cr; }
         }
-        k_acc_spec_abs2<<<(int)((nspec+tb-1)/tb),tb>>>(nspec,s->f_spec,acc);
+        k_acc_spec_abs2<<<(int)((nspec+tb-1)/tb),tb>>>(nspec,spec,acc);
         {
           const cudaError_t ce=cudaGetLastError();
           if(ce!=cudaSuccess){ cudaFree(acc); return -2000+(int)ce; }
@@ -2292,6 +3959,73 @@ extern "C" int sog_gpu_green_form_a(SogGpuState*s,int nord,int nth,double lx,
   return 0;
 }
 
+// Measure the CubeS2 assignment-window symbol <|W(k)|^2> on the full grid, into
+// a host buffer of the compact half spectrum (kh + nh*(iy + ny*iz), nh = nx/2+1).
+// Same measurement as the replicated Form-A conversion (spread one unit charge
+// at nth^3 sub-cell positions, transform with a full-grid R2C plan, accumulate
+// |W|^2), but self-contained: it allocates its own full-grid plan and buffers
+// so it runs while the state is in slab mode (whose f_rho_r / f_spec /
+// f_plan_r2c are slab-sized or absent).
+//
+// The window is a global property of the spline and the grid -- identical on
+// every rank -- so the z-slab solve measures it redundantly per rank and feeds
+// it to build_green_slab_half, which divides that rank's Form-B slice by
+// D * <|W|^2> to obtain Form A.  Returns 0 on success, a negative code on error.
+extern "C" int sog_gpu_measure_window(int nx,int ny,int nz,int nord,int nth,
+    double lx,double ly,double lz,double*out){
+  const size_t ng=(size_t)nx*ny*nz;
+  const int nh=nx/2+1;
+  const size_t nspec=(size_t)nh*ny*nz;
+  const double xi=(nord==6)?LAMMPS_NS::kCubes2Xi6:LAMMPS_NS::kCubes2Xi4;
+  const int nn=(nord==6)?LAMMPS_NS::kCubes2NumNodes6:LAMMPS_NS::kCubes2NumNodes4;
+  const LAMMPS_NS::CubeS2Node4* nodes=(nord==6)?LAMMPS_NS::kCubes2Nodes6:LAMMPS_NS::kCubes2Nodes4;
+  (void)lx;(void)ly;(void)lz;
+  float* rho=nullptr; cufftComplex* spec=nullptr; cufftHandle plan=0;
+  double* acc=nullptr;
+  if(cudaMalloc((void**)&rho,ng*sizeof(float))!=cudaSuccess) return -1;
+  if(cudaMalloc((void**)&spec,nspec*sizeof(cufftComplex))!=cudaSuccess){
+    cudaFree(rho); return -1;}
+  if(cudaMalloc((void**)&acc,nspec*sizeof(double))!=cudaSuccess){
+    cudaFree(rho); cudaFree(spec); return -1;}
+  if(cufftPlan3d(&plan,nz,ny,nx,CUFFT_R2C)!=CUFFT_SUCCESS){
+    cudaFree(rho); cudaFree(spec); cudaFree(acc); return -2;}
+  CK(cudaMemset(acc,0,nspec*sizeof(double)));
+  std::vector<float> h_rho(ng);
+  const int tb=256;
+  bool ok=true;
+  for(int a=0;a<nth&&ok;++a){
+    for(int b=0;b<nth&&ok;++b){
+      for(int c=0;c<nth&&ok;++c){
+        const double tx=(a+0.5)/nth, ty=(b+0.5)/nth, tz=(c+0.5)/nth;
+        std::fill(h_rho.begin(),h_rho.end(),0.0f);
+        for(int d=0;d<nn;++d){
+          const LAMMPS_NS::CubeS2Node4& nd=nodes[d];
+          const double w=(nord==6)?cubes2_weight_6(tx,ty,tz,nd,xi)
+                                  :cubes2_weight_4(tx,ty,tz,nd,xi);
+          if(w==0.0) continue;
+          const int ix=((nd.dx%nx)+nx)%nx;
+          const int iy=((nd.dy%ny)+ny)%ny;
+          const int iz=((nd.dz%nz)+nz)%nz;
+          h_rho[(size_t)ix+(size_t)nx*((size_t)iy+(size_t)ny*(size_t)iz)] +=
+              (float)w;
+        }
+        CK(cudaMemcpy(rho,h_rho.data(),ng*sizeof(float),cudaMemcpyHostToDevice));
+        if(cufftExecR2C(plan,rho,spec)!=CUFFT_SUCCESS){ ok=false; break; }
+        k_acc_spec_abs2<<<(int)((nspec+tb-1)/tb),tb>>>(nspec,spec,acc);
+        if(cudaGetLastError()!=cudaSuccess){ ok=false; break; }
+      }
+    }
+  }
+  if(ok){
+    std::vector<double> h_acc(nspec);
+    CK(cudaMemcpy(h_acc.data(),acc,nspec*sizeof(double),cudaMemcpyDeviceToHost));
+    const double inv_theta=1.0/((double)nth*nth*nth);
+    for(size_t i=0;i<nspec;++i) out[i]=h_acc[i]*inv_theta;
+  }
+  cudaFree(rho); cudaFree(spec); cudaFree(acc); cufftDestroy(plan);
+  return ok?0:-3;
+}
+
 // QuadS (separable, full-complex C2C) is the only consumer of the f_rho/f_pot
 // meshes and the C2C plan.  The CubeS₂ path this operator selects never touches
 // them, so they are allocated here instead of in setup: that removes 16 B per
@@ -2304,6 +4038,16 @@ static void ensure_quads_mesh(SogGpuState*s){
   if(!s->f_plan) cufftPlan3d(&s->f_plan,s->nz,s->ny,s->nx,CUFFT_C2C);
 }
 
+// QuadS ik-mode scratch: three full-complex gradient meshes and the spectrum
+// they are transformed from.  Allocated on demand, once per grid.
+static void ensure_quads_ik(SogGpuState*s){
+  const size_t ng=s->ngrid;
+  if(!s->f_qgx) CK(cudaMalloc(&s->f_qgx,ng*sizeof(cufftComplex)));
+  if(!s->f_qgy) CK(cudaMalloc(&s->f_qgy,ng*sizeof(cufftComplex)));
+  if(!s->f_qgz) CK(cudaMalloc(&s->f_qgz,ng*sizeof(cufftComplex)));
+  if(!s->f_qgspec) CK(cudaMalloc(&s->f_qgspec,ng*sizeof(cufftComplex)));
+}
+
 // Allocated on demand by sog_gpu_solve_f, which may skip the density rebuild
 // between calls and therefore cannot share f_rho_r with the potential.
 // The half spectrum (8 B per grid point) is borrowed from the fixed-point
@@ -2311,17 +4055,49 @@ static void ensure_quads_mesh(SogGpuState*s){
 // forward transform, and the mesh is rebuilt from scratch by the next spread.
 // Only sog_gpu_solve_f, which may skip that rebuild, needs a buffer of its own.
 static void ensure_spec(SogGpuState*s){
-  if(!s->f_spec) CK(cudaMalloc(&s->f_spec,s->ngrid*sizeof(cufftComplex)));
+  // cuFFT's R2C writes only the half spectrum, (nx/2+1) * ny * nz modes, so
+  // the buffer is sized for that and not for the full grid: the old full-grid
+  // allocation wasted 4 B per grid point on every QuadS step.
+  if(!s->f_spec){
+    const size_t nh=(size_t)(s->nx/2+1)*(size_t)s->ny*(size_t)s->nz;
+    CK(cudaMalloc(&s->f_spec,nh*sizeof(cufftComplex)));
+  }
 }
 
 static void ensure_pot_r(SogGpuState*s){
   if(!s->f_pot_r) CK(cudaMalloc(&s->f_pot_r,s->ngrid*sizeof(float)));
 }
 
+// The ik-mode gradient meshes and their shared half-spectrum scratch.  Three
+// extra float grids (12 B per grid point together) plus one half spectrum.
+static void ensure_ik_grads(SogGpuState*s){
+  if(!s->f_gradx_r) CK(cudaMalloc(&s->f_gradx_r,s->ngrid*sizeof(float)));
+  if(!s->f_grady_r) CK(cudaMalloc(&s->f_grady_r,s->ngrid*sizeof(float)));
+  if(!s->f_gradz_r) CK(cudaMalloc(&s->f_gradz_r,s->ngrid*sizeof(float)));
+  const size_t nsp=(size_t)(s->nx/2+1)*s->ny*s->nz;
+  if(!s->f_grad_spec) CK(cudaMalloc(&s->f_grad_spec,nsp*sizeof(cufftComplex)));
+}
+
 static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,const double*d_q,
     const double*boxlo,double lx,double ly,double lz,double qscale,int spline,int want_pot,
-    double*d_force,double*d_vpot,double self_coeff,double qsqsum,int remove_self,
+    double*d_force,double*d_vpot,double self_coeff,double qsqsum,int remove_self,int force_mode,
     double*virial6,int host_reduction){
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  // Every kernel, memset and transform of the step runs on the caller's
+  // stream: the AOTI backend captures the evaluation on a side stream, so a
+  // launch on the legacy default stream is not part of the graph (it runs
+  // once, at capture, and never on replay).
+  cufftSetStream(s->f_plan_r2c, stream);
+  cufftSetStream(s->f_plan_c2r, stream);
+  if (s->f_plan) cufftSetStream(s->f_plan, stream);
+  const char* term_env = std::getenv("SOG_TERM_GATHER");
+  const bool term_gather = s->term_ok && (term_env == nullptr || std::atoi(term_env) != 0);
+  // 0 = old gather for both orders, 1 (default) = term gather for order 6 only,
+  // 2 = term gather for both orders (order 4 is available for A/B; it did not
+  // improve the full step because the 32-node case is too small to amortize
+  // the block-wide basis fill).
+  const bool term4 = s->term_ok && (term_env != nullptr && std::atoi(term_env) >= 2);
+
   size_t ng=s->ngrid;
   (void)nlocal;
   double boxlo3[3]={boxlo[0],boxlo[1],boxlo[2]};
@@ -2333,13 +4109,21 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
   // actually moves (or on the first call), not on every solve.
   if(new_boxlo || boxlo[0]!=0.0 || boxlo[1]!=0.0 || boxlo[2]!=0.0)
     CK(cudaMemcpy(d_boxlo,boxlo3,3*sizeof(double),cudaMemcpyHostToDevice));
-  CK(cudaMemset(s->d_red,0,20*sizeof(double)));
+  CK(cudaMemsetAsync(s->d_red,0,20*sizeof(double),stream));
   double volume=s->metric?s->volume:lx*ly*lz, rho_scale=(double)ng/volume, scaleinv=1.0/(double)ng;
   // 2*pi/L on the host: three fp64 divisions per mode are the single largest
   // cost of the k-space pass on a 1/64-rate fp64 pipe.
   const double kfx=2*M_PI/lx, kfy=2*M_PI/ly, kfz=2*M_PI/lz;
 
   int tb=256, gg=(ng+tb-1)/tb, ga=(nlocal+tb-1)/tb;
+  // Multiprocessors of this device, for the occupancy of the k-space pass.
+  static int multiprocessors = [] {
+    int device = 0;
+    cudaGetDevice(&device);
+    int count = 0;
+    cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
+    return count > 0 ? count : 32;
+  }();
   // The phase timers cost five synchronous event waits per call, so they are
   // armed only when the caller asks for them (SOG_GPU_TIMING).
   const bool timing = (std::getenv("SOG_GPU_TIMING") != nullptr);
@@ -2351,56 +4135,178 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
     cudaEventCreate(&s->evt_fftinv_start); cudaEventCreate(&s->evt_fftinv_stop);
     cudaEventCreate(&s->evt_gather_start); cudaEventCreate(&s->evt_gather_stop);
   }
+  // Record one stage boundary.  EVERY event the accumulation below reads must be
+  // recorded on this call: cudaEventElapsedTime on an event that was created but
+  // never recorded returns an error and leaves its output untouched, so the
+  // accumulator would sum uninitialised memory and report garbage.  That is
+  // exactly what happened while the marks were unwired -- all ten events were
+  // created, only gather_stop was ever recorded, and SOG_GPU_TIMING printed
+  // nonsense.  These are host-side enqueues: with timing off they cost nothing.
+  auto mark = [&](cudaEvent_t e) { if (timing) cudaEventRecord(e, stream); };
   bool quads = (spline==SOG_QUADS_4||spline==SOG_QUADS_6);
   int nord = (spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
   const int gw=(nlocal+(tb/32)-1)/(tb/32);
+  // The fractional coordinate of every atom, once per step, shared by the
+  // spread and the gather of both backends.  Recomputing it inside a per-atom
+  // kernel means three fp64 divisions plus a floor per atom; on a card whose
+  // fp64 pipe is 1/32 to 1/64 of the fp32 one that was 85 fp64 instructions per
+  // atom in the QuadS gather, i.e. that gather's whole 0.5 ms.  The B-spline
+  // engine puts the same work in its node_stencils pass for the same reason.
+  FracNode* frac = ensure_frac(s,nlocal);
+  if(nlocal>0)
+    k_midtown_frac<<<ga,tb,0,stream>>>(nlocal,d_x,d_boxlo,1.0/lx,1.0/ly,1.0/lz,
+                              s->nx,s->ny,s->nz,frac);
   if(quads){
-    // QuadS keeps the full-complex path; the half-spectrum kernels below are
-    // CubeS2 only.
-    ensure_quads_mesh(s);
-    k_zero_complex_f<<<gg,tb>>>(ng,s->f_rho);
-    if(nord==4) k_spread_quads<4,cufftComplex><<<ga,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho);
-    else        k_spread_quads<6,cufftComplex><<<ga,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho);
-    cufftExecC2C(s->f_plan,s->f_rho,s->f_rho,CUFFT_FORWARD);
-    k_kspace_f<<<gg,tb>>>(s->nx,s->ny,s->nz,lx,ly,lz,s->d_hinv,s->metric,s->f_rho,
-                          s->f_gp,s->f_pot,want_pot,scaleinv,s->d_red);
-    cufftExecC2C(s->f_plan,s->f_pot,s->f_pot,CUFFT_INVERSE);
-    if(nord==4) k_gather_quads<4,cufftComplex><<<ga,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_pot,want_pot,d_force,d_vpot,s->d_red);
-    else        k_gather_quads<6,cufftComplex><<<ga,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_pot,want_pot,d_force,d_vpot,s->d_red);
-  } else {
-    // CubeS2: real meshes and a half spectrum.
-    k_zero_fx<<<gg,tb>>>(ng,s->f_rho_fx);
-    if(nord==4) k_spread_cubes2_warp_fx<4><<<gw,tb>>>(nlocal,d_x,d_boxlo,lx,ly,lz,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
-    else {
-      const int gwp=(nlocal+kSpreadWarps*kSpreadPack-1)/(kSpreadWarps*kSpreadPack);
-      k_spread_cubes2_warp_fx_packed<6><<<gwp,tb>>>(nlocal,d_x,d_boxlo,1.0/lx,1.0/ly,1.0/lz,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
-    }
-    k_fx_to_float<<<gg,tb>>>(ng,s->f_rho_fx,s->f_rho_r,1.0/kFxScale);
-    cufftComplex *spec = reinterpret_cast<cufftComplex*>(s->f_rho_fx);
-    cufftExecR2C(s->f_plan_r2c,s->f_rho_r,spec);
+    // Real density and half spectrum, like the B-spline / CubeS2 core: a warp
+    // spreads and gathers the (2nu)^3 separable stencil, R2C/C2R carry the
+    // mesh.  This halves the transform work and the density/potential buffers
+    // relative to the original full-complex path.
+    // The zeroing of the density mesh is a grid-sized pass, so it is counted
+    // with the spread, exactly as k_zero_fx is in the CubeS2 branch.
+    mark(s->evt_spread_start);
+    k_zero_fx<<<gg,tb,0,stream>>>(ng,s->f_rho_fx);
+    if(nord==4) k_spread_quads_warp_r<4><<<gw,tb,36*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+    else        k_spread_quads_warp_r<6><<<gw,tb,54*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+    k_fx_to_float<<<gg,tb,0,stream>>>(ng,s->f_rho_fx,s->f_rho_r,1.0/kFxScale);
+    mark(s->evt_spread_stop);
+    ensure_spec(s);
+    mark(s->evt_fftfwd_start);
+    cufftExecR2C(s->f_plan_r2c,s->f_rho_r,s->f_spec);
+    mark(s->evt_fftfwd_stop);
+    mark(s->evt_kspace_start);
     {
       const int nh=s->nx/2+1;
       const int npw=(nh+2)/3;
       const int gx=(npw*s->ny+63)/64;
-      int gz=240/gx; if(gz<1) gz=1; if(gz>s->nz) gz=s->nz;
-      k_kspace_h<<<dim3(gx,gz),64>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->d_hinv,
+      int gz=(16*multiprocessors + gx - 1)/gx;
+      if(gz<1) gz=1; if(gz>s->nz) gz=s->nz;
+      k_kspace_h<<<dim3(gx,gz),64,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->d_hinv,
+                                     s->metric,s->f_gp,s->f_spec,want_pot,
+                                     scaleinv,s->d_red);
+    }
+    mark(s->evt_kspace_stop);
+    mark(s->evt_fftinv_start);
+    if(force_mode==1){
+      // Fourier differentiation on the half spectrum: three C2R gradients of
+      // i*k_a*phi_hat, then a value-only warp gather.
+      ensure_ik_grads(s);
+      k_mul_ik<<<gg,tb,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->f_spec,s->f_grad_spec,0);
+      cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_gradx_r);
+      k_mul_ik<<<gg,tb,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->f_spec,s->f_grad_spec,1);
+      cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_grady_r);
+      k_mul_ik<<<gg,tb,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->f_spec,s->f_grad_spec,2);
+      cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_gradz_r);
+      cufftExecC2R(s->f_plan_c2r,s->f_spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
+      if(nord==4) k_gather_quads_warp_r_ik<4><<<gw,tb,36*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
+      else        k_gather_quads_warp_r_ik<6><<<gw,tb,54*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
+    } else {
+      cufftExecC2R(s->f_plan_c2r,s->f_spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
+      if(nord==4) k_gather_quads_warp_r<4><<<gw,tb,36*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,qscale,1.0/lx,1.0/ly,1.0/lz,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
+      else        k_gather_quads_warp_r<6><<<gw,tb,54*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,qscale,1.0/lx,1.0/ly,1.0/lz,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
+    }
+  } else {
+    // CubeS2: real meshes and a half spectrum.
+    mark(s->evt_spread_start);
+    k_zero_fx<<<gg,tb,0,stream>>>(ng,s->f_rho_fx);
+    if(nord==4) k_spread_cubes2_warp_fx_tab4<<<gw,tb,0,stream>>>(nlocal,frac,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+    else {
+      const int gwp=(nlocal+kSpreadWarps*kSpreadPack-1)/(kSpreadWarps*kSpreadPack);
+      k_spread_cubes2_warp_fx_packed<6><<<gwp,tb,0,stream>>>(nlocal,frac,d_q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+    }
+    k_fx_to_float<<<gg,tb,0,stream>>>(ng,s->f_rho_fx,s->f_rho_r,1.0/kFxScale);
+    mark(s->evt_spread_stop);
+    cufftComplex *spec = reinterpret_cast<cufftComplex*>(s->f_rho_fx);
+    mark(s->evt_fftfwd_start);
+    cufftExecR2C(s->f_plan_r2c,s->f_rho_r,spec);
+    mark(s->evt_fftfwd_stop);
+    mark(s->evt_kspace_start);
+    {
+      const int nh=s->nx/2+1;
+      const int npw=(nh+2)/3;
+      const int gx=(npw*s->ny+63)/64;
+      // The pass is fp32-accumulate over the modes of a column and fp64 only
+      // for the three wave numbers of a metric cell; with a handful of blocks
+      // (the old 240-block target gave gz == 1 at every production mesh) each
+      // thread walks the whole z column and the machine sits idle.  Spread the
+      // work over the z axis so the launch fills the device instead.
+      int gz=(16*multiprocessors + gx - 1)/gx;
+      if(gz<1) gz=1; if(gz>s->nz) gz=s->nz;
+      k_kspace_h<<<dim3(gx,gz),64,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,s->d_hinv,
                                      s->metric,s->f_gp,spec,want_pot,
                                      scaleinv,s->d_red);
     }
+    mark(s->evt_kspace_stop);
+    mark(s->evt_fftinv_start);
     // f_rho_r is free here (the density went into f_spec), so the potential
     // mesh replaces it instead of taking a buffer of its own.
-    cufftExecC2R(s->f_plan_c2r,spec,s->f_rho_r);
-    if(nord==4) k_gather_cubes2_warp_r<4><<<gw,tb>>>(nlocal,d_x,d_boxlo,1.0/lx,1.0/ly,1.0/lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
-    else        k_gather_cubes2_warp_r<6><<<gw,tb>>>(nlocal,d_x,d_boxlo,1.0/lx,1.0/ly,1.0/lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
+    if(force_mode==1){
+      // Fourier differentiation: three inverse transforms of i·k_a·φ̂ into the
+      // gradient meshes, then a value-only gather.  CubeS2 only (QuadS keeps the
+      // AD path); the caller rejects ik on the bspline backend.
+      //
+      // The three transforms run BEFORE the potential's C2R below: `spec`
+      // aliases f_rho_fx, the buffer the potential's own inverse reads and
+      // may reuse, so the gradient spectra must be taken off the intact
+      // potential spectrum first.
+      ensure_ik_grads(s);
+      k_mul_ik<<<gg,tb,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,spec,s->f_grad_spec,0);
+      cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_gradx_r);
+      k_mul_ik<<<gg,tb,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,spec,s->f_grad_spec,1);
+      cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_grady_r);
+      k_mul_ik<<<gg,tb,0,stream>>>(s->nx,s->ny,s->nz,kfx,kfy,kfz,spec,s->f_grad_spec,2);
+      cufftExecC2R(s->f_plan_c2r,s->f_grad_spec,s->f_gradz_r);
+      cufftExecC2R(s->f_plan_c2r,spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
+      if(nord==4) k_gather_cubes2_warp_r_ik<4><<<gw,tb,30*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
+      else        k_gather_cubes2_warp_r_ik<6><<<gw,tb,60*sizeof(float)*(tb/32),stream>>>(nlocal,frac,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,s->f_gradx_r,s->f_grady_r,s->f_gradz_r,want_pot,d_force,d_vpot);
+    } else {
+      cufftExecC2R(s->f_plan_c2r,spec,s->f_rho_r);
+      mark(s->evt_fftinv_stop);
+      mark(s->evt_gather_start);
+      if((nord==6 && term_gather) || (nord==4 && term4)){
+        if(nord==4) k_gather_cubes2_term<4><<<gw,tb,0,stream>>>(nlocal,frac,d_q,qscale,1.0/lx,1.0/ly,1.0/lz,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot);
+        else        k_gather_cubes2_term<6><<<gw,tb,0,stream>>>(nlocal,frac,d_q,qscale,1.0/lx,1.0/ly,1.0/lz,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot);
+      } else {
+        if(nord==4) k_gather_cubes2_warp_r<4><<<gw,tb,0,stream>>>(nlocal,frac,1.0/lx,1.0/ly,1.0/lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
+        else        k_gather_cubes2_warp_r<6><<<gw,tb,0,stream>>>(nlocal,frac,1.0/lx,1.0/ly,1.0/lz,d_q,qscale,s->nx,s->ny,s->nz,s->f_rho_r,want_pot,d_force,d_vpot,s->d_red);
+      }
+    }
   }
-  if (timing) cudaEventRecord(s->evt_gather_stop, 0);
+  mark(s->evt_gather_stop);
   // ── Accumulate timing ──
-  if (timing) { float ms;
-    cudaEventSynchronize(s->evt_spread_stop); cudaEventElapsedTime(&ms,s->evt_spread_start,s->evt_spread_stop); s->acc_spread += ms;
-    cudaEventSynchronize(s->evt_fftfwd_stop); cudaEventElapsedTime(&ms,s->evt_fftfwd_start,s->evt_fftfwd_stop); s->acc_fftfwd += ms;
-    cudaEventSynchronize(s->evt_kspace_stop); cudaEventElapsedTime(&ms,s->evt_kspace_start,s->evt_kspace_stop); s->acc_kspace += ms;
-    cudaEventSynchronize(s->evt_fftinv_stop); cudaEventElapsedTime(&ms,s->evt_fftinv_start,s->evt_fftinv_stop); s->acc_fftinv += ms;
-    cudaEventSynchronize(s->evt_gather_stop); cudaEventElapsedTime(&ms,s->evt_gather_start,s->evt_gather_stop); s->acc_gather += ms;
+  // Each stage is read only if its stop event actually completed; an event that
+  // was never recorded (a path that skips a stage) must not contribute a stale
+  // or uninitialised millisecond count to the average.
+  //
+  // cudaGetLastError() after a failure is NOT cosmetic: a failed
+  // cudaEventElapsedTime latches cudaErrorInvalidResourceHandle into the
+  // thread's sticky error state, and C10's launch checks read it with
+  // cudaGetLastError() -- so the first later torch op throws "CUDA error:
+  // invalid resource handle".  That is the reported SOG_GPU_TIMING crash.
+  // Swallowing the code here keeps a diagnostics switch from poisoning the run.
+  if (timing) {
+    auto stage = [](cudaEvent_t a, cudaEvent_t b, double& acc) {
+      if (cudaEventSynchronize(b) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+      }
+      float ms = 0.0f;
+      if (cudaEventElapsedTime(&ms, a, b) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+      }
+      acc += ms;
+    };
+    stage(s->evt_spread_start, s->evt_spread_stop, s->acc_spread);
+    stage(s->evt_fftfwd_start, s->evt_fftfwd_stop, s->acc_fftfwd);
+    stage(s->evt_kspace_start, s->evt_kspace_stop, s->acc_kspace);
+    stage(s->evt_fftinv_start, s->evt_fftinv_stop, s->acc_fftinv);
+    stage(s->evt_gather_start, s->evt_gather_stop, s->acc_gather);
   }
   if (timing) ++s->timing_count;
   if (timing && s->timing_count >= s->timing_interval && s->timing_count > 0) {
@@ -2443,7 +4349,11 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
     //   vpot[i] -= qscale*q_i*(rsi + sc),  rsi = g(0),  sc = 0
     // (rsi is exactly 2*self_coeff because self_coeff = ½ g(0)).
     const double rsi = remove_self ? 2.0*self_coeff : 0.0;
-    if(nlocal>0) k_vpot_self<<<ga,tb>>>(nlocal,d_vpot,d_q,qscale,rsi,0.0);
+    // rsi = 2*self_coeff and sc = 0, so with remove_self == 0 (the op's
+    // setting) this kernel would subtract zero from every atom: skip the
+    // whole nlocal load/multiply/store.
+    if(rsi != 0.0 && nlocal>0)
+      k_vpot_self<<<ga,tb,0,stream>>>(nlocal,d_vpot,d_q,qscale,rsi,0.0);
   }
   // Energy = qscale * [ 0.5*V*Σ(s2·ge·|ρ|²)  −  remove_self·self_coeff·qsqsum ]
   double e_kneq0 = 0.5*volume*red[0];
@@ -2481,35 +4391,75 @@ static void ensure_local_atoms(SogGpuState*s,int nlocal){
 static void ensure_local_brick(SogGpuState*s,size_t nbrick){
   if(nbrick<=s->cap_brick) return;
   cudaFree(s->d_brick);
-  CK(cudaMalloc(&s->d_brick,nbrick*sizeof(double)));
+  cudaFree(s->s_brick_fx);
+  CK(cudaMalloc(&s->d_brick,nbrick*sizeof(float)));
+  CK(cudaMalloc(&s->s_brick_fx,nbrick*sizeof(unsigned long long)));
   s->cap_brick=nbrick;
 }
 
-// Spread the local atoms into the device brick.  No download: the distributed
-// solve keeps working on d_brick and only fetches the ghost planes.
-extern "C" void sog_gpu_spread_brick_dev(SogGpuState*s,int nlocal,
+// The single gradient brick of an ik solve.  Sized like the potential brick
+// (owned + ghost planes), allocated on first use so an AD deployment never
+// pays for it.
+static void ensure_grad_brick(SogGpuState*s,size_t nbrick){
+  if(nbrick<=s->cap_gbrick) return;
+  cudaFree(s->d_gbrick);
+  CK(cudaMalloc(&s->d_gbrick,nbrick*sizeof(float)));
+  s->cap_gbrick=nbrick;
+}
+
+// Spread the local atoms into the device FIXED-POINT brick.  No download: the
+// distributed solve keeps working on s_brick_fx and only fetches the ghost
+// planes; the float potential brick (d_brick) is written by the inverse FFT.
+extern "C" void sog_gpu_spread_brick_dev_ptr(SogGpuState*s,int nlocal,
     const double*x,const double*boxlo,double lx,double ly,double lz,
     const double*q,double rho_scale,int spline,int nx,int ny,int nz,
     int nxlo,int nxhi,int nylo,int nyhi,int nzlo,int nzhi){
   size_t nb=(size_t)(nxhi-nxlo+1)*(nyhi-nylo+1)*(nzhi-nzlo+1);
   ensure_local_brick(s,nb);
-  CK(cudaMemset(s->d_brick,0,nb*sizeof(double)));
+  CK(cudaMemset(s->s_brick_fx,0,nb*sizeof(unsigned long long)));
+  if(nlocal>0){
+      int tb=256,gw=(nlocal+(tb/32)-1)/(tb/32),ga=(nlocal+tb-1)/tb;ga=(nlocal+tb-1)/tb;
+    if(s->d_boxlo==nullptr) CK(cudaMalloc(&s->d_boxlo,3*sizeof(double)));
+    CK(cudaMemcpy(s->d_boxlo,boxlo,3*sizeof(double),cudaMemcpyHostToDevice));
+    FracNode* frac=ensure_frac(s,nlocal);
+    k_midtown_frac<<<ga,tb>>>(nlocal,x,s->d_boxlo,1.0/lx,1.0/ly,1.0/lz,
+                              nx,ny,nz,frac);
+    bool quads=(spline==SOG_QUADS_4||spline==SOG_QUADS_6);
+    bool bspline=(spline>=200);
+    int nord=(spline==SOG_CUBES2_6||spline==SOG_QUADS_6||spline==SOG_BSPLINE_6)?6:4;
+    if(bspline){
+      const int bo=spline-200;
+      if(bo==4)      k_spread_bspline_brick<4><<<ga,tb>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      else if(bo==5) k_spread_bspline_brick<5><<<ga,tb>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      else           k_spread_bspline_brick<6><<<ga,tb>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+    }else if(quads){
+      if(nord==4) k_spread_quads_brick<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      else k_spread_quads_brick<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+    }else{
+      if(nord==4) k_spread_cubes2_brick<4><<<gw,tb,30*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      else {
+        const int gwb = (nlocal + kSpreadPack * kSpreadWarps - 1) /
+                        (kSpreadPack * kSpreadWarps);
+        k_spread_cubes2_brick_packed6<<<gwb, kSpreadWarps * 32>>>(
+            nlocal, frac, q, rho_scale, nx, ny, nz, nxlo, nxhi, nylo, nyhi,
+            nzlo, nzhi, s->s_brick_fx);
+      }
+    }
+    CK(cudaGetLastError());
+  }
+}
+
+extern "C" void sog_gpu_spread_brick_dev(SogGpuState*s,int nlocal,
+    const double*x,const double*boxlo,double lx,double ly,double lz,
+    const double*q,double rho_scale,int spline,int nx,int ny,int nz,
+    int nxlo,int nxhi,int nylo,int nyhi,int nzlo,int nzhi){
   if(nlocal>0){
     ensure_local_atoms(s,nlocal);
     CK(cudaMemcpy(s->d_x,x,3*(size_t)nlocal*sizeof(double),cudaMemcpyHostToDevice));
     CK(cudaMemcpy(s->d_q,q,(size_t)nlocal*sizeof(double),cudaMemcpyHostToDevice));
-    int tb=256,ga=(nlocal+tb-1)/tb;
-    bool quads=(spline==SOG_QUADS_4||spline==SOG_QUADS_6);
-    int nord=(spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
-    if(quads){
-      if(nord==4) k_spread_quads_brick<4><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick);
-      else k_spread_quads_brick<6><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick);
-    }else{
-      if(nord==4) k_spread_cubes2_brick<4><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick);
-      else k_spread_cubes2_brick<6><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick);
-    }
-    CK(cudaGetLastError());
   }
+  sog_gpu_spread_brick_dev_ptr(s,nlocal,s->d_x,boxlo,lx,ly,lz,s->d_q,rho_scale,
+                               spline,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi);
 }
 
 extern "C" void sog_gpu_spread_brick(SogGpuState*s,int nlocal,
@@ -2519,34 +4469,127 @@ extern "C" void sog_gpu_spread_brick(SogGpuState*s,int nlocal,
   size_t nb=(size_t)(nxhi-nxlo+1)*(nyhi-nylo+1)*(nzhi-nzlo+1);
   sog_gpu_spread_brick_dev(s,nlocal,x,boxlo,lx,ly,lz,q,rho_scale,spline,nx,ny,
                            nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi);
-  CK(cudaMemcpy(rho_brick,s->d_brick,nb*sizeof(double),cudaMemcpyDeviceToHost));
+  // Fixed-point brick -> fp64 host API (the legacy callers see a double mesh).
+  std::vector<unsigned long long> fx(nb);
+  CK(cudaMemcpy(fx.data(),s->s_brick_fx,nb*sizeof(unsigned long long),
+                cudaMemcpyDeviceToHost));
+  const double inv=1.0/kFxScale;
+  for(size_t i=0;i<nb;++i)
+    rho_brick[i]=inv*(double)(long long)fx[i];
 }
 
 // Gather from the brick ALREADY on the device (the distributed solve fills it
 // with the potential and the forward halo); only x/q go up and F/v come down.
+extern "C" void sog_gpu_gather_brick_dev_ptr(SogGpuState*s,int nlocal,
+    const double*x,const double*boxlo,double lx,double ly,double lz,
+    const double*q,double qscale,int spline,int nx,int ny,int nz,
+    int nxlo,int nxhi,int nylo,int nyhi,int nzlo,int nzhi,
+    double*dforce,double*dvpot){
+  if(nlocal<=0) return;
+  size_t nb=(size_t)(nxhi-nxlo+1)*(nyhi-nylo+1)*(nzhi-nzlo+1);
+  ensure_local_brick(s,nb);ensure_local_atoms(s,nlocal);
+  int tb=256,gw=(nlocal+(tb/32)-1)/(tb/32),ga=(nlocal+tb-1)/tb;ga=(nlocal+tb-1)/tb;
+  if(s->d_boxlo==nullptr) CK(cudaMalloc(&s->d_boxlo,3*sizeof(double)));
+  CK(cudaMemcpy(s->d_boxlo,boxlo,3*sizeof(double),cudaMemcpyHostToDevice));
+  FracNode* frac=ensure_frac(s,nlocal);
+  k_midtown_frac<<<ga,tb>>>(nlocal,x,s->d_boxlo,1.0/lx,1.0/ly,1.0/lz,
+                            nx,ny,nz,frac);
+  bool quads=(spline==SOG_QUADS_4||spline==SOG_QUADS_6);
+  bool bspline=(spline>=200);
+  int nord=(spline==SOG_CUBES2_6||spline==SOG_QUADS_6||spline==SOG_BSPLINE_6)?6:4;
+  if(bspline){
+    const int bo=spline-200;
+    if(bo==4)      k_gather_bspline_brick<4><<<ga,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    else if(bo==5) k_gather_bspline_brick<5><<<ga,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    else           k_gather_bspline_brick<6><<<ga,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+  }else if(quads){
+    if(nord==4) k_gather_quads_brick<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    else k_gather_quads_brick<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+  }else{
+    if(nord==4) k_gather_cubes2_brick<4><<<gw,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    else if(s->term_ok) k_gather_cubes2_term_brick6<<<gw,tb>>>(nlocal,frac,q,qscale,lx,ly,lz,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    else k_gather_cubes2_brick<6><<<gw,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+  }
+  CK(cudaGetLastError());
+}
+
 extern "C" void sog_gpu_gather_brick_dev(SogGpuState*s,int nlocal,
     const double*x,const double*boxlo,double lx,double ly,double lz,
     const double*q,double qscale,int spline,int nx,int ny,int nz,
     int nxlo,int nxhi,int nylo,int nyhi,int nzlo,int nzhi,
     double*force,double*vpot){
   if(nlocal<=0) return;
-  size_t nb=(size_t)(nxhi-nxlo+1)*(nyhi-nylo+1)*(nzhi-nzlo+1);
-  ensure_local_brick(s,nb);ensure_local_atoms(s,nlocal);
+  ensure_local_atoms(s,nlocal);
   CK(cudaMemcpy(s->d_x,x,3*(size_t)nlocal*sizeof(double),cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s->d_q,q,(size_t)nlocal*sizeof(double),cudaMemcpyHostToDevice));
-  int tb=256,ga=(nlocal+tb-1)/tb;
-  bool quads=(spline==SOG_QUADS_4||spline==SOG_QUADS_6);
-  int nord=(spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
-  if(quads){
-    if(nord==4) k_gather_quads_brick<4><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,s->d_force,s->d_vpot);
-    else k_gather_quads_brick<6><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,s->d_force,s->d_vpot);
-  }else{
-    if(nord==4) k_gather_cubes2_brick<4><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,s->d_force,s->d_vpot);
-    else k_gather_cubes2_brick<6><<<ga,tb>>>(nlocal,s->d_x,boxlo[0],boxlo[1],boxlo[2],lx,ly,lz,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,s->d_force,s->d_vpot);
-  }
-  CK(cudaGetLastError());
+  sog_gpu_gather_brick_dev_ptr(s,nlocal,s->d_x,boxlo,lx,ly,lz,s->d_q,qscale,
+                               spline,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,
+                               s->d_force,s->d_vpot);
   CK(cudaMemcpy(force,s->d_force,3*(size_t)nlocal*sizeof(double),cudaMemcpyDeviceToHost));
   CK(cudaMemcpy(vpot,s->d_vpot,(size_t)nlocal*sizeof(double),cudaMemcpyDeviceToHost));
+}
+
+// The potential brick of a slab solve (owned + ghost planes).
+extern "C" float* sog_gpu_potential_brick(SogGpuState*s){
+  return s->d_brick;
+}
+
+// The gradient brick of an ik solve, allocated to `n` floats on first use.  The
+// slab solve needs the pointer before the first gather (the unpack writes it),
+// so it is reached through this accessor rather than the opaque state struct.
+extern "C" float* sog_gpu_grad_brick(SogGpuState*s,size_t n){
+  ensure_grad_brick(s,n);
+  return s->d_gbrick;
+}
+
+// One component of the ik gather.  x and q are uploaded only when ``upload``// is set, so the three components share one upload; the result stays in the
+// device force buffer and is copied back once by the finish call below.  The
+// spline families are the two the ik mode admits (CubeS2 and QuadS) -- the
+// caller rejects the B-spline backend before reaching here.
+extern "C" void sog_gpu_gather_brick_dev_ik(SogGpuState*s,int nlocal,
+    const double*x,const double*boxlo,double lx,double ly,double lz,
+    const double*q,double qscale,int spline,int nx,int ny,int nz,
+    int nxlo,int nxhi,int nylo,int nyhi,int nzlo,int nzhi,
+    const float*u,const float*g,int comp,int want_pot,int upload){
+  if(nlocal<=0) return;
+  size_t nb=(size_t)(nxhi-nxlo+1)*(nyhi-nylo+1)*(nzhi-nzlo+1);
+  ensure_local_brick(s,nb);ensure_local_atoms(s,nlocal);
+  if(upload){
+    CK(cudaMemcpy(s->d_x,x,3*(size_t)nlocal*sizeof(double),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(s->d_q,q,(size_t)nlocal*sizeof(double),
+                  cudaMemcpyHostToDevice));
+  }
+  int tb=256,gw=(nlocal+(tb/32)-1)/(tb/32),ga=(nlocal+tb-1)/tb;ga=(nlocal+tb-1)/tb;
+  // The three ik components share one upload, so they share one FracNode fill.
+  FracNode* frac=ensure_frac(s,nlocal);
+  if(upload){
+    if(s->d_boxlo==nullptr) CK(cudaMalloc(&s->d_boxlo,3*sizeof(double)));
+    CK(cudaMemcpy(s->d_boxlo,boxlo,3*sizeof(double),cudaMemcpyHostToDevice));
+    k_midtown_frac<<<ga,tb>>>(nlocal,s->d_x,s->d_boxlo,1.0/lx,1.0/ly,1.0/lz,
+                              nx,ny,nz,frac);
+  }
+  const float* ub=(u!=nullptr)?u:s->d_brick;
+  const bool quads=(spline==SOG_QUADS_4||spline==SOG_QUADS_6);
+  const int nord=(spline==SOG_CUBES2_6||spline==SOG_QUADS_6)?6:4;
+  if(quads){
+    if(nord==4) k_gather_quads_brick_ik<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,ub,g,comp,want_pot,s->d_force,s->d_vpot);
+    else        k_gather_quads_brick_ik<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,ub,g,comp,want_pot,s->d_force,s->d_vpot);
+  }else{
+    if(nord==4) k_gather_cubes2_brick_ik<4><<<gw,tb,30*sizeof(float)*(tb/32)>>>(nlocal,frac,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,ub,g,comp,want_pot,s->d_force,s->d_vpot);
+    else        k_gather_cubes2_brick_ik<6><<<gw,tb,60*sizeof(float)*(tb/32)>>>(nlocal,frac,s->d_q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,ub,g,comp,want_pot,s->d_force,s->d_vpot);
+  }
+  CK(cudaGetLastError());
+}
+
+extern "C" void sog_gpu_gather_brick_ik_finish(SogGpuState*s,int nlocal,
+    double*force,double*vpot,int want_pot){
+  if(nlocal<=0) return;
+  CK(cudaMemcpy(force,s->d_force,3*(size_t)nlocal*sizeof(double),
+                cudaMemcpyDeviceToHost));
+  if(want_pot)
+    CK(cudaMemcpy(vpot,s->d_vpot,(size_t)nlocal*sizeof(double),
+                  cudaMemcpyDeviceToHost));
 }
 
 extern "C" void sog_gpu_gather_brick(SogGpuState*s,int nlocal,
@@ -2556,7 +4599,10 @@ extern "C" void sog_gpu_gather_brick(SogGpuState*s,int nlocal,
     double*force,double*vpot){
   size_t nb=(size_t)(nxhi-nxlo+1)*(nyhi-nylo+1)*(nzhi-nzlo+1);
   ensure_local_brick(s,nb);
-  CK(cudaMemcpy(s->d_brick,u_brick,nb*sizeof(double),cudaMemcpyHostToDevice));
+  // fp64 host potential -> float device brick (the legacy callers pass doubles).
+  std::vector<float> uf(nb);
+  for(size_t i=0;i<nb;++i) uf[i]=(float)u_brick[i];
+  CK(cudaMemcpy(s->d_brick,uf.data(),nb*sizeof(float),cudaMemcpyHostToDevice));
   sog_gpu_gather_brick_dev(s,nlocal,x,boxlo,lx,ly,lz,q,qscale,spline,nx,ny,nz,
                            nxlo,nxhi,nylo,nyhi,nzlo,nzhi,force,vpot);
 }
@@ -2575,7 +4621,7 @@ extern "C" double sog_gpu_compute(SogGpuState*s,int nlocal,const double*x,const 
   CK(cudaMemcpy(s->d_q,q,(size_t)nlocal*sizeof(double),cudaMemcpyHostToDevice));
   double e = sog_gpu_compute_core(s,nlocal,s->d_x,s->d_q,boxlo,lx,ly,lz,qscale,spline,
                                   want_pot,s->d_force,s->d_vpot,self_coeff,qsqsum,
-                                  remove_self,virial6,1);
+                                  remove_self,0,virial6,1);
   CK(cudaMemcpy(force,s->d_force,3*(size_t)nlocal*sizeof(double),cudaMemcpyDeviceToHost));
   if(want_pot) CK(cudaMemcpy(vpot,s->d_vpot,(size_t)nlocal*sizeof(double),cudaMemcpyDeviceToHost));
   return e;
@@ -2588,7 +4634,7 @@ extern "C" double sog_gpu_compute_dev(SogGpuState*s,int nlocal,const double*d_x,
     double lx,double ly,double lz,const double*d_q,double qscale,int spline,int want_pot,
     double*d_force,double*virial6,double*d_vpot,double self_coeff,double qsqsum,int remove_self){
   return sog_gpu_compute_core(s,nlocal,d_x,d_q,boxlo,lx,ly,lz,qscale,spline,want_pot,
-                              d_force,d_vpot,self_coeff,qsqsum,remove_self,virial6,1);
+                              d_force,d_vpot,self_coeff,qsqsum,remove_self,0,virial6,1);
 }
 
 // Deferred-reduction variant: the pipeline runs exactly as above, but the 20
@@ -2599,9 +4645,9 @@ extern "C" double sog_gpu_compute_dev(SogGpuState*s,int nlocal,const double*d_x,
 extern "C" void sog_gpu_compute_dev_defer(SogGpuState*s,int nlocal,const double*d_x,
     const double*boxlo,double lx,double ly,double lz,const double*d_q,double qscale,
     int spline,int want_pot,double*d_force,double*d_vpot,double self_coeff,
-    double qsqsum,int remove_self){
+    double qsqsum,int remove_self,int force_mode){
   sog_gpu_compute_core(s,nlocal,d_x,d_q,boxlo,lx,ly,lz,qscale,spline,want_pot,
-                       d_force,d_vpot,self_coeff,qsqsum,remove_self,nullptr,0);
+                       d_force,d_vpot,self_coeff,qsqsum,remove_self,force_mode,nullptr,0);
 }
 
 extern "C" double* sog_gpu_red_device_ptr(SogGpuState*s){ return s->d_red; }
@@ -2611,13 +4657,18 @@ extern "C" double* sog_gpu_red_device_ptr(SogGpuState*s){ return s->d_red; }
 // mesh already summed over the ranks.
 extern "C" void sog_gpu_spread_f(SogGpuState*s,int nlocal,const double*x,
     const double*boxlo,double lx,double ly,double lz,const double*q,
-    double rho_scale){
+    double rho_scale,int spline){
   size_t ng=s->ngrid;
   int tb=256, gg=(int)((ng+tb-1)/tb), gw=(nlocal+(tb/32)-1)/(tb/32);
   if(s->d_boxlo==nullptr) CK(cudaMalloc(&s->d_boxlo,3*sizeof(double)));
   CK(cudaMemcpy(s->d_boxlo,boxlo,3*sizeof(double),cudaMemcpyHostToDevice));
   k_zero_fx<<<gg,tb>>>(ng,s->f_rho_fx);
-  if(nlocal>0) k_spread_cubes2_warp_fx<6><<<gw,tb>>>(nlocal,x,s->d_boxlo,lx,ly,lz,q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+  // The fixed-point mesh is the CubeS2 path; the order selects the stencil.
+  const int nord=(spline==SOG_CUBES2_6)?6:4;
+  if(nlocal>0){
+    if(nord==6) k_spread_cubes2_warp_fx<6><<<gw,tb>>>(nlocal,x,s->d_boxlo,lx,ly,lz,q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+    else        k_spread_cubes2_warp_fx<4><<<gw,tb>>>(nlocal,x,s->d_boxlo,lx,ly,lz,q,rho_scale,s->nx,s->ny,s->nz,s->f_rho_fx);
+  }
 }
 
 extern "C" unsigned long long* sog_gpu_fx_device_ptr(SogGpuState*s){ return s->f_rho_fx; }
@@ -2634,7 +4685,7 @@ extern "C" float* sog_gpu_real_device_ptr(SogGpuState*s){ return s->f_rho_r; }
 // that summed the real density over the ranks first.
 extern "C" void sog_gpu_solve_f(SogGpuState*s,int nlocal,const double*x,
     const double*boxlo,double lx,double ly,double lz,const double*q,double qscale,
-    int want_pot,int density_ready,double*d_force,double*d_vpot){
+    int want_pot,int density_ready,double*d_force,double*d_vpot,int spline){
   size_t ng=s->ngrid;
   int tb=256, gg=(int)((ng+tb-1)/tb), gw=(nlocal+(tb/32)-1)/(tb/32);
   double volume=lx*ly*lz, scaleinv=1.0/(double)ng;
@@ -2657,7 +4708,13 @@ extern "C" void sog_gpu_solve_f(SogGpuState*s,int nlocal,const double*x,
                                    scaleinv,s->d_red);
   }
   cufftExecC2R(s->f_plan_c2r,s->f_spec,s->f_pot_r);
-  if(nlocal>0) k_gather_cubes2_warp_r<6><<<gw,tb>>>(nlocal,x,s->d_boxlo,1.0/lx,1.0/ly,1.0/lz,q,qscale,s->nx,s->ny,s->nz,s->f_pot_r,want_pot,d_force,d_vpot,s->d_red);
+  FracNode* frac=ensure_frac(s,nlocal);
+  if(nlocal>0) k_midtown_frac<<<(nlocal+tb-1)/tb,tb>>>(nlocal,x,s->d_boxlo,1.0/lx,1.0/ly,1.0/lz,s->nx,s->ny,s->nz,frac);
+  const int nord=(spline==SOG_CUBES2_6)?6:4;
+  if(nlocal>0){
+    if(nord==6) k_gather_cubes2_warp_r<6><<<gw,tb>>>(nlocal,frac,1.0/lx,1.0/ly,1.0/lz,q,qscale,s->nx,s->ny,s->nz,s->f_pot_r,want_pot,d_force,d_vpot,s->d_red);
+    else        k_gather_cubes2_warp_r<4><<<gw,tb>>>(nlocal,frac,1.0/lx,1.0/ly,1.0/lz,q,qscale,s->nx,s->ny,s->nz,s->f_pot_r,want_pot,d_force,d_vpot,s->d_red);
+  }
   (void)volume;
 }
 
@@ -2752,7 +4809,11 @@ extern "C" double sog_gpu_solve_dev(SogGpuState*s,int nlocal,const double*d_x,
   // rsi = g(0) = 2*self_coeff, and the self term contributes no virial.
   if(want_pot){
     const double rsi=remove_self?2.0*self_coeff:0.0;
-    if(nlocal>0) k_vpot_self<<<ga,tb>>>(nlocal,d_vpot,d_q,qscale,rsi,0.0);
+    // rsi = 2*self_coeff and sc = 0, so with remove_self == 0 (the op's
+    // setting) this kernel would subtract zero from every atom: skip the
+    // whole nlocal load/multiply/store.
+    if(rsi != 0.0 && nlocal>0)
+      k_vpot_self<<<ga,tb>>>(nlocal,d_vpot,d_q,qscale,rsi,0.0);
   }
   double e_kneq0=0.5*volume*red[0];
   double e_self=remove_self?self_coeff*qsqsum:0.0;

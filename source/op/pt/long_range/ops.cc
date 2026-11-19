@@ -88,7 +88,7 @@ TORCH_LIBRARY_FRAGMENT(deepmd, library) {
       "Tensor n_node_per_frame, Tensor total_charge, Tensor? box, "
       "Tensor coefficient, Tensor communicator, int kernel, int channel, "
       "float prefactor, int order, float spacing, "
-      "int mesh_backend=0) -> "
+      "int mesh_backend=0, int force_mode=0) -> "
       "(Tensor atom_energy, Tensor charge_gradient, Tensor force, "
       "Tensor atom_virial, Tensor virial)");
 }

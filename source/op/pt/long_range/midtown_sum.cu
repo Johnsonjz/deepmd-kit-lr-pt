@@ -7,13 +7,6 @@
 // mesh_sum.cu.  It shares the contract of ``mesh_sum``: the same arguments,
 // the same outputs and the same formulas, so the caller does not change.
 //
-// The frame virial follows that contract as well: a frame that a call owns
-// whole returns W = -dE/d(strain), and a frame decomposed over domains
-// returns the share of its owners, which the ranks add up to W
-// (``k_midtown_virial_share``).  A rank that returned W itself would have it
-// counted once per rank by the caller's frame sum, and the long-range virial,
-// hence the pressure, would drift with the rank count.
-//
 // The first version is deliberately narrow: one channel, the SOG kernel,
 // orthogonal cells and a single rank.  Every unsupported combination raises
 // instead of silently falling back, so a caller never gets a different
@@ -36,6 +29,7 @@
 // scalars the device entry point wants on the host (the squared charge sum
 // and the charged-node count) make the round trip.
 
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/library.h>
 #include <torch/types.h>
 
@@ -111,17 +105,38 @@ std::mutex& midtown_mutex() {
   return mutex;
 }
 
-int midtown_spline(int64_t order) {
+int midtown_spline(int64_t order, bool quads = false) {
   TORCH_CHECK(order == 4 || order == 6,
               "midtown mesh backend supports spline order 4 or 6, got ",
               order);
+  if (quads) return order == 6 ? SOG_QUADS_6 : SOG_QUADS_4;
   return order == 6 ? SOG_CUBES2_6 : SOG_CUBES2_4;
+}
+
+// Whether n factors over 2, 3 and 5.
+//
+// 7 is deliberately EXCLUDED even though cuFFT can transform it and the
+// B-spline backend sizes its mesh over 2-3-5-7 (mesh_sum.cu even_fft_size):
+// the plans are not equal in cost.  At L = 122.31 A and spacing 0.5 the
+// requested extent is 245 points, which a 2-3-5 mesh rounds to 250 (2 * 5^3)
+// but a 2-3-5-7 mesh accepts as 245 = 5 * 7^2.  Measured, the 245^3 plan runs
+// regular_fft_factor<49> + regular_fft_factor<5> + vector_fft (1.42 ms of
+// transforms plus 0.39 ms of pre/post processing) against 0.59 ms for 250^3 --
+// the radix-7 pass makes the smaller mesh 3x more expensive.  A finer grid is
+// cheaper than a factor-7 one.
+bool factorable_235(int n) {
+  for (const int p : {2, 3, 5}) {
+    while (n % p == 0) {
+      n /= p;
+    }
+  }
+  return n == 1;
 }
 
 int next_factorable(int n) {
   const int minimum = 4;
   n = std::max(n, minimum);
-  while (!sog_green::factorable_235(n)) {
+  while (!factorable_235(n)) {
     ++n;
   }
   return n;
@@ -129,16 +144,22 @@ int next_factorable(int n) {
 
 // The per-axis grid. The operator contract is a mesh of spacing at most
 // `spacing`, and the same rule serves both backends so that one call means the
-// same grid whichever mesh backend evaluates it. The midtown accuracy rule
-// only sizes the grid of a caller that passes no spacing.
-int midtown_axis(double length,
-                 const std::vector<double>& bw,
-                 int spline,
-                 double spacing) {
-  if (spacing > 0.0) {
-    return next_factorable(static_cast<int>(std::ceil(length / spacing)));
-  }
-  return sog_green::grid_axis(length, bw, 1.0, spline, 0.0);
+// same grid whichever mesh backend evaluates it.
+//
+// The spacing itself is NOT derived here: it comes from the caller, which is
+// deepmd/dpmodel/long_range/grid_rule.py inverting the measured error law for a
+// target force-relative accuracy.  The operator only rounds the extent up to a
+// size cuFFT transforms well.  A non-positive spacing is rejected rather than
+// silently sized by a second copy of the accuracy rule: the B-spline backend
+// rejects it too (mesh_sum.cu), so accepting it here would make the same call
+// mean different things per backend.
+int midtown_axis(double length, double spacing) {
+  TORCH_CHECK(spacing > 0.0,
+              "the midtown mesh backend takes a positive mesh spacing, got ",
+              spacing,
+              "; the grid of a target accuracy comes from "
+              "deepmd.dpmodel.long_range.grid_rule.spacing()");
+  return next_factorable(static_cast<int>(std::ceil(length / spacing)));
 }
 
 }  // namespace
@@ -205,8 +226,7 @@ __global__ void k_midtown_finish1(int n, const double* vpot, const double* f3,
                                   const double* q, const bool* mask,
                                   const double* coord, double prefactor,
                                   double kernel_zero, int channel,
-                                  double* energy, double* sums,
-                                  double* moments) {
+                                  double* energy, double* sums) {
   __shared__ double ssum[10][8];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -218,12 +238,10 @@ __global__ void k_midtown_finish1(int n, const double* vpot, const double* f3,
     const double phi = (vpot[i] - prefactor * kernel_zero * q[i]) * m;
     energy[i] = 0.5 * q[i] * phi;
     if (channel >= 0) local[0] = phi;
-    const int k = i * 9;
-    for (int a = 0; a < 3; ++a) {
+      for (int a = 0; a < 3; ++a) {
       for (int b = 0; b < 3; ++b) {
-        const double mom = f3[3 * i + a] * coord[3 * i + b];
-        moments[k + 3 * a + b] = mom;
-        local[1 + 3 * a + b] = mom;
+        // Only the reduction needs it; finish2 recomputes the per-atom value.
+        local[1 + 3 * a + b] = f3[3 * i + a] * coord[3 * i + b];
       }
     }
   }
@@ -254,9 +272,9 @@ __global__ void k_midtown_finish2(int n, const double* vpot, const double* q,
                                   const bool* mask, double prefactor,
                                   double kernel_zero, int channel,
                                   const double* sums, const double* count,
-                                  const double* moments, const double* red,
-                                  double virial_scale, float* grad,
-                                  float* virial9) {
+                                  const double* f3, const double* coord,
+                                  const double* red, double virial_scale,
+                                  float* grad, float* virial9) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const double m = mask[i] ? 1.0 : 0.0;
@@ -269,9 +287,16 @@ __global__ void k_midtown_finish2(int n, const double* vpot, const double* q,
   const double W[9] = {red[1] * v, red[4] * v, red[5] * v,
                        red[4] * v, red[2] * v, red[6] * v,
                        red[5] * v, red[6] * v, red[3] * v};
+  // F_i (x) r_i recomputed here rather than carried through a 72 B/atom
+  // scratch written by finish1 and read back: the same fp64 product of the
+  // same arrays, so bit-identical, without the write+read of 144 B/atom/step.
   const int k = i * 9;
-  for (int t = 0; t < 9; ++t) {
-    virial9[k + t] = static_cast<float>(moments[k + t] + (W[t] - sums[1 + t]) / cnt);
+  for (int a = 0; a < 3; ++a) {
+    for (int b = 0; b < 3; ++b) {
+      const int t = 3 * a + b;
+      const double mom = f3[3 * i + a] * coord[3 * i + b];
+      virial9[k + t] = static_cast<float>(mom + (W[t] - sums[1 + t]) / cnt);
+    }
   }
 }
 
@@ -283,69 +308,6 @@ __global__ void k_midtown_virial(const double* red, double scale, float* out) {
     return;
   }
   out[t] = static_cast<float>(red[1 + kSym[t]] * scale);
-}
-
-// The share of the frame virial of the owners of a frame, as the operator
-// contract states it (ops.cc): the sum of sum_i F_i (x) r_i over the owners,
-// plus n (W - sum_j F_j (x) r_j) / N of the rest of the k-space virial, with n
-// the owners and N the charged nodes of the frame.  A domain-decomposed system
-// runs the replicated mesh of the frame on every rank and returns the slice of
-// its owners, so a rank that returned W itself would have it counted once per
-// rank by the caller's frame sum, and the long-range virial, hence the
-// pressure, would drift with the rank count.  ``moments`` holds the nine
-// components of F_i (x) r_i of every node of the frame, ``sums`` their sums
-// over the charged nodes of the frame and ``count`` that count; ``red`` holds
-// the six k-space sums xx yy zz xy xz yz.  The caller takes W itself when it
-// owns every node.
-constexpr int kVirialThreads = 256;
-
-__global__ void __launch_bounds__(kVirialThreads)
-    k_midtown_virial_share(const double* __restrict__ moments,
-                           int owner_begin,
-                           int owner_count,
-                           const double* __restrict__ sums,
-                           const double* __restrict__ count,
-                           const double* __restrict__ red,
-                           double virial_scale,
-                           float* __restrict__ out) {
-  __shared__ double partial[9][kVirialThreads];
-  double local[9];
-#pragma unroll
-  for (int t = 0; t < 9; ++t) {
-    local[t] = 0.0;
-  }
-  for (int i = threadIdx.x; i < owner_count; i += kVirialThreads) {
-    const int k = (owner_begin + i) * 9;
-#pragma unroll
-    for (int t = 0; t < 9; ++t) {
-      local[t] += moments[k + t];
-    }
-  }
-#pragma unroll
-  for (int t = 0; t < 9; ++t) {
-    partial[t][threadIdx.x] = local[t];
-  }
-  __syncthreads();
-  for (int stride = kVirialThreads / 2; stride > 0; stride /= 2) {
-    if (threadIdx.x < stride) {
-#pragma unroll
-      for (int t = 0; t < 9; ++t) {
-        partial[t][threadIdx.x] += partial[t][threadIdx.x + stride];
-      }
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x >= 9) {
-    return;
-  }
-  const int t = threadIdx.x;
-  static const int kSym[9] = {0, 3, 4, 3, 1, 5, 4, 5, 2};
-  const double cnt = count[0] > 0.0 ? count[0] : 1.0;
-  const double W = red[1 + kSym[t]] * virial_scale;
-  const double share =
-      partial[t][0] +
-      static_cast<double>(owner_count) * (W - sums[1 + t]) / cnt;
-  out[t] = static_cast<float>(share);
 }
 
 namespace {
@@ -409,7 +371,11 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              double spacing,
                              int owner_begin,
                              int owner_count,
-                             const torch::Tensor* communicator) {
+                             const torch::Tensor* communicator,
+                             int64_t force_mode,
+                             bool quads) {
+  const auto stream = at::cuda::getCurrentCUDAStream();
+
   CpuTimer::cycle();
   TORCH_CHECK(kernel == kSog,
               "the midtown mesh backend evaluates the SOG kernel only");
@@ -432,8 +398,13 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
               "the midtown mesh backend needs amplitude and rate pairs, got ",
               coefficient.size(0), " coefficients");
 
-  const int spline = midtown_spline(order);
+  const int spline = midtown_spline(order, quads);
+  const bool is_quads = (spline == SOG_QUADS_4 || spline == SOG_QUADS_6);
   const int64_t bands = coefficient.size(0) / 2;
+  if (std::getenv("SOG_MIDTOWN_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[midtown] nodes=%lld frames=%lld\n",
+                 static_cast<long long>(n), static_cast<long long>(frame_count));
+  }
 
   // The coefficients are metadata: the caller passes them on the host, so no
   // device synchronization happens here.  The frame boundaries are only read
@@ -441,9 +412,33 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
   // device (the charge constraint reads it there).
   CpuTimer tm;
   const bool coef_host = coefficient.device().is_cpu();
-  torch::Tensor coef_h =
-      coef_host ? coefficient.detach().flatten().contiguous()
-                : coefficient.detach().flatten().to(at::kCPU).contiguous();
+  // A CUDA coefficient (the frozen canonical graph carries it as a device
+  // constant) cannot be copied to an ordinary CPU tensor while a stream is
+  // being captured: ATen rejects the copy and the whole graph capture falls
+  // back to eager.  Keep a pinned host mirror, keyed by the tensor identity,
+  // so the first call stages it and every later call (including the capture)
+  // reuses it.  A pinned destination is the one copy ATen allows inside a
+  // capture, so even the first call is legal.
+  torch::Tensor coef_h;
+  if (coef_host) {
+    coef_h = coefficient.detach().flatten().contiguous();
+  } else {
+    static std::mutex coef_mutex;
+    static const void* coef_ptr = nullptr;
+    static int64_t coef_numel = -1;
+    static torch::Tensor coef_pinned;
+    const std::lock_guard<std::mutex> lock(coef_mutex);
+    const void* ptr = coefficient.data_ptr();
+    if (coef_ptr != ptr || coef_numel != coefficient.numel()) {
+      coef_pinned = torch::empty(
+          {coefficient.numel()},
+          coefficient.options().device(at::kCPU).pinned_memory(true));
+      coef_pinned.copy_(coefficient.detach().flatten());
+      coef_ptr = ptr;
+      coef_numel = coefficient.numel();
+    }
+    coef_h = coef_pinned;
+  }
   const double* cf = coef_h.data_ptr<double>();
   std::vector<double> amp(bands), bw(bands);
   double kernel_zero = 0.0;
@@ -496,9 +491,6 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
   // A frame with no charged nodes is skipped, so its virial row is never
   // written: keep the zero fill here (one tiny memset, not per-node).
   auto virial = torch::zeros({frame_count, 9}, float_options);
-  // Owners other than every node lie in one frame (latent_charge_sum), whose
-  // virial is then the share of these owners rather than the whole frame.
-  const bool every_node = owner_begin == 0 && owner_count == n;
 
   tm.mark("hostparse");
   std::lock_guard<std::mutex> lock(midtown_mutex());
@@ -518,6 +510,8 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     const bool tilted = std::fabs(c[1]) >= 1e-12 || std::fabs(c[2]) >= 1e-12 ||
                         std::fabs(c[3]) >= 1e-12 || std::fabs(c[5]) >= 1e-12 ||
                         std::fabs(c[6]) >= 1e-12 || std::fabs(c[7]) >= 1e-12;
+    TORCH_CHECK(!(is_quads && tilted),
+                "the QuadS backend supports orthogonal cells only");
     const double lx = c[0], ly = c[4], lz = c[8];
 
     // The metric of a triclinic cell: W = A^{-1} A^{-T} with A the rows.  The
@@ -571,10 +565,10 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     auto q = at::empty({count}, double_options);
     auto csums = at::zeros({2}, double_options);
     const int qblocks = static_cast<int>((count + 255) / 256);
-    k_midtown_charges1<<<qblocks, 256>>>(
+    k_midtown_charges1<<<qblocks, 256,0,stream>>>(
         static_cast<int>(count), raw.data_ptr<float>(), mask_f.data_ptr<bool>(),
         q.data_ptr<double>(), csums.data_ptr<double>());
-    k_midtown_charges2<<<qblocks, 256>>>(
+    k_midtown_charges2<<<qblocks, 256,0,stream>>>(
         static_cast<int>(count), mask_f.data_ptr<bool>(),
         csums.data_ptr<double>(), qtot + f, static_cast<int>(channel),
         q.data_ptr<double>());
@@ -583,9 +577,9 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     auto c_f = coord.narrow(0, begin, count);
 
     // ── grid, green tables and device state ──
-    const int nx = midtown_axis(lens[0], bw, spline, spacing);
-    const int ny = midtown_axis(lens[1], bw, spline, spacing);
-    const int nz = midtown_axis(lens[2], bw, spline, spacing);
+    const int nx = midtown_axis(lens[0], spacing);
+    const int ny = midtown_axis(lens[1], spacing);
+    const int nz = midtown_axis(lens[2], spacing);
     // The green tables and the metric depend on the cell, but an NPT step
     // changes it by ~1e-4: rebuilding them every step costs milliseconds.
     // Rebuild only when the cell drifts past a tolerance (the box_tol idea of
@@ -597,9 +591,22 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         cell_drift = std::max(cell_drift, std::fabs(local.cell[k] - c[k]) / scale);
       }
     }
+    // Must mirror the default chosen at the rebuild below, or a rebuild in one
+    // form would be reported as satisfying a request for the other.
+    //
+    // Default: Form A on for every non-tilted midtown mesh, at both CubeS2
+    // orders.  `SOG_MIDTOWN_FORM_A=0/1` overrides either way; tilted cells have
+    // no measured window symbol and stay on Form B.
     const char* fa_env_want = std::getenv("SOG_MIDTOWN_FORM_A");
+    // QuadS builds the exact window inverse directly (sog_green.h), so its
+    // table is Form A by construction; the env switch below only governs the
+    // CubeS2 variance subtraction.
     const int want_form =
-        (fa_env_want != nullptr && std::atoi(fa_env_want) != 0 && !tilted) ? 1 : 0;
+        (is_quads || (!tilted &&
+                      (fa_env_want != nullptr ? std::atoi(fa_env_want) != 0
+                                              : true)))
+            ? 1
+            : 0;
     const bool same = local.ready && !local.slab && local.form == want_form &&
                       local.nx == nx && local.ny == ny && local.nz == nz &&
                       local.spline == spline && local.amp == amp &&
@@ -612,6 +619,33 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                 nz, int(tilted), amp.size());
       }
       std::vector<double> ge, gf, gv;
+      // Refuse before the host-side green build: at a large box the replicated
+      // mesh costs several GiB per rank, and a bare `cudaMalloc: out of memory`
+      // arrives only after tens of GB of host tables and about a minute of
+      // single-threaded work.  `setup_replicated` allocates f_gp (8 B), f_rho_r
+      // (4 B) and f_rho_fx (8 B) per grid point; keep 10% headroom for the
+      // cuFFT work area.
+      {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        const double ng = static_cast<double>(nx) * ny * nz;
+        // f_gp (float2, 8 B) + f_rho_r (4) + f_rho_fx (8) per grid point.
+        // QuadS adds its half-spectrum buffer (4 B) and the ik force mode the
+        // three gradient meshes (12 B) plus their half-spectrum scratch (4 B);
+        // the old flat 20 counted neither, so a QuadS-ik mesh could pass this
+        // check and then fail inside the solve.
+        const double per_point = 20.0 + (is_quads ? 4.0 : 0.0) +
+                                 (force_mode != 0 ? 16.0 : 0.0);
+        const double need = ng * per_point;
+        TORCH_CHECK(static_cast<double>(free_b) >= need * 1.10,
+                    "midtown: the replicated mesh needs ",
+                    need / 1073741824.0, " GiB of device memory for a ", nx,
+                    "x", ny, "x", nz, " grid, but only ",
+                    static_cast<double>(free_b) / 1073741824.0,
+                    " GiB is free. Use a coarser mesh (a larger `pme_spacing` "
+                    "or a less demanding `pme_accuracy`), a smaller box, or a "
+                    "distributed backend where the force mode allows one.");
+      }
       if (tilted) {
         sog_green::build_green_metric(nx, ny, nz, W, amp, bw, spline, ge, gf,
                                       gv);
@@ -624,13 +658,20 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
       sog_gpu_setup_f32(local.state, nx, ny, nz, ge.data(), gf.data(),
                         gv.data());
       // Form A: replace the Form-B variance subtraction by the exact measured
-      // assignment-window symbol.  Off by default so the two can be measured
-      // against each other on identical inputs; see docs/LONG_RANGE_PORT.md.
-      // Value-parsed like SOG_MIDTOWN_SLAB / SOG_MIDTOWN_DIST: a bare presence
-      // test made `SOG_MIDTOWN_FORM_A=0` turn Form A ON.
+      // assignment-window symbol (see the Midtown paper).
+      //
+      // Default: ON at both CubeS2 orders, for every non-tilted mesh.  The
+      // variance-subtraction residual dominates the order-4 energy error
+      // (18-78x on the same grid) and is small but nonzero at order 6; exact
+      // inversion is the reference form and `SOG_MIDTOWN_FORM_A=0/1` overrides.
       const char* fa_env = std::getenv("SOG_MIDTOWN_FORM_A");
-      if (fa_env != nullptr && std::atoi(fa_env) != 0 && !tilted) {
-        const int nord = (spline == SOG_CUBES2_6) ? 6 : 4;
+      const int nord = (spline == SOG_CUBES2_6) ? 6 : 4;
+      // QuadS is already the exact window inverse; converting it again with
+      // the CubeS2 symbol would apply the wrong deconvolution.
+      const bool form_a =
+          !tilted && !is_quads &&
+          (fa_env != nullptr ? std::atoi(fa_env) != 0 : true);
+      if (form_a) {
         // nth must be >= 1: with 0 the theta loops never run, acc stays zero
         // and w = 0 * inf is NaN, which the floor test then silently swallows
         // while zeroing the whole reciprocal interaction.
@@ -680,7 +721,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         uy, uz, q.data_ptr<double>(), prefactor, spline,
         /*want_potential=*/1, d_force.data_ptr<double>(),
         d_vpot.data_ptr<double>(), /*self_coeff=*/0.0, /*qsqsum=*/0.0,
-        /*remove_self=*/0);
+        /*remove_self=*/0, static_cast<int>(force_mode));
     // The 20 reduction sums stay on the device: the finish kernels read them
     // in place, so no scalar and no copy crosses to the host.
     const double* red = sog_gpu_red_device_ptr(local.state);
@@ -694,46 +735,39 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     force.narrow(0, begin, count).copy_(f3);
 
     auto sums = at::zeros({10}, double_options);
-    auto moments = at::empty({count * 9}, double_options);
     const int fblocks = static_cast<int>((count + 255) / 256);
     // The energy lands in the output directly: no buffer, no copy.
     double* energy_out = atom_energy.data_ptr<double>() + begin;
-    k_midtown_finish1<<<fblocks, 256>>>(
+    k_midtown_finish1<<<fblocks, 256,0,stream>>>(
         static_cast<int>(count), d_vpot.data_ptr<double>(),
         f3.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
         c_f.data_ptr<double>(), prefactor, kernel_zero,
-        static_cast<int>(channel), energy_out, sums.data_ptr<double>(),
-        moments.data_ptr<double>());
-    k_midtown_finish2<<<fblocks, 256>>>(
+        static_cast<int>(channel), energy_out, sums.data_ptr<double>());
+    k_midtown_finish2<<<fblocks, 256,0,stream>>>(
         static_cast<int>(count), d_vpot.data_ptr<double>(),
         q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
         static_cast<int>(channel), sums.data_ptr<double>(),
-        csums.data_ptr<double>(), moments.data_ptr<double>(), red,
-        0.5 * volume * prefactor,
+        csums.data_ptr<double>(), f3.data_ptr<double>(),
+        c_f.data_ptr<double>(), red, 0.5 * volume * prefactor,
         charge_gradient.narrow(0, begin, count).data_ptr<float>(),
         atom_virial.narrow(0, begin, count).data_ptr<float>());
 
-    // The frame virial, from the same six sums: W itself when this call owns
-    // every node, else the share of its owners, which the ranks of a
-    // decomposed frame add up to W (ops.cc).
-    if (every_node) {
-      k_midtown_virial<<<1, 32>>>(red, 0.5 * volume * prefactor,
-                                  virial.data_ptr<float>() + 9 * f);
-    } else {
-      k_midtown_virial_share<<<1, kVirialThreads>>>(
-          moments.data_ptr<double>(), static_cast<int>(owner_begin - begin),
-          static_cast<int>(owner_count), sums.data_ptr<double>(),
-          csums.data_ptr<double>(), red, 0.5 * volume * prefactor,
-          virial.data_ptr<float>() + 9 * f);
-    }
+    // The frame virial, from the same six sums, in one nine-thread kernel.
+    k_midtown_virial<<<1, 32,0,stream>>>(red, 0.5 * volume * prefactor,
+                                virial.data_ptr<float>() + 9 * f);
 
     tm.mark("finish");
     begin += count;
   }
   tm.mark("postloop");
   // The caller keeps only the nodes this rank owns.
+  //
+  // The flush is NOT part of the ownership branch: with np > 1 every rank owns a
+  // slice, so gating the report on "this rank owns the whole frame" meant the
+  // timer printed nothing exactly where the per-step cost matters.  flush()
+  // itself already throttles to one report per 50 calls.
+  CpuTimer::flush();
   if (owner_begin == 0 && owner_count == n) {
-    CpuTimer::flush();
   return {atom_energy, charge_gradient, force, atom_virial, virial};
   }
   auto cut = [&](const torch::Tensor& t) {
@@ -766,6 +800,9 @@ ChargeSumOutputs midtown_sum_local(
   TORCH_CHECK(n_node_per_frame.size(0) == 1,
               "the distributed midtown backend takes one frame");
   const int64_t count = coord.size(0);
+  if (std::getenv("SOG_MIDTOWN_DEBUG") != nullptr) {
+    std::fprintf(stderr, "[slab] count=%lld\n", static_cast<long long>(count));
+  }
 
   const bool coef_host = coefficient.device().is_cpu();
   torch::Tensor coef_h =
@@ -833,9 +870,9 @@ ChargeSumOutputs midtown_sum_local(
     local.state = sog_gpu_create();
     TORCH_CHECK(local.state != nullptr, "midtown: sog_gpu_create failed");
   }
-  const int nx = midtown_axis(lx, bw, spline, spacing);
-  const int ny = midtown_axis(ly, bw, spline, spacing);
-  const int nz = midtown_axis(lz, bw, spline, spacing);
+  const int nx = midtown_axis(lx, spacing);
+  const int ny = midtown_axis(ly, spacing);
+  const int nz = midtown_axis(lz, spacing);
   // The green tables depend on the cell, and an MD barostat moves it by ~1e-4
   // per step: rebuilding them every call cost 11 ms at a 100^3 mesh, which is
   // more than the whole solve.  Rebuild only when the cell drifts past the
@@ -880,7 +917,8 @@ ChargeSumOutputs midtown_sum_local(
   const double boxlo[3] = {0.0, 0.0, 0.0};
   sog_gpu_spread_f(local.state, static_cast<int>(count),
                    c_f.data_ptr<double>(), boxlo, lx, ly, lz,
-                   q.data_ptr<double>(), (double)(nx * ny * nz) / volume);
+                   q.data_ptr<double>(), (double)(nx * ny * nz) / volume,
+                   spline);
   sog_gpu_fx_to_real(local.state);
   {
     const int64_t ng = int64_t{nx} * ny * nz;
@@ -902,7 +940,7 @@ ChargeSumOutputs midtown_sum_local(
   sog_gpu_solve_f(local.state, static_cast<int>(count), c_f.data_ptr<double>(),
                   boxlo, lx, ly, lz, q.data_ptr<double>(), prefactor,
                   /*want_pot=*/1, /*density_ready=*/1, d_force.data_ptr<double>(),
-                  d_vpot.data_ptr<double>());
+                  d_vpot.data_ptr<double>(), spline);
   // red[0..6] comes from the k-space pass over the SUMMED density, so it is
   // already the whole frame's energy and virial; summing it again would double
   // it (it is a mode sum, not an atom sum).
@@ -912,34 +950,32 @@ ChargeSumOutputs midtown_sum_local(
   auto f_s = d_force.reshape({count, 3});
   force.copy_(f_s);
   auto sums = at::zeros({10}, double_options);
-  auto moments = at::empty({count * 9}, double_options);
   auto energy_f = at::empty({count}, double_options);
   const int fblocks = static_cast<int>((count + 255) / 256);
   k_midtown_finish1<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       f_s.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
       c_f.data_ptr<double>(), prefactor, kernel_zero, static_cast<int>(channel),
-      energy_f.data_ptr<double>(), sums.data_ptr<double>(),
-      moments.data_ptr<double>());
+      energy_f.data_ptr<double>(), sums.data_ptr<double>());
   // The frame sums (the constrained-channel potential sum and the nine moment
   // sums) are what finish2 shares over the charged nodes, so they are global.
   sums.copy_(sum_over_domains(*communicator, sums));
   auto red = red_dev.clone();
+  auto vscale = red.narrow(0, 1, 6) * (0.5 * volume * prefactor);
   k_midtown_finish2<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
       static_cast<int>(channel), sums.data_ptr<double>(),
-      count_d.data_ptr<double>(), moments.data_ptr<double>(),
-      red.data_ptr<double>(), 0.5 * volume * prefactor,
+      count_d.data_ptr<double>(), f_s.data_ptr<double>(),
+      c_f.data_ptr<double>(), red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
   atom_energy.copy_(energy_f.reshape({count, 1}));
-  // The share of this rank in the frame virial: its own moments plus its even
-  // share of the rest of the k-space virial, which the ranks add up to W.
-  k_midtown_virial_share<<<1, kVirialThreads>>>(
-      moments.data_ptr<double>(), 0, static_cast<int>(count),
-      sums.data_ptr<double>(), count_d.data_ptr<double>(),
-      red.data_ptr<double>(), 0.5 * volume * prefactor,
-      virial.data_ptr<float>());
+  static const int64_t kSym[9] = {0, 3, 4, 3, 1, 5, 4, 5, 2};
+  auto sym_index = at::from_blob(const_cast<int64_t*>(kSym), {9}, at::kLong)
+                       .clone()
+                       .to(coord.device());
+  auto w = vscale.index_select(0, sym_index).reshape({3, 3});
+  virial.copy_(w.reshape({1, 9}).to(at::kFloat));
   return {atom_energy, charge_gradient, force, atom_virial, virial};
 }
 
@@ -1012,10 +1048,8 @@ ChargeSumOutputs midtown_sum_slab(
     const torch::Tensor& total_charge, const torch::Tensor& box,
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
-    const torch::Tensor* communicator) {
-  TORCH_CHECK(!form_a_requested(),
-              "midtown: SOG_MIDTOWN_FORM_A is implemented on the replicated "
-              "solve only; unset it for the slab path");
+    const torch::Tensor* communicator, bool quads, bool bspline,
+    int64_t force_mode) {
   TORCH_CHECK(kernel == kSog, "the slab midtown backend evaluates the SOG kernel only");
   TORCH_CHECK(charge.size(1) == 1, "the slab midtown backend supports one channel");
   TORCH_CHECK(channel == -1 || channel == 0,
@@ -1047,17 +1081,17 @@ ChargeSumOutputs midtown_sum_slab(
   TORCH_CHECK(!tilted, "the slab midtown backend supports orthogonal cells only");
   const double lx = c[0], ly = c[4], lz = c[8];
   const double volume = lx * ly * lz;
-  const int spline = midtown_spline(order);
+  TORCH_CHECK(!bspline || (order == 4 || order == 5 || order == 6),
+              "the slab B-spline backend supports order 4, 5 or 6, got ", order);
+  const int spline =
+      bspline ? (order == 6 ? SOG_BSPLINE_6
+                            : (order == 5 ? SOG_BSPLINE_5 : SOG_BSPLINE_4))
+              : midtown_spline(order, quads);
 
   const int np = deepmd::long_range::domain_count(*communicator);
   const int me = deepmd::long_range::domain_rank(*communicator);
   auto TR = [](){ return std::getenv("SOG_SLAB_TRACE") != nullptr; };
   if (TR()) fprintf(stderr, "[slab] enter np=%d me=%d\n", np, me);
-  // The slab path launches on the legacy default stream while AOTI evaluates
-  // on a side stream.  Wait for the previous call's default-stream work here
-  // (entry only): it orders consecutive steps without waiting on the side
-  // stream, which deadlocks (cudaDeviceSynchronize / exit waits).
-  cudaStreamSynchronize(nullptr);
   // NCCL only moves the transposed blocks BETWEEN ranks.  At np=1 both
   // all-to-alls are an identity permutation and the accumulator sum is already
   // complete, so no communicator is created and the backend runs without
@@ -1070,17 +1104,35 @@ ChargeSumOutputs midtown_sum_slab(
                 "(libnccl.so.2, or the CUDA wheel's nvidia/nccl)");
   }
 
-  const int nx = midtown_axis(lx, bw, spline, spacing);
-  const int ny = midtown_axis(ly, bw, spline, spacing);
-  const int nz = midtown_axis(lz, bw, spline, spacing);
+  const int nx = midtown_axis(lx, spacing);
+  const int ny = midtown_axis(ly, spacing);
+  const int nz = midtown_axis(lz, spacing);
   const int zlo = me * nz / np, zhi = (me + 1) * nz / np - 1;
   const int ZL = zhi - zlo + 1;
   const int ylo = me * ny / np, YL = (me + 1) * ny / np - ylo;
-  const int gh = (spline == 6) ? 6 : 4;
+  // Ghost margin = the stencil width.  CubeS2/QuadS reach `order` points per
+  // axis (offsets -1..2 for 4, -2..3 for 6); B-spline of order p reaches
+  // p points from floor(p-1)/2 to the left, so p covers it too.
+  const int gh = bspline ? static_cast<int>(order) : ((order == 6) ? 6 : 4);
   TORCH_CHECK(ZL >= gh, "midtown slab: nz/np = ", ZL,
               " is thinner than the stencil (", gh,
               "); use fewer ranks or a finer grid");
-  const bool full_brick = (ZL == nz);
+  // full_brick: the atom decomposition is NOT rank == z-slab, so a rank owns
+  // atoms at any z.  Every rank then spreads into a full-height brick and the
+  // density/potential are made global with one device all-reduce each; the
+  // transforms below still work on this rank's nz/np z-slab, so the mesh
+  // memory and the collective traffic of the transposes are unchanged.  The
+  // trade is the spread brick: it holds all nz planes (+ghosts) instead of
+  // ZL, i.e. the full mesh rather than 1/np of it.
+  //
+  // Selected automatically when a single z band owns the box (np == 1), or
+  // forced with SOG_MIDTOWN_FULLBRICK=1 for a processor grid that splits x
+  // and/or y (the LAMMPS default).  Without the force the z-band guard below
+  // rejects such a grid rather than silently spreading atoms onto the wrong
+  // slab.
+  const char* fb_env = std::getenv("SOG_MIDTOWN_FULLBRICK");
+  const bool full_brick =
+      (ZL == nz) || (fb_env != nullptr && std::atoi(fb_env) != 0);
   const int zb_lo = full_brick ? -gh : zlo - gh;
   const int zb_hi = full_brick ? nz - 1 + gh : zhi + gh;
   const int ZB = full_brick ? nz + 2 * gh : ZL + 2 * gh;
@@ -1108,7 +1160,19 @@ ChargeSumOutputs midtown_sum_slab(
       cell_drift = std::max(cell_drift, std::fabs(local.cell[k] - c[k]) / scale);
     }
   }
-  const bool same = local.ready && local.slab && local.form == 0 &&
+  const bool is_quads = (spline == SOG_QUADS_4 || spline == SOG_QUADS_6);
+  const bool is_bspline = (spline >= 200);
+  const char* fa_env_slab = std::getenv("SOG_MIDTOWN_FORM_A");
+  const int want_form =
+      (is_quads || is_bspline ||
+       (fa_env_slab != nullptr ? std::atoi(fa_env_slab) != 0 : true))
+          ? 1
+          : 0;
+  // Only the CubeS2 Form A needs the measured window; QuadS inverts its window
+  // exactly and B-spline inverts its assignment factor exactly, both inside
+  // build_green_slab_half.
+  const bool use_window = (!is_quads && !is_bspline && want_form == 1);
+  const bool same = local.ready && local.slab && local.form == want_form &&
                     local.nx == nx &&
                     local.ny == ny && local.nz == nz &&
                     local.spline == spline && local.amp == amp &&
@@ -1120,13 +1184,32 @@ ChargeSumOutputs midtown_sum_slab(
     // k_green_pencil reads.  Building the full x table and slicing it with an
     // x-stride of nx instead makes the kernel read a value belonging to another
     // (kh, iy, iz) cell, which silently produces a plausible but wrong solve.
+    //
+    // Form A (CubeS2): measure the assignment window <|W|^2> on the full grid
+    // (self-contained, temporary full-grid plan) and hand it to the builder,
+    // which then divides the Form-B slice by D*<|W|^2>.  The window is a global
+    // property, identical on every rank, so no communication is needed.
+    std::vector<double> window;
+    const double* window_ptr = nullptr;
+    if (use_window) {
+      const size_t nw = (size_t)(nx / 2 + 1) * ny * nz;
+      window.resize(nw);
+      const int nord = (spline == SOG_CUBES2_6) ? 6 : 4;
+      const char* nth_env = std::getenv("SOG_MIDTOWN_FORM_A_NTH");
+      const int nth = std::max(1, nth_env ? std::atoi(nth_env) : 8);
+      const int rc = sog_gpu_measure_window(nx, ny, nz, nord, nth, lx, ly, lz,
+                                            window.data());
+      TORCH_CHECK(rc == 0, "midtown slab: Form-A window measurement failed rc=",
+                  rc);
+      window_ptr = window.data();
+    }
     std::vector<double> sge, sgf, sgv;
     sog_green::build_green_slab_half(nx, ny, nz, lx, ly, lz, amp, bw, spline,
-                                     ylo, YL, sge, sgf, sgv);
+                                     ylo, YL, sge, sgf, sgv, window_ptr);
     const size_t gn = (size_t)(nx / 2 + 1) * YL * nz;
     TORCH_CHECK(sge.size() == gn, "midtown slab: green table size mismatch");
-    sog_gpu_setup_slab(local.state, nx, ny, nz, YL, ZL, sge.data(), sgf.data(),
-                       sgv.data(), gn);
+    sog_gpu_setup_slab(local.state, nx, ny, nz, YL, ZL, sge.data(), sgv.data(),
+                       gn);
     local.nx = nx;
     local.ny = ny;
     local.nz = nz;
@@ -1134,6 +1217,7 @@ ChargeSumOutputs midtown_sum_slab(
     local.amp = amp;
     local.bw = bw;
     local.slab = true;
+    local.form = want_form;
     local.slab_ylo = ylo;
     local.slab_YL = YL;
     for (int k = 0; k < 9; ++k) {
@@ -1227,16 +1311,22 @@ ChargeSumOutputs midtown_sum_slab(
                            c_f.data_ptr<double>(), boxlo, lx, ly, lz,
                            q.data_ptr<double>(), rho_scale, spline, nx, ny, nz,
                            0, nx - 1, 0, ny - 1, zb_lo, zb_hi);
-  if (np == 1) {
-    // Reverse halo: the ghost planes are periodic images, so their charge
-    // folds back into the owned planes at the other end of the slab.  Kept on
-    // the device: the host get/add pairs were four synchronising bus round
-    // trips per ghost plane and dominated the np == 1 call.
+  if (full_brick) {
+    // No z neighbour: the ghost planes are periodic images inside this rank's
+    // own full-height brick.  Fold them first, then sum the bricks across
+    // ranks so every rank holds the GLOBAL density.  The 2^40 integers add
+    // exactly, so the global mesh is independent of the reduction order and of
+    // the atom decomposition.
     for (int j = 0; j < gh; ++j) {
       sog_gpu_brick_add_planes(local.state, plane * (size_t)j,
-                               plane * (size_t)(zoff + ZL - gh + j), plane);
-      sog_gpu_brick_add_planes(local.state, plane * (size_t)(zoff + ZL + j),
-                               plane * (size_t)(zoff + j), plane);
+                               plane * (size_t)(nz + j), plane);
+      sog_gpu_brick_add_planes(local.state, plane * (size_t)(nz + gh + j),
+                               plane * (size_t)(gh + j), plane);
+    }
+    if (np > 1) {
+      TORCH_CHECK(sog_gpu_brick_allreduce_fx(local.state, plane * (size_t)gh,
+                                             plane * (size_t)nz) == 0,
+                  "midtown slab: full-brick density all-reduce failed");
     }
   } else {
     TORCH_CHECK(sog_gpu_nccl_halo_rev(local.state, prev, next, plane, zoff, ZL,
@@ -1278,9 +1368,17 @@ ChargeSumOutputs midtown_sum_slab(
   }
   mark(3);  // forward all-to-all
   if (TR()) fprintf(stderr, "[slab] alltoall fwd done\n");
+  // The ik force mode differentiates in Fourier space: the green-multiplied
+  // potential spectrum is kept (keep_spec), and every Cartesian component is
+  // then pushed through the same inverse z + transpose + inverse (x,y) chain
+  // that the potential takes.  That is one transpose per component -- the price
+  // of the mode -- but it keeps the solve's memory at one extra pencil, one
+  // extra brick, and no extra block buffers.
+  const bool ik = (force_mode != 0);
+  TORCH_CHECK(!ik || (!bspline), "the slab midtown backend implements the ik force mode for CubeS2 and QuadS only");
   TORCH_CHECK(sog_gpu_slab_unpack_green_izpack_dev(
-                  local.state, nx, ny, nz, ylo, YL, lx, ly, lz, nullptr,
-                  nullptr, nullptr, scaleinv, np) == 0,
+                  local.state, nx, ny, nz, ylo, YL, lx, ly, lz, scaleinv, np,
+                  /*keep_spec=*/ik ? 1 : 0) == 0,
               "midtown slab: unpack / z FFT / green failed");
   mark(4);  // unpack + z FFT + green + inverse
   if (TR()) fprintf(stderr, "[slab] zfft+green done\n");
@@ -1291,46 +1389,118 @@ ChargeSumOutputs midtown_sum_slab(
   }
   mark(5);  // accumulator all-reduce
   if (TR()) fprintf(stderr, "[slab] red reduce done\n");
-  if (use_nccl) {
-    TORCH_CHECK(sog_gpu_nccl_alltoall_bwd(local.state, rcnt.data(),
-                                          rdisp.data(), scnt.data(),
-                                          sdisp.data(), np) == 0,
-                "midtown slab: NCCL inverse all-to-all failed");
-  } else {
-    TORCH_CHECK(sog_gpu_slab_copy_packed(local.state, /*forward=*/0,
-                                         (size_t)rcnt[0]) == 0,
-                "midtown slab: packed block copy failed");
-  }
+  // One inverse transpose: the packed blocks of the spectrum just produced in
+  // s_rho are moved to the receiving ranks' (x,y) slabs in s_pot.
+  auto transpose_back = [&]() {
+    if (use_nccl) {
+      TORCH_CHECK(sog_gpu_nccl_alltoall_bwd(local.state, rcnt.data(),
+                                            rdisp.data(), scnt.data(),
+                                            sdisp.data(), np) == 0,
+                  "midtown slab: NCCL inverse all-to-all failed");
+    } else {
+      TORCH_CHECK(sog_gpu_slab_copy_packed(local.state, /*forward=*/0,
+                                           (size_t)rcnt[0]) == 0,
+                  "midtown slab: packed block copy failed");
+    }
+  };
+  // Fill a brick's z ghost planes: a full brick sums the owned planes over the
+  // ranks and wraps them periodically, a z-slab exchanges them with its two
+  // neighbours.
+  auto fill_ghosts = [&](float* brick) {
+    if (full_brick) {
+      // The inverse transform wrote this rank's own ZL planes; the rest of the
+      // brick was zeroed by the unpack.  Sum across ranks to get the full
+      // potential, then fill the periodic ghosts from the owned edge planes.
+      if (np > 1) {
+        TORCH_CHECK(sog_gpu_brick_allreduce_f_at(local.state, brick,
+                                                 plane * (size_t)gh,
+                                                 plane * (size_t)nz) == 0,
+                    "midtown slab: full-brick potential all-reduce failed");
+      }
+      for (int j = 0; j < gh; ++j) {
+        // lower ghost <- the last gh owned planes (periodic wrap)
+        sog_gpu_brick_copy_planes_at(local.state, brick,
+                                     plane * (size_t)(nz + j),
+                                     plane * (size_t)j, plane);
+        // upper ghost <- the first gh owned planes
+        sog_gpu_brick_copy_planes_at(local.state, brick,
+                                     plane * (size_t)(gh + j),
+                                     plane * (size_t)(nz + gh + j), plane);
+      }
+    } else {
+      TORCH_CHECK(sog_gpu_nccl_halo_fwd_at(local.state, brick, prev, next,
+                                           plane, zoff, ZL, gh, gh) == 0,
+                  "midtown slab: NCCL forward halo failed");
+    }
+  };
+  transpose_back();
   mark(6);  // inverse all-to-all
   if (TR()) fprintf(stderr, "[slab] alltoall bwd done\n");
   TORCH_CHECK(sog_gpu_slab_unpack_ixyfft_to_brick_dev(local.state, nx, ny, nz,
-                                                      ZL, np, zoff, ZB) == 0,
+                                                      ZL, np, zoff, ZB,
+                                                      /*out=*/nullptr) == 0,
               "midtown slab: unpack + inverse (x,y) FFT failed");
   mark(7);  // unpack + inverse (x,y) FFT
-  if (np > 1) {
-    TORCH_CHECK(sog_gpu_nccl_halo_fwd(local.state, prev, next, plane, zoff, ZL,
-                                      gh, gh) == 0,
-                "midtown slab: NCCL forward halo failed");
-  } else {
-    // Forward halo: the potential is periodic, so the owned edge planes fill
-    // the ghosts of the other end.  Device to device, as above.
-    for (int j = 0; j < gh; ++j) {
-      sog_gpu_brick_copy_planes(local.state, plane * (size_t)(zoff + j),
-                                plane * (size_t)(zoff + ZL + j), plane);
-      sog_gpu_brick_copy_planes(local.state,
-                                plane * (size_t)(zoff + ZL - gh + j),
-                                plane * (size_t)j, plane);
-    }
-  }
+  fill_ghosts(sog_gpu_potential_brick(local.state));
 
   mark(8);  // forward halo
   if (TR()) fprintf(stderr, "[slab] ixyfft done\n");
-  std::vector<double> force(3 * (size_t)count), vpot((size_t)count);
-  sog_gpu_gather_brick_dev(local.state, static_cast<int>(count),
-                           c_f.data_ptr<double>(), boxlo, lx, ly, lz,
-                           q.data_ptr<double>(), prefactor, spline, nx, ny, nz,
-                           0, nx - 1, 0, ny - 1, zb_lo, zb_hi, force.data(),
-                           vpot.data());
+  auto d_force = at::empty({3 * (int64_t)count}, coord.options());
+  auto d_vpot = at::empty({(int64_t)count}, coord.options());
+  if (!ik) {
+    // Device-resident AD path: x/q are the caller's CUDA tensors, and the
+    // gather writes force/vpot straight to device buffers.  No host round trip.
+    sog_gpu_gather_brick_dev_ptr(
+        local.state, static_cast<int>(count), c_f.data_ptr<double>(), boxlo,
+        lx, ly, lz, q.data_ptr<double>(), prefactor, spline, nx, ny, nz, 0,
+        nx - 1, 0, ny - 1, zb_lo, zb_hi,
+        d_force.data_ptr<double>(), d_vpot.data_ptr<double>());
+  } else {
+    std::vector<double> force(3 * (size_t)count), vpot((size_t)count);
+    sog_gpu_gather_brick_dev(local.state, static_cast<int>(count),
+                             c_f.data_ptr<double>(), boxlo, lx, ly, lz,
+                             q.data_ptr<double>(), prefactor, spline, nx, ny,
+                             nz, 0, nx - 1, 0, ny - 1, zb_lo, zb_hi,
+                             force.data(), vpot.data());
+    float* gbrick = sog_gpu_grad_brick(local.state, (size_t)ZB * plane);
+    TORCH_CHECK(gbrick != nullptr,
+                "midtown slab: gradient brick allocation failed");
+    TORCH_CHECK(sog_gpu_slab_grad_izpack_dev(local.state, nx, ny, nz, ylo, YL,
+                                             lx, ly, lz, np, /*axis=*/2) == 0,
+                "midtown slab: z gradient pack failed");
+    transpose_back();
+    TORCH_CHECK(sog_gpu_slab_unpack_ixyfft_to_brick_dev(
+                    local.state, nx, ny, nz, ZL, np, zoff, ZB,
+                    gbrick) == 0,
+                "midtown slab: unpack + inverse (x,y) FFT failed");
+    fill_ghosts(gbrick);
+    sog_gpu_gather_brick_dev_ik(
+        local.state, static_cast<int>(count), c_f.data_ptr<double>(), boxlo, lx,
+        ly, lz, q.data_ptr<double>(), prefactor, spline, nx, ny, nz, 0, nx - 1,
+        0, ny - 1, zb_lo, zb_hi, nullptr, gbrick, /*comp=*/2, /*want_pot=*/0, /*upload=*/1);
+    for (int axis = 0; axis < 2; ++axis) {
+      TORCH_CHECK(sog_gpu_slab_grad_izpack_dev(local.state, nx, ny, nz, ylo, YL,
+                                               lx, ly, lz, np, axis) == 0,
+                  "midtown slab: gradient pack failed");
+      transpose_back();
+      TORCH_CHECK(sog_gpu_slab_unpack_ixyfft_to_brick_dev(
+                      local.state, nx, ny, nz, ZL, np, zoff, ZB,
+                      gbrick) == 0,
+                  "midtown slab: unpack + inverse (x,y) FFT failed");
+      fill_ghosts(gbrick);
+      sog_gpu_gather_brick_dev_ik(
+          local.state, static_cast<int>(count), c_f.data_ptr<double>(), boxlo,
+          lx, ly, lz, q.data_ptr<double>(), prefactor, spline, nx, ny, nz, 0,
+          nx - 1, 0, ny - 1, zb_lo, zb_hi, sog_gpu_potential_brick(local.state),
+          gbrick, axis, /*want_pot=*/0, /*upload=*/0);
+    }
+    sog_gpu_gather_brick_ik_finish(local.state, static_cast<int>(count),
+                                   force.data(), vpot.data(), /*want_pot=*/0);
+    d_force.copy_(at::from_blob(force.data(), {3 * count}, at::kDouble)
+                      .to(coord.device()));
+    d_vpot.copy_(at::from_blob(vpot.data(), {count}, at::kDouble)
+                     .to(coord.device()));
+  }
   mark(9);  // gather
   if (TR()) fprintf(stderr, "[slab] gather done\n");
   if (tim) {
@@ -1355,12 +1525,6 @@ ChargeSumOutputs midtown_sum_slab(
   double acc[20] = {0};
   sog_gpu_red_download(local.state, acc);
 
-  // double_options carries the CUDA device: from_blob on a host pointer needs
-  // plain CPU options or the tensor claims a device it does not live on.
-  auto d_vpot = at::from_blob(vpot.data(), {count}, at::kDouble)
-                    .to(coord.device()).clone();
-  auto d_force = at::from_blob(force.data(), {3 * count}, at::kDouble)
-                     .to(coord.device()).clone();
   auto red = at::from_blob(acc, {7}, at::kDouble).to(coord.device()).clone();
 
   auto atom_energy = torch::zeros({count, 1}, double_options);
@@ -1372,31 +1536,23 @@ ChargeSumOutputs midtown_sum_slab(
   force_out.copy_(d_force.reshape({count, 3}));
 
   auto sums = at::zeros({10}, double_options);
-  auto moments = at::empty({count * 9}, double_options);
   const int fblocks = static_cast<int>((count + 255) / 256);
   k_midtown_finish1<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       d_force.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
       c_f.data_ptr<double>(), prefactor, kernel_zero, static_cast<int>(channel),
-      atom_energy.data_ptr<double>(), sums.data_ptr<double>(),
-      moments.data_ptr<double>());
+      atom_energy.data_ptr<double>(), sums.data_ptr<double>());
   sums.copy_(sum_over_domains(*communicator, sums));
   auto count_d = csums.narrow(0, 0, 1).clamp_min(1.0);
   k_midtown_finish2<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
       static_cast<int>(channel), sums.data_ptr<double>(),
-      count_d.data_ptr<double>(), moments.data_ptr<double>(),
-      red.data_ptr<double>(), 0.5 * volume * prefactor,
+      count_d.data_ptr<double>(), d_force.data_ptr<double>(),
+      c_f.data_ptr<double>(), red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
-  // The share of this rank in the frame virial, as in the other two paths: its
-  // own moments plus its even share of the rest of the k-space virial, which
-  // the ranks add up to W.
-  k_midtown_virial_share<<<1, kVirialThreads>>>(
-      moments.data_ptr<double>(), 0, static_cast<int>(count),
-      sums.data_ptr<double>(), count_d.data_ptr<double>(),
-      red.data_ptr<double>(), 0.5 * volume * prefactor,
-      virial.data_ptr<float>());
+  k_midtown_virial<<<1, 32>>>(red.data_ptr<double>(), 0.5 * volume * prefactor,
+                              virial.data_ptr<float>());
   return {atom_energy, charge_gradient, force_out, atom_virial, virial};
 }
 

@@ -164,6 +164,13 @@ std::pair<torch::Tensor, std::int64_t> gather_domain_rows(
 torch::Tensor sum_over_domains(const torch::Tensor& communicator,
                                const torch::Tensor& values) {
 #ifdef USE_MPI
+  // A zero address is the single-domain caller (no MPI communicator): the sum
+  // over domains is the local values alone.  Dereferencing the handle here
+  // would read address zero and crash, which is exactly what the single-rank
+  // distributed solve hits.
+  if (address_of(communicator) == 0) {
+    return values;
+  }
   TORCH_CHECK(values.dim() == 1 && values.scalar_type() == torch::kFloat64,
               "sum_over_domains: values must be a float64 vector");
   const MPI_Comm comm = communicator_of(communicator);
@@ -192,6 +199,11 @@ torch::Tensor sum_over_domains(const torch::Tensor& communicator,
 torch::Tensor sum_over_domains_f32(const torch::Tensor& communicator,
                                    const torch::Tensor& values) {
 #ifdef USE_MPI
+  // Single-domain caller: the sum over domains is the local values (see
+  // sum_over_domains).  A null handle must not be dereferenced.
+  if (address_of(communicator) == 0) {
+    return values;
+  }
   TORCH_CHECK(values.dim() == 1 && values.scalar_type() == torch::kFloat32,
               "sum_over_domains_f32: values must be a float32 vector");
   const MPI_Comm comm = communicator_of(communicator);
