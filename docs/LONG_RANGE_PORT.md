@@ -315,6 +315,13 @@ density, so summing it again doubles the virial (measured: exactly 2x at np=2).
 After the fix, np=2 agrees with the replicated path to max|dF| 6e-6 and
 max|dE| 2e-6 (2.9e-7 relative), from 1.36 and 0.68.
 
+The frame virial is a share as well (see `docs/SEZM_1L_VIRIAL_BUG.md`): every
+midtown path returns `sum_owned F(x)r + n_owned (W - sum_all F(x)r) / N`, so
+the ranks add up to `W`, not `nranks * W`.  The replicated path returned `W`
+on every rank before, which made the LAMMPS pressure of a 1L SeZM model drift
+by -462 atm per added rank; `mesh_sum` (bspline) always partitioned it, and
+`direct_sum` sums the per-node virials of its owners.
+
 It is still not the default, for a measured reason:
 
 | np=2, 12288 atoms, 0.5 A | ms/call |

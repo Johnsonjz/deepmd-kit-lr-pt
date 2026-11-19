@@ -7,6 +7,13 @@
 // mesh_sum.cu.  It shares the contract of ``mesh_sum``: the same arguments,
 // the same outputs and the same formulas, so the caller does not change.
 //
+// The frame virial follows that contract as well: a frame that a call owns
+// whole returns W = -dE/d(strain), and a frame decomposed over domains
+// returns the share of its owners, which the ranks add up to W
+// (``k_midtown_virial_share``).  A rank that returned W itself would have it
+// counted once per rank by the caller's frame sum, and the long-range virial,
+// hence the pressure, would drift with the rank count.
+//
 // The first version is deliberately narrow: one channel, the SOG kernel,
 // orthogonal cells and a single rank.  Every unsupported combination raises
 // instead of silently falling back, so a caller never gets a different
@@ -278,6 +285,69 @@ __global__ void k_midtown_virial(const double* red, double scale, float* out) {
   out[t] = static_cast<float>(red[1 + kSym[t]] * scale);
 }
 
+// The share of the frame virial of the owners of a frame, as the operator
+// contract states it (ops.cc): the sum of sum_i F_i (x) r_i over the owners,
+// plus n (W - sum_j F_j (x) r_j) / N of the rest of the k-space virial, with n
+// the owners and N the charged nodes of the frame.  A domain-decomposed system
+// runs the replicated mesh of the frame on every rank and returns the slice of
+// its owners, so a rank that returned W itself would have it counted once per
+// rank by the caller's frame sum, and the long-range virial, hence the
+// pressure, would drift with the rank count.  ``moments`` holds the nine
+// components of F_i (x) r_i of every node of the frame, ``sums`` their sums
+// over the charged nodes of the frame and ``count`` that count; ``red`` holds
+// the six k-space sums xx yy zz xy xz yz.  The caller takes W itself when it
+// owns every node.
+constexpr int kVirialThreads = 256;
+
+__global__ void __launch_bounds__(kVirialThreads)
+    k_midtown_virial_share(const double* __restrict__ moments,
+                           int owner_begin,
+                           int owner_count,
+                           const double* __restrict__ sums,
+                           const double* __restrict__ count,
+                           const double* __restrict__ red,
+                           double virial_scale,
+                           float* __restrict__ out) {
+  __shared__ double partial[9][kVirialThreads];
+  double local[9];
+#pragma unroll
+  for (int t = 0; t < 9; ++t) {
+    local[t] = 0.0;
+  }
+  for (int i = threadIdx.x; i < owner_count; i += kVirialThreads) {
+    const int k = (owner_begin + i) * 9;
+#pragma unroll
+    for (int t = 0; t < 9; ++t) {
+      local[t] += moments[k + t];
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < 9; ++t) {
+    partial[t][threadIdx.x] = local[t];
+  }
+  __syncthreads();
+  for (int stride = kVirialThreads / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+#pragma unroll
+      for (int t = 0; t < 9; ++t) {
+        partial[t][threadIdx.x] += partial[t][threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x >= 9) {
+    return;
+  }
+  const int t = threadIdx.x;
+  static const int kSym[9] = {0, 3, 4, 3, 1, 5, 4, 5, 2};
+  const double cnt = count[0] > 0.0 ? count[0] : 1.0;
+  const double W = red[1 + kSym[t]] * virial_scale;
+  const double share =
+      partial[t][0] +
+      static_cast<double>(owner_count) * (W - sums[1 + t]) / cnt;
+  out[t] = static_cast<float>(share);
+}
+
 namespace {
 // Per-stage CPU timing of the operator, off unless SOG_MIDTOWN_CPU is set.
 struct CpuTimer {
@@ -426,6 +496,9 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
   // A frame with no charged nodes is skipped, so its virial row is never
   // written: keep the zero fill here (one tiny memset, not per-node).
   auto virial = torch::zeros({frame_count, 9}, float_options);
+  // Owners other than every node lie in one frame (latent_charge_sum), whose
+  // virial is then the share of these owners rather than the whole frame.
+  const bool every_node = owner_begin == 0 && owner_count == n;
 
   tm.mark("hostparse");
   std::lock_guard<std::mutex> lock(midtown_mutex());
@@ -640,9 +713,19 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         charge_gradient.narrow(0, begin, count).data_ptr<float>(),
         atom_virial.narrow(0, begin, count).data_ptr<float>());
 
-    // The frame virial, from the same six sums, in one nine-thread kernel.
-    k_midtown_virial<<<1, 32>>>(red, 0.5 * volume * prefactor,
-                                virial.data_ptr<float>() + 9 * f);
+    // The frame virial, from the same six sums: W itself when this call owns
+    // every node, else the share of its owners, which the ranks of a
+    // decomposed frame add up to W (ops.cc).
+    if (every_node) {
+      k_midtown_virial<<<1, 32>>>(red, 0.5 * volume * prefactor,
+                                  virial.data_ptr<float>() + 9 * f);
+    } else {
+      k_midtown_virial_share<<<1, kVirialThreads>>>(
+          moments.data_ptr<double>(), static_cast<int>(owner_begin - begin),
+          static_cast<int>(owner_count), sums.data_ptr<double>(),
+          csums.data_ptr<double>(), red, 0.5 * volume * prefactor,
+          virial.data_ptr<float>() + 9 * f);
+    }
 
     tm.mark("finish");
     begin += count;
@@ -842,7 +925,6 @@ ChargeSumOutputs midtown_sum_local(
   // sums) are what finish2 shares over the charged nodes, so they are global.
   sums.copy_(sum_over_domains(*communicator, sums));
   auto red = red_dev.clone();
-  auto vscale = red.narrow(0, 1, 6) * (0.5 * volume * prefactor);
   k_midtown_finish2<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       q.data_ptr<double>(), mask_f.data_ptr<bool>(), prefactor, kernel_zero,
@@ -851,12 +933,13 @@ ChargeSumOutputs midtown_sum_local(
       red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
   atom_energy.copy_(energy_f.reshape({count, 1}));
-  static const int64_t kSym[9] = {0, 3, 4, 3, 1, 5, 4, 5, 2};
-  auto sym_index = at::from_blob(const_cast<int64_t*>(kSym), {9}, at::kLong)
-                       .clone()
-                       .to(coord.device());
-  auto w = vscale.index_select(0, sym_index).reshape({3, 3});
-  virial.copy_(w.reshape({1, 9}).to(at::kFloat));
+  // The share of this rank in the frame virial: its own moments plus its even
+  // share of the rest of the k-space virial, which the ranks add up to W.
+  k_midtown_virial_share<<<1, kVirialThreads>>>(
+      moments.data_ptr<double>(), 0, static_cast<int>(count),
+      sums.data_ptr<double>(), count_d.data_ptr<double>(),
+      red.data_ptr<double>(), 0.5 * volume * prefactor,
+      virial.data_ptr<float>());
   return {atom_energy, charge_gradient, force, atom_virial, virial};
 }
 
@@ -1306,8 +1389,14 @@ ChargeSumOutputs midtown_sum_slab(
       count_d.data_ptr<double>(), moments.data_ptr<double>(),
       red.data_ptr<double>(), 0.5 * volume * prefactor,
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
-  k_midtown_virial<<<1, 32>>>(red.data_ptr<double>(), 0.5 * volume * prefactor,
-                              virial.data_ptr<float>());
+  // The share of this rank in the frame virial, as in the other two paths: its
+  // own moments plus its even share of the rest of the k-space virial, which
+  // the ranks add up to W.
+  k_midtown_virial_share<<<1, kVirialThreads>>>(
+      moments.data_ptr<double>(), 0, static_cast<int>(count),
+      sums.data_ptr<double>(), count_d.data_ptr<double>(),
+      red.data_ptr<double>(), 0.5 * volume * prefactor,
+      virial.data_ptr<float>());
   return {atom_energy, charge_gradient, force_out, atom_virial, virial};
 }
 
