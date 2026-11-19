@@ -524,7 +524,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         accuracy = self.pme_accuracy
         if accuracy is None:
             accuracy = grid_rule.DEFAULT_ACCURACY
-        return grid_rule.spacing(
+        spacing = grid_rule.spacing(
             self.mesh_backend,
             self.effective_order(),
             sigma_min,
@@ -532,6 +532,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             accuracy,
             force_mode=self.force_mode,
         )
+        if self.mesh_backend == "bspline" and self.effective_order() >= 8:
+            # The measured law stops at order 4/6; its order-8 extrapolation
+            # leaves the B-spline assignment aliasing above the target.  Keep
+            # the PME mesh inside the band where the assignment factor is
+            # accurate; the midtown backends have their own validity cap.
+            spacing = min(spacing, PME_SPACING_FRACTION * math.pi / k_max)
+        return spacing
 
     def effective_order(self) -> int:
         """The spline order the mesh actually evaluates.
