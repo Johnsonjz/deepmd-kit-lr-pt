@@ -18,7 +18,9 @@ commit：`254611ad`，已 push：
 ## 正确性
 
 - 同一 c560 mid6 工件，1.12M `run 0`：
-  - 旧 PR/c560 实现 vs P0 移植：**max|ΔF| = 0，rms = 0**
+  - 旧 PR/c560 实现 vs P0 移植：**max|ΔF| = 2.78e-4，rms = 8.47e-5**
+  - 相对 |F|max：**8.1e-5**；这是 P0 fixed-point/float brick 与旧 double
+    路径的精度差，不是 P0 逻辑错误。
 - c560 测试：
   - `test_mesh_backend.py` + `test_long_range_sum.py`：**54 passed**
   - `test_long_range_multi_rank.py`：2 skipped（本机跳过）
@@ -28,10 +30,11 @@ commit：`254611ad`，已 push：
 
 | np | B-spline-6 | CubeS₂-6 | 结论 |
 |---:|---:|---:|---|
-| 2 | 74.26 ms | 80.82 ms | CubeS₂ 仍慢 8.8% |
-| 4 | 49.68 ms | 44.11 ms | CubeS₂ 快 11.2% |
+| 2 | 71.84 ms | **67.20 ms** | CubeS₂ 快 6.5% |
+| 4 | 39.25 ms | **36.70 ms** | CubeS₂ 快 6.5% |
 
-P0 前 c560 np2 CubeS₂ 为 111.9 ms，P0 后 80.8 ms（**−28%**）；B-spline 不变。
+P0 前 c560 np2 CubeS₂ 为 111.9 ms；真正重编 P0 后 **67.20 ms**（−40%）。
+np2/np4 都已回到 main 同量级（main np2 67.4、np4 36.3）。
 
 ## 备注
 
@@ -40,3 +43,5 @@ P0 前 c560 np2 CubeS₂ 为 111.9 ms，P0 后 80.8 ms（**−28%**）；B-splin
   grid/freeze 工件与 slab 分块，而不是继续改 P0 kernel。
 - 本次移植用的是 P0/full long-range 文件级替换；c560 的 with-comm 路径已在
   2/4 rank slab run0 验证，但多 rank 单测在本机 skipped，未做完整 MPI 回归。
+- 之前一次 80.8/81.1 ms 的数字是**旧 .so 未重编**造成的；本次 `strings`
+  确认 `k_spread_cubes2_brick_packed6` 已在二进制中，并强制重新编译。
