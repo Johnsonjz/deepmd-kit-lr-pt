@@ -942,6 +942,26 @@ class DPAtomicModel(BaseAtomicModel):
             lr_gradient.to(descriptor.dtype) * (descriptor - descriptor.detach())
         ).sum(-1, keepdim=True)
         ret["energy"] = energy + lr_energy.to(energy.dtype) + response.to(energy.dtype)
+        # A one-block SeZM descriptor has no inter-block border exchange to
+        # partition the reciprocal-space virial; derive it from the local
+        # force and coordinates so the rank sum is the frame virial.
+        if getattr(getattr(self, "descriptor", None), "n_blocks", 0) == 1:
+            import torch
+
+            n = lr_force.shape[0]
+            moment = (
+                lr_force[:, :, None] * long_range_op["coord"][:n, None, :]
+            ).reshape(n, 9)
+            nf = n_node.shape[0]
+            frame = torch.repeat_interleave(
+                torch.arange(nf, device=lr_force.device),
+                n_node.to(lr_force.device),
+            )
+            lr_virial = (
+                torch.zeros(nf, 9, dtype=lr_virial.dtype, device=lr_force.device)
+                .index_add(0, frame, moment.to(lr_virial.dtype))
+                .reshape(nf, 1, 9)
+            )
         sink = long_range_op.get("out")
         if sink is not None:
             sink["force"] = lr_force
