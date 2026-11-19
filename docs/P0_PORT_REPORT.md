@@ -97,3 +97,17 @@ mpirun -np 4 pytest test_long_range_multi_rank.py
 c560 上 order-8 B-spline PME 网格偏粗导致 5 个 model 测试失败；
 已在 `mesh_spacing()` 对 `bspline` 且 order≥8 加 Nyquist cap，与 main 一致；
 相关 PME 测试 7 passed。
+
+## DPA4 多卡复查（c560-1l.pt2，LAMMPS run 0）
+
+`dpa4-sog-1L` canonical with-comm artifact，192 水，`pair deepmd/kk`：
+
+| np | PE (eV) | press (atm) | vol (Å³) |
+|---:|---:|---:|---:|
+| 1 | -29946.665 | -3709.5883 | 1927.3176 |
+| 2 | -29946.665 | -3709.5882 | 1927.3176 |
+| 4 | -29946.665 | -3709.5849 | 1927.3176 |
+
+压力在 1/2/4 rank 上稳定（差 <0.004 atm），virial 不再随 rank 数漂移。
+已知限制仍是 `SEZM_CANONICAL_STATUS.md` 里的“空 rank 会早退/挂起”，本组
+1/2/4 rank 未命中。
