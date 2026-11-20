@@ -387,6 +387,73 @@ def test_mesh_virial_is_the_strain_derivative(kernel_name: str) -> None:
     )
 
 
+@pytest.mark.parametrize("mesh_backend", ["bspline", "midtown", "slab"])
+def test_rows_without_charge_change_nothing(
+    mesh_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows the caller does not own carry no charge and change no output.
+
+    A decomposed frame hands the operator its ghost rows too, marked with
+    ``node_mask == False`` and a zero charge.  The total-charge constraint
+    counts the charged nodes and divides by that count, the frame moment sum
+    runs over them, and the share of the k-space virial belongs to them, so
+    appending such rows must leave every output unchanged -- in particular the
+    frame virial, which the caller forms by summing the per-node shares over
+    every row of the node axis.  The slab solve takes the same arrays, with the
+    frame boundaries of the caller, so the environment switch runs it here on
+    one domain.
+    """
+    system = _system([120], 1, 0, 21, -1.0)
+    coord, charge, node_mask, n_node, total_charge = system
+    # An orthogonal cell: the slab solve of one domain takes those only.
+    box = torch.eye(3, dtype=torch.float64).reshape(1, 9) * 12.0
+    kernel = KERNELS["sog"]()
+    if mesh_backend == "slab":
+        monkeypatch.setenv("SOG_MIDTOWN_SLAB", "1")
+        mesh = "midtown"
+    else:
+        monkeypatch.delenv("SOG_MIDTOWN_SLAB", raising=False)
+        mesh = mesh_backend
+    kwargs = {
+        "kernel": kernel,
+        "channel": 0,
+        "prefactor": COULOMB_CONSTANT,
+        "box": box,
+        "order": 6,
+        "spacing": 0.6,
+        "mesh_backend": mesh,
+    }
+    plain = latent_charge_sum(*system, **kwargs)
+
+    ghosts = 37
+    extra_coord = (
+        torch.rand(
+            ghosts, 3, generator=torch.Generator().manual_seed(3), dtype=torch.float64
+        )
+        * 12.0
+        - 1.0
+    )
+    mixed = (
+        torch.cat([coord, extra_coord.to(coord.device)]),
+        torch.cat([charge, torch.zeros(ghosts, 1, dtype=charge.dtype, device="cuda")]),
+        torch.cat([node_mask, torch.zeros(ghosts, dtype=torch.bool, device="cuda")]),
+        torch.tensor([n_node[0].item() + ghosts], dtype=torch.int64, device="cuda"),
+        total_charge,
+    )
+    haunted = latent_charge_sum(*mixed, **kwargs)
+
+    n = coord.shape[0]
+    for name, before, after in zip(NAMES, plain, haunted, strict=True):
+        before = before.detach().to(torch.float64)
+        after = after.detach().to(torch.float64)
+        scale = max(float(before.abs().max()), 1e-12)
+        error = float((after[:n] - before).abs().max()) / scale
+        assert error < 1e-6, f"{mesh_backend}: {name} moved by {error:.3e}"
+    # The rows without charge own nothing: their energy and virial are zero.
+    assert torch.all(haunted[0][n:] == 0)
+    assert torch.all(haunted[3][n:] == 0)
+
+
 @pytest.mark.parametrize("order", [2, 3, 5, 7, 9, 10, 11, 12])
 def test_mesh_orders(order: int) -> None:
     """Every B-spline order agrees with the mesh evaluation of training.
