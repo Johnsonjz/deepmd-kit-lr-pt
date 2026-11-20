@@ -1112,6 +1112,11 @@ ChargeSumOutputs midtown_sum_slab(
   const int me = deepmd::long_range::domain_rank(*communicator);
   auto TR = [](){ return std::getenv("SOG_SLAB_TRACE") != nullptr; };
   if (TR()) fprintf(stderr, "[slab] enter np=%d me=%d\n", np, me);
+  // The slab path launches on the legacy default stream while AOTI evaluates
+  // on a side stream.  Wait for the previous call's default-stream work here
+  // (entry only): it orders consecutive steps without waiting on the side
+  // stream, which deadlocks (cudaDeviceSynchronize / exit waits).
+  cudaStreamSynchronize(nullptr);
   // NCCL only moves the transposed blocks BETWEEN ranks.  At np=1 both
   // all-to-alls are an identity permutation and the accumulator sum is already
   // complete, so no communicator is created and the backend runs without
