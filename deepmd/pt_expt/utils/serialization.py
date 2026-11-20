@@ -281,6 +281,25 @@ def _needs_with_comm_artifact(
     return bool(atomic_model.dense_lower_supports_comm())
 
 
+def _needs_canonical_with_comm(model: Any, lower_kind: str) -> bool:
+    """Whether the compact canonical lower of this model needs a comm sibling.
+
+    The plain canonical ABI carries no border exchange, so a message-passing
+    descriptor reuses the ghost features of its first block for every later
+    one. The with-comm sibling carries the eight comm tensors the descriptor's
+    ``border_op`` drives. A model with a long-range module qualifies as soon as
+    its module serves a decomposed frame: the module reads the same
+    communicator through the operator, and nothing else about the canonical
+    lower changes.
+    """
+    if lower_kind not in ("dpa1_canonical", "dpa4c_canonical"):
+        return False
+    atomic_model = model.atomic_model
+    if not atomic_model.has_message_passing_across_ranks():
+        return False
+    return bool(atomic_model.supports_edge_parallel())
+
+
 def check_graph_trace_torch_version(model: torch.nn.Module) -> None:
     """Fail fast when the graph trace needs unbacked-SymInt support torch lacks.
 
