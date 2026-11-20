@@ -79,3 +79,13 @@ system/
 /build-*/
 /lammps_src/
 /log.lammps
+
+# Internal development notes and paper dumps (kept on the docs-notes branch)
+/docs/
+
+# Local test and tool caches
+.pytest_cache/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
