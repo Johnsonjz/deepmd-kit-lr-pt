@@ -382,7 +382,7 @@ def ensure_registered() -> None:
         _register()
 
 
-_MESH_BACKEND_CODES = {"bspline": 0, "midtown": 1}
+_MESH_BACKEND_CODES = {"bspline": 0, "midtown": 1, "quads": 2}
 """The mesh backend of a periodic call, as the operator's integer code."""
 
 

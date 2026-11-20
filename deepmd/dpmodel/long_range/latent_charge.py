@@ -342,9 +342,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                 "`pme_spacing`, `pme_order` and `pme_accuracy` require `periodic=True`"
             )
         self.mesh_backend = str(mesh_backend)
-        if self.mesh_backend not in ("bspline", "midtown"):
+        if self.mesh_backend not in ("bspline", "midtown", "quads"):
             raise ValueError(
-                "`mesh_backend` must be 'bspline' or 'midtown', got "
+                "`mesh_backend` must be 'bspline', 'midtown' or 'quads', got "
                 f"{self.mesh_backend!r}"
             )
         self.force_mode = str(force_mode)
@@ -352,7 +352,10 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             raise ValueError(
                 f"`force_mode` must be 'ad' or 'ik', got {self.force_mode!r}"
             )
-        if self.force_mode != "ad" and self.mesh_backend != "midtown":
+        if self.force_mode != "ad" and self.mesh_backend not in (
+            "midtown",
+            "quads",
+        ):
             raise ValueError(
                 "`force_mode='ik'` (Fourier differentiation) requires "
                 "`mesh_backend='midtown'`"
@@ -548,7 +551,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         Sizing the grid from the *configured* value would size it for the wrong
         stencil, so every consumer goes through this.
         """
-        if self.mesh_backend == "midtown":
+        if self.mesh_backend in ("midtown", "quads"):
             return 4 if self.pme_order == 4 else 6
         return int(self.pme_order)
 

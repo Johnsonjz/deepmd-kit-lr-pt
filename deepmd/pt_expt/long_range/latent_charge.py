@@ -173,7 +173,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
         # The midtown mesh carries the CubeS2 spline: the 88-node stencil of
         # order 6, or the 32-node stencil of order 4 when the configuration
         # asks for it.  Never the B-spline default of 8.
-        if self.mesh_backend == "midtown":
+        if self.mesh_backend in ("midtown", "quads"):
             order = 4 if self.pme_order == 4 else 6
         else:
             order = self.pme_order
