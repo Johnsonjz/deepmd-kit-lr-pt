@@ -342,9 +342,11 @@ class SOGKernel(BaseInteractionKernel):
     n_gaussian
         The number :math:`M` of Gaussians of the default widths.
     base_width
-        The width :math:`\sigma` of the first default Gaussian, in Å.
+        The width :math:`\sigma` of the first default Gaussian, in Å. ``None``
+        falls back to :data:`SOG_DEFAULT_BASE_WIDTH`.
     width_ratio
-        The ratio :math:`b > 1` of consecutive default widths.
+        The ratio :math:`b > 1` of consecutive default widths. ``None`` falls
+        back to :data:`SOG_DEFAULT_WIDTH_RATIO`.
     trainable
         Whether the amplitudes and widths are trained.
     precision
@@ -359,13 +361,20 @@ class SOGKernel(BaseInteractionKernel):
         amplitude: float | list[float] | None = None,
         width: list[float] | None = None,
         n_gaussian: int = 12,
-        base_width: float = 2.180230445405648,
-        width_ratio: float = 1.62976708826776469,
+        base_width: float | None = 2.180230445405648,
+        width_ratio: float | None = 1.62976708826776469,
         trainable: bool = True,
         precision: str = "default",
     ) -> None:
         super().__init__(trainable, precision)
         if width is None:
+            # A bare ``sog`` configuration leaves the ladder unset and lets the
+            # configuration layer derive it; the class constants are the final
+            # fallback.
+            if base_width is None:
+                base_width = 2.180230445405648
+            if width_ratio is None:
+                width_ratio = 1.62976708826776469
             if n_gaussian < 1:
                 raise ValueError(f"`n_gaussian` must be positive, got {n_gaussian}")
             if not np.isfinite(base_width) or base_width <= 0.0:

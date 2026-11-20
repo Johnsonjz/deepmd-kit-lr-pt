@@ -3652,8 +3652,18 @@ def interaction_kernel_sog() -> list[Argument]:
         "k = 0, ..., `n_gaussian` - 1."
     )
     doc_n_gaussian = "The number of Gaussians of the default widths."
-    doc_base_width = "The width of the first default Gaussian, in Å."
-    doc_width_ratio = "The ratio of consecutive default widths. Must exceed one."
+    doc_base_width = (
+        "The width of the first default Gaussian, in Å. Unset leaves the ladder "
+        "to the configuration layer, which applies the SOG library rule "
+        "sigma = n_layers * rcut / 1.9892536839080267, where the geometric "
+        "embedding reaches `rcut` before the first message-passing block; set "
+        "it to use an explicit ladder instead."
+    )
+    doc_width_ratio = (
+        "The ratio of consecutive default widths. Must exceed one. Unset leaves "
+        "the ladder to the configuration layer, which applies the SOG library "
+        "rule; set it to use an explicit ladder instead."
+    )
     doc_trainable = "Whether the amplitudes and widths are trained."
     return [
         Argument(
@@ -3673,16 +3683,16 @@ def interaction_kernel_sog() -> list[Argument]:
         Argument("n_gaussian", int, optional=True, default=12, doc=doc_n_gaussian),
         Argument(
             "base_width",
-            float,
+            [float, type(None)],
             optional=True,
-            default=2.180230445405648,
+            default=None,
             doc=doc_base_width,
         ),
         Argument(
             "width_ratio",
-            float,
+            [float, type(None)],
             optional=True,
-            default=1.6297670882677647,
+            default=None,
             doc=doc_width_ratio,
         ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
@@ -3819,19 +3829,47 @@ def long_range_latent_charge() -> list[Argument]:
     )
     doc_pme_spacing = (
         "The largest spacing of the mesh of a periodic frame, in Angstrom; "
-        "the default is three quarters of the Nyquist spacing of the "
-        "wave-number cutoff, 0.75 pi / k_max. Requires `periodic: true`."
+        "overrides `pme_accuracy`. The default is the spacing the measured "
+        "error law of `deepmd.dpmodel.long_range.grid_rule` gives at that "
+        "target, and three quarters of the Nyquist spacing of the wave-number "
+        "cutoff when the kernel's width is unknown to the rule. Requires "
+        "`periodic: true`."
+    )
+    doc_pme_accuracy = (
+        "Target relative error of the mesh energy of a periodic frame, 1e-4 by "
+        "default. The spacing is solved from the measured error law "
+        "eps = C (Delta / sigma_min)^p, with `C` and `p` per (backend, spline "
+        "order) -- see `deepmd/dpmodel/long_range/grid_rule.py`. The law alone "
+        "sizes the grid: it is measured at the target spacings themselves, so "
+        "there is no additional Nyquist ceiling and a high spline order "
+        "improves accuracy at the same grid rather than shrinking it. Set "
+        "`pme_spacing` to override. Requires `periodic: true`."
     )
     doc_pme_order = (
         "The order of the B-splines that spread the charges to the mesh, 8 "
-        "by default. Requires `periodic: true`."
+        "by default; 4 to 12 are accepted, and higher orders are more "
+        "accurate per grid point. The midtown and quads backends have a "
+        "CubeS2 or QuadS stencil of order 4 or 6 only: `pme_order: 4` selects "
+        "order 4 and every other value selects order 6. Requires "
+        "`periodic: true`."
     )
     doc_mesh_backend = (
         "The mesh solver of a periodic frame: `bspline` (the smooth "
-        "particle-mesh Ewald sum, the default) or `midtown` (the CubeS2 "
-        "splines and cuFFT of the SOG library). The midtown backend serves the "
-        "SOG kernel and one channel; it evaluates order 6 or 4 independently "
-        "of `pme_order`."
+        "particle-mesh Ewald sum, the default), `midtown` (the CubeS2 splines "
+        "and cuFFT of the SOG library) or `quads` (the separable QuadS stencil "
+        "of the same solver). The midtown and quads backends serve the SOG "
+        "kernel and one channel; they evaluate order 6 or 4 independently of "
+        "`pme_order`."
+    )
+    doc_force_mode = (
+        "How the periodic force is differentiated on the mesh: `ad` (weight "
+        "differentiation, the default) gathers the derivatives of the "
+        "assignment weights, so the force is exactly the gradient of the mesh "
+        "energy; `ik` differentiates the potential in Fourier space, one order "
+        "more accurate in the mesh spacing but at three extra inverse "
+        "transforms and without the exact-gradient property. `ik` requires "
+        "`mesh_backend: midtown` or `mesh_backend: quads`. Requires "
+        "`periodic: true`."
     )
     return [
         Argument("channels", int, optional=True, default=1, doc=doc_channels),
@@ -3918,6 +3956,13 @@ def long_range_latent_charge() -> list[Argument]:
             doc=doc_pme_spacing,
         ),
         Argument(
+            "pme_accuracy",
+            [float, None],
+            optional=True,
+            default=None,
+            doc=doc_pme_accuracy,
+        ),
+        Argument(
             "pme_order",
             [int, None],
             optional=True,
@@ -3930,8 +3975,17 @@ def long_range_latent_charge() -> list[Argument]:
             optional=True,
             default="bspline",
             doc=doc_mesh_backend,
-            extra_check=lambda x: x in ("bspline", "midtown"),
-            extra_check_errmsg="must be 'bspline' or 'midtown'",
+            extra_check=lambda x: x in ("bspline", "midtown", "quads"),
+            extra_check_errmsg="must be 'bspline', 'midtown' or 'quads'",
+        ),
+        Argument(
+            "force_mode",
+            str,
+            optional=True,
+            default="ad",
+            doc=doc_force_mode,
+            extra_check=lambda x: x in ("ad", "ik"),
+            extra_check_errmsg="must be 'ad' or 'ik'",
         ),
     ]
 

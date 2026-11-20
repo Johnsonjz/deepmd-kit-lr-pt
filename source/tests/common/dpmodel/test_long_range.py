@@ -1040,3 +1040,69 @@ def test_ellipsoid_grid_packs_fewer_slots_than_fixed(n: int) -> None:
     assert int(np.sum(fixed.mask)) == int(np.sum(packed.mask))
     # But the packed grid allocates far fewer slots.
     assert fixed.mask.size / packed.mask.size >= 1.8
+
+
+def test_mesh_backend_force_mode_and_accuracy_round_trip() -> None:
+    """The mesh solver, force mode and accuracy reach the module and survive save/load."""
+    long_range = _pme_long_range(
+        mesh_backend="quads",
+        force_mode="ik",
+        pme_accuracy=2e-5,
+    )
+    assert long_range.effective_order() == 6
+    assert long_range.mesh_backend == "quads"
+    assert long_range.force_mode == "ik"
+    assert long_range.pme_accuracy == 2e-5
+
+    record = long_range.serialize()
+    assert record["mesh_backend"] == "quads"
+    assert record["force_mode"] == "ik"
+    assert record["pme_accuracy"] == 2e-5
+    restored = LatentChargeLongRange.deserialize(record)
+    assert restored.mesh_backend == "quads"
+    assert restored.force_mode == "ik"
+    assert restored.pme_accuracy == 2e-5
+    assert restored.mesh_spacing() == long_range.mesh_spacing()
+
+
+def test_force_mode_ik_requires_a_cubes2_mesh() -> None:
+    """The Fourier force is defined for the midtown and quads meshes only."""
+    with pytest.raises(ValueError, match="midtown.*quads"):
+        _periodic_long_range(force_mode="ik")
+
+
+@pytest.mark.parametrize("bad", [0.0, -1e-5, float("nan"), float("inf")])
+def test_pme_accuracy_rejects_a_non_positive_target(bad: float) -> None:
+    """The target of the grid rule is finite and positive."""
+    with pytest.raises(ValueError, match="pme_accuracy"):
+        _periodic_long_range(pme_accuracy=bad)
+
+
+def test_long_range_args_expose_the_mesh_options() -> None:
+    """The configuration schema accepts the mesh solver, force mode and accuracy."""
+    args = long_range_args()
+    config = args.normalize_value(
+        {
+            "type": "latent_charge",
+            "periodic": True,
+            "mesh_backend": "quads",
+            "force_mode": "ik",
+            "pme_accuracy": 1e-5,
+        },
+        trim_pattern="_*",
+    )
+    assert config["mesh_backend"] == "quads"
+    assert config["force_mode"] == "ik"
+    assert config["pme_accuracy"] == 1e-5
+
+
+def test_sog_args_leave_the_ladder_to_the_config_layer() -> None:
+    """A bare ``sog`` kernel keeps its ladder unset so the library rule applies."""
+    args = long_range_args()
+    config = args.normalize_value(
+        {"type": "latent_charge", "kernel": {"type": "sog"}},
+        trim_pattern="_*",
+    )
+    kernel = config["kernel"]
+    assert kernel["base_width"] is None
+    assert kernel["width_ratio"] is None

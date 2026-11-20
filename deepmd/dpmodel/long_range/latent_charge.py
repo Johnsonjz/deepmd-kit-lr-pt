@@ -222,7 +222,8 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         gradient of the mesh energy; ``"ik"`` differentiates the potential in
         Fourier space, gaining one order in the mesh spacing at the cost of
         three extra inverse transforms and a force that is not the exact
-        gradient of the mesh energy. ``"ik"`` requires ``mesh_backend="midtown"``.
+        gradient of the mesh energy. ``"ik"`` requires ``mesh_backend="midtown"``
+        or ``mesh_backend="quads"``.
         Requires ``periodic=True``.
     """
 
@@ -358,7 +359,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         ):
             raise ValueError(
                 "`force_mode='ik'` (Fourier differentiation) requires "
-                "`mesh_backend='midtown'`"
+                "`mesh_backend='midtown'` or `'quads'`"
             )
         self.pme_order = PME_ORDER if pme_order is None else int(pme_order)
         if self.pme_order < 2:
@@ -1001,6 +1002,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             decouple_k_grid=data.get("decouple_k_grid", False),
             pme_spacing=data.get("pme_spacing"),
             pme_order=data.get("pme_order"),
+            pme_accuracy=data.get("pme_accuracy"),
         )
         if data.get("frozen_k_max") is not None:
             # The constructor derives the frozen cutoff from the (possibly

@@ -198,10 +198,13 @@ def dpa4c_canonical_compress_long_range_energy_force(
         # serialized empty int list to the operator as None.
         list(fitting_routes) if fitting_routes else None,
         list(charge_fitting_routes) if charge_fitting_routes else None,
-        # 0 is the B-spline mesh, 1 the midtown mesh; the default is left
-        # explicit here because the operator's own default keeps older graphs
-        # valid.
+        # 0 is the B-spline mesh, 1 the midtown mesh, 2 the QuadS mesh; the
+        # default is left explicit here because the operator's own default
+        # keeps older graphs valid.
         {"bspline": 0, "midtown": 1, "quads": 2}[long_range.mesh_backend],
+        # 0 differentiates the assignment weights (AD), 1 the potential in
+        # Fourier space (ik); the default is left implicit as above.
+        {"ad": 0, "ik": 1}[long_range.force_mode],
     )
 
 

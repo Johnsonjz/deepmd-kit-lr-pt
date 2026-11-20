@@ -60,6 +60,29 @@ _KERNEL_CLASSES = {"les": LESKernel, "sog": SOGKernel}
 _SOG_DEFAULT_M = SOG_DEFAULT_M
 
 
+def _reject_unsupported_mesh_options(mesh_backend: str, force_mode: str) -> None:
+    """Reject the mesh options the pt graph host does not evaluate.
+
+    The pt host builds the reciprocal sum from the dpmodel mesh evaluation,
+    which is the B-spline one and differentiates its assignment weights.  A
+    configuration that asks for another backend or for the Fourier force would
+    otherwise be silently evaluated on the B-spline mesh, with a grid sized for
+    a solver it does not use.
+    """
+    if str(mesh_backend) != "bspline":
+        raise NotImplementedError(
+            f"the pt (graph) backend evaluates the B-spline mesh only; "
+            f"`mesh_backend: {mesh_backend}` is available through the pt_expt "
+            "`.pt2` path"
+        )
+    if str(force_mode) != "ad":
+        raise NotImplementedError(
+            "the pt (graph) backend differentiates the mesh force by the "
+            "assignment weights only; `force_mode: ik` is available through "
+            "the pt_expt `.pt2` path"
+        )
+
+
 @BaseLongRange.register("latent_charge")
 class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
     """Energy of interacting latent charges, periodic or not (pt backend)."""
@@ -122,7 +145,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
         }
         kernel_type = str(kernel_config.pop("type"))
         if kernel_type == "sog" and not any(
-            key in kernel_config
+            kernel_config.get(key) is not None
             for key in ("width", "amplitude", "base_width", "width_ratio")
         ):
             # D12: new configurations follow the SOG library rule rather than
@@ -168,6 +191,10 @@ class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
             ),
             **charge_net_config,
         )
+        _reject_unsupported_mesh_options(
+            config.get("mesh_backend", "bspline"),
+            config.get("force_mode", "ad"),
+        )
         return cls(
             charge_net,
             kernel_cls(**kernel_config),
@@ -179,6 +206,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
             decouple_k_grid=config.get("decouple_k_grid", False),
             pme_spacing=config.get("pme_spacing"),
             pme_order=config.get("pme_order"),
+            pme_accuracy=config.get("pme_accuracy"),
         )
 
     @classmethod
@@ -194,6 +222,10 @@ class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
                 f"unknown long-range kernel {kernel_type!r}; expected one of "
                 f"{tuple(_KERNEL_CLASSES)}"
             ) from exc
+        _reject_unsupported_mesh_options(
+            data.get("mesh_backend", "bspline"),
+            data.get("force_mode", "ad"),
+        )
         obj = cls(
             LatentChargeFitting.deserialize(data["charge_net"]),
             kernel_cls.deserialize(kernel_data),
@@ -205,6 +237,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP, torch.nn.Module):
             decouple_k_grid=data.get("decouple_k_grid", False),
             pme_spacing=data.get("pme_spacing"),
             pme_order=data.get("pme_order"),
+            pme_accuracy=data.get("pme_accuracy"),
         )
         if data.get("frozen_k_max") is not None:
             obj.frozen_k_max = float(data["frozen_k_max"])
