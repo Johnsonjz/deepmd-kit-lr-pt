@@ -250,6 +250,25 @@ in `float32` with `tanh` or `silu` hidden layers whose widths are multiples of
 four and without `resnet_dt`; the defaults give such a module in a compressed
 model.
 
+The dedicated operator chooses its mesh solver with
+{ref}`mesh_backend <model[standard]/long_range[latent_charge]/mesh_backend>`:
+`bspline` (the default) for the smooth particle-mesh Ewald sum, `midtown` for
+the CubeS2 splines and cuFFT of the SOG library, or `quads` for the separable
+QuadS stencil of the same solver. The `midtown` and `quads` solvers serve the
+`sog` kernel and one charge channel. Its force is differentiated by
+{ref}`force_mode <model[standard]/long_range[latent_charge]/force_mode>`:
+`ad` (the default) differentiates the assignment weights and gives the exact
+gradient of the mesh energy, while `ik` differentiates the potential in
+Fourier space, one order more accurate in the mesh spacing but at three extra
+inverse transforms and without the exact-gradient property; `ik` requires the
+`midtown` or `quads` solver. The target of the mesh-spacing rule is the
+relative energy error
+{ref}`pme_accuracy <model[standard]/long_range[latent_charge]/pme_accuracy>`
+(1e-4 by default), which
+{ref}`pme_spacing <model[standard]/long_range[latent_charge]/pme_spacing>`
+overrides with an explicit spacing. A model evaluated by the graph lower,
+such as an uncompressed one, always uses the B-spline solver.
+
 The following are not supported for a model with a long-range module:
 multi-rank (domain-decomposed) inference of a model that the dedicated
 operator does not evaluate, such as an uncompressed one, spin models, the
