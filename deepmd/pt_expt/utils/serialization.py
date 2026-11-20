@@ -225,8 +225,9 @@ def _needs_with_comm_artifact(
     per-lower capability instead of assuming both lowers agree. The dense
     lower checks ``dense_lower_supports_comm()`` (``True`` for
     dpa2/dpa3, whose dense lower is the production multi-rank path).
-    Compact canonical lowers never use a separate with-comm artifact; the
-    multi-block DPA4C lower carries halo exchange in its main ABI.
+    A compact canonical lower of a message-passing model uses the eight-tensor
+    with-comm sibling; the fused DPA4C lower carries its halo exchange in the
+    main ABI and does not need it.
 
     Native spin participates on the GRAPH lower, matching pt's
     ``SeZMModel.supports_edge_parallel`` (which ``SeZMNativeSpinModel`` does
@@ -253,6 +254,10 @@ def _needs_with_comm_artifact(
         NativeSpinModelKind,
     )
 
+    if lower_kind in ("dpa1_canonical", "dpa4c_canonical"):
+        # The compact canonical lower has no border exchange in its main ABI;
+        # a message-passing model needs the eight-tensor with-comm sibling.
+        return _needs_canonical_with_comm(model, lower_kind)
     if lower_kind not in ("graph", "nlist"):
         return False
 
@@ -1637,6 +1642,21 @@ def _collect_metadata(
         meta["canonical_requires_source_csr"] = _canonical_requires_source_csr(
             model, lower_kind
         )
+        # A compact canonical artifact without the with-comm sibling runs its
+        # descriptor with comm_dict=None and reuses the ghost features of its
+        # first block for every later one. Record the limitation so a
+        # deployment can refuse the multi-rank case instead of running it.
+        single_rank_only = bool(
+            meta["has_message_passing"]
+            and not _needs_canonical_with_comm(model, lower_kind)
+        )
+        meta["canonical_single_rank_only"] = single_rank_only
+        if single_rank_only:
+            log.warning(
+                "the compact canonical lower of this model has no cross-rank "
+                "message-passing exchange; the artifact is faithful on a single "
+                "rank only. Run it with one rank, or deploy the graph lower."
+            )
 
     # Model-level pair-type exclusion (``pair_exclude_types``): a list of
     # ``[ti, tj]`` type pairs whose interaction is dropped.  Exclusion is a
@@ -2577,7 +2597,7 @@ def _trace_and_export_impl(
             # The compact lower of a model with further message-passing blocks
             # reads the border plan of a decomposed frame, whose extents are
             # kept distinct from the other axes.
-            want_border = bool(model.atomic_model.has_message_passing_across_ranks())
+            want_border = bool(model.atomic_model.has_message_passing_across_ranks()) and not with_comm_dict
             border_sizes = (
                 next_safe_prime(
                     e_sample + 3,
@@ -2594,27 +2614,28 @@ def _trace_and_export_impl(
                 want_border=want_border,
                 border_sizes=border_sizes,
             )
-            # The inputs after the graph, and the moment of a native-spin
-            # model, reach the lower by name, in the order of the samples.
-            graph_count = 9 if is_native_spin else 8
-            names = (
-                *(("coord",) if want_long_range else ()),
-                *(("communicator",) if want_long_range or want_border else ()),
-                *(("box",) if want_long_range else ()),
-                *(("halo_send", "halo_swaps") if want_border else ()),
-            )
-            traced = model.forward_lower_canonical_graph_exportable(
-                *sample_inputs[:graph_count],
-                **dict(zip(names, sample_inputs[graph_count:], strict=True)),
-                do_atomic_virial=do_atomic_virial,
-                tracing_mode="symbolic",
-                _allow_non_fake_inputs=True,
-            )
-            dynamic_shapes = _build_canonical_graph_dynamic_shapes(
-                is_native_spin=is_native_spin,
-                long_range=want_long_range,
-                border=want_border,
-            )
+            if not with_comm_dict:
+                # The inputs after the graph, and the moment of a native-spin
+                # model, reach the lower by name, in the order of the samples.
+                graph_count = 9 if is_native_spin else 8
+                names = (
+                    *(("coord",) if want_long_range else ()),
+                    *(("communicator",) if want_long_range or want_border else ()),
+                    *(("box",) if want_long_range else ()),
+                    *(("halo_send", "halo_swaps") if want_border else ()),
+                )
+                traced = model.forward_lower_canonical_graph_exportable(
+                    *sample_inputs[:graph_count],
+                    **dict(zip(names, sample_inputs[graph_count:], strict=True)),
+                    do_atomic_virial=do_atomic_virial,
+                    tracing_mode="symbolic",
+                    _allow_non_fake_inputs=True,
+                )
+                dynamic_shapes = _build_canonical_graph_dynamic_shapes(
+                    is_native_spin=is_native_spin,
+                    long_range=want_long_range,
+                    border=want_border,
+                )
             if with_comm_dict:
                 from deepmd.pt_expt.utils.comm import (
                     ensure_comm_registered,
