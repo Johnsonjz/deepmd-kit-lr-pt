@@ -1,32 +1,42 @@
 # Paper Tables 5 and 6 — 2026-11-20
 
-Benchmarks rerun on the current `c560-test` / `pr/long-range-complete`
-tree (P0 slab, 6th-order production path, fixed frame-virial share).
+Rerun on the current `c560-test` / `pr/long-range-complete` tree with the
+**dpa4_sog_fix r_c=5 Å** campaign artifacts, following
+`sog_work/docs/PERF_BENCH_WORKFLOW.md`:
+
+- step time = second `Loop time` of `run 3` + `run 8`;
+- ns/day = 0.0432 / s_per_step;
+- peak memory = `nvidia-smi` sample minus the pre-run baseline;
+- small 9,216-atom cells use `USE_SLAB=0` (replicated mesh); the
+  1,119,744-atom cells use the z-slab.
 
 ## Table 5
 
-- 9,216 atoms per rank; 1/2/4 GPUs.  Multi-GPU runs replicate the cell along
-  z (18,432 / 36,864 atoms).
-- Additional 1,119,744-atom rows for DPA4C, DPA4C-SOG, DPA4C-Plus,
-  DPA4C-SOG-Plus.
-- Artifacts re-frozen with the current tree:
-  `t5_dpa4.pt2`, `t5_dpa4-1L.pt2`, `t5_dpa4-sog.pt2`, `t5_dpa4-sog-1L.pt2`,
-  `t5_dpa4c.pt2`, `t5_dpa4c-sog.pt2`, `t5_dpa4c-plus.pt2`,
-  `t5_dpa4c-plus-sog.pt2`.
-- Raw: `table5_20261120.csv`.
+9,216 atoms per rank on 1/2/4 GPUs; 2/4 GPU replicate the cell along z
+(18,432 / 36,864 atoms), exactly the Figure 10 convention.  Additional
+1,119,744-atom rows for the four DPA4C-family models (one common cell).
 
-DPA4-2L and DPA4-SOG-2L complete on one GPU at 9,216 atoms but not when the
-cell is replicated (24 GiB card limit); the table marks those cells with a
-dash.  This differs from the old 20,736-atom table.
+- Raw 9,216: `table5_9216_20261120.csv`
+- Raw 1.12M: `table5_1119744_20261120.csv`
+- Artifacts: `$E2E/frozen_v2` (eight campaign models, r_c=5 Å).
+
+All eight models run at 9,216 atoms per rank.  The two-layer message-passing
+models use 23.8 GiB per GPU at 2/4 ranks; the one-layer models 16.1 GiB.
 
 ## Table 6
 
-- DPA4C-SOG, equal 1e-4 energy target, 9,216 and 1,119,744 atoms.
-- B-spline / CubeS2 / QuadS, order 4 and 6, AD force path.
-- Artifacts: `bs4.pt2`, `bs6.pt2`, `mid4.pt2`, `mid6.pt2`, `qs4.pt2`,
-  `qs6.pt2`; short-range baseline `sr.pt2`.
-- Raw: `table6_9216_20261120.csv`, `table6_1119744_20261120.csv`.
+DPA4C-SOG, equal 1e-4 energy target, 9,216 and 1,119,744 atoms, one GPU.
+B-spline / CubeS2 / QuadS, order 4 and 6.
 
-At 9,216 atoms all six variants are within 0.06 ms; at 1.12M CubeS2-6 is
-fastest (17.87 ms LR, 107.70 ms total), B-spline-6 is 19.20 ms, and B-spline-4
-is 27.18 ms.  QuadS-6 is 18.67 ms.
+- Raw 9,216: `table6_9216_20261120.csv`
+- Raw 1.12M: `table6_1119744_20261120.csv`
+- Artifacts: `frozen_v2/dpa4c.pt2` (SR baseline), `frozen_v2/dpa4c-sog-bs4.pt2`,
+  `frozen_v2/dpa4c-sog-bs6.pt2`, `frozen_v2/dpa4c-sog-mid4ad.pt2`, and
+  `mid6fix.pt2` / `qs4fix.pt2` / `qs6fix.pt2` frozen from
+  `runs/dpa4_sog_fix/water/dpa4c-sog/model.ckpt-200000.pt` with the current
+  tree.
+
+At 9,216 atoms all variants are within 0.04 ms of total step time; CubeS2-4 has
+the smallest total (2.402 ms).  At 1.12M QuadS-6 is fastest (17.05 ms LR,
+127.57 ms total), CubeS2-6 is 17.55 ms, B-spline-6 19.35 ms, B-spline-4
+33.57 ms.  B-spline-6 has the smallest LR memory (3,556 MiB).
