@@ -3076,8 +3076,7 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
       std::vector<std::vector<int>> kk_swaps;
       std::vector<int*> kk_ptrs;
       std::vector<at::Tensor> canonical_comm;
-      if (world != nullptr && with_comm_loader && halo != nullptr &&
-          halo->nswap > 0) {
+      if (world != nullptr && with_comm_loader && lower_input_is_canonical_) {
         const int nswap = halo->nswap;
         int sent = 0;
         for (int s = 0; s < nswap; ++s) sent += halo->sendnum[s];
@@ -3104,6 +3103,27 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
             at::from_blob(const_cast<int*>(halo->recvproc), {nswap}, i32).clone(),
             at::from_blob(const_cast<int*>(halo->sendnum), {nswap}, i32).clone(),
             at::from_blob(const_cast<int*>(halo->recvnum), {nswap}, i32).clone(),
+            torch::tensor(
+                (int64_t)reinterpret_cast<std::uintptr_t>(
+                    *reinterpret_cast<void* const*>(world)),
+                i64),
+            torch::tensor((int64_t)nloc, i32),
+            torch::tensor((int64_t)(nall_nodes - nloc), i32),
+        };
+      }
+      if (world != nullptr && with_comm_loader && lower_input_is_canonical_ &&
+          canonical_comm.empty()) {
+        // A rank of an empty subdomain still joins the collectives of the
+        // with-comm artifact: an empty swap table is the identity exchange,
+        // but it must be present on every rank.
+        const auto i32 = torch::TensorOptions().dtype(torch::kInt32);
+        const auto i64 = torch::TensorOptions().dtype(torch::kInt64);
+        canonical_comm = {
+            torch::empty({0}, i64),
+            torch::empty({0}, i32),
+            torch::empty({0}, i32),
+            torch::empty({0}, i32),
+            torch::empty({0}, i32),
             torch::tensor(
                 (int64_t)reinterpret_cast<std::uintptr_t>(
                     *reinterpret_cast<void* const*>(world)),
