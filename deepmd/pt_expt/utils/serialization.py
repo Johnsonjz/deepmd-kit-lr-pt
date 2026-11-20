@@ -2558,19 +2558,28 @@ def _trace_and_export_impl(
             )
         if canonical:
             if lower_kind == "dpa4c_canonical":
+                from deepmd.pt_expt.kernels.dpa4.canonical import (
+                    canonical_model_eligible as sezm_canonical_eligible,
+                )
                 from deepmd.pt_expt.kernels.dpa4c.canonical import (
                     canonical_model_eligible,
                 )
+
+                if not (canonical_model_eligible(model) or sezm_canonical_eligible(model)):
+                    raise NotImplementedError(
+                        "compact canonical export requires an eligible compressed "
+                        "DPA1, DPA4C or SeZM energy model"
+                    )
             else:
                 from deepmd.pt_expt.kernels.cuda.dpa1.canonical import (
                     canonical_model_eligible,
                 )
 
-            if not canonical_model_eligible(model):
-                raise NotImplementedError(
-                    "compact canonical export requires an eligible compressed "
-                    "DPA1 or DPA4C energy model"
-                )
+                if not canonical_model_eligible(model):
+                    raise NotImplementedError(
+                        "compact canonical export requires an eligible compressed "
+                        "DPA1 energy model"
+                    )
 
         # Trace-time sizes must be pairwise-distinct AND avoid every static
         # model dim (dim_fparam / dim_aparam / parameter dims): make_fx's
@@ -2714,7 +2723,11 @@ def _trace_and_export_impl(
                     tracing_mode="symbolic",
                     _allow_non_fake_inputs=True,
                 )
-                dynamic_shapes = _build_canonical_graph_dynamic_shapes(*sample_inputs)
+                dynamic_shapes = _build_canonical_graph_dynamic_shapes(
+                    is_native_spin=is_native_spin,
+                    long_range=want_long_range,
+                    border=want_border,
+                )
         elif with_comm_dict:
             # Load libdeepmd_op_pt.so and register border_op fake/autograd
             # metadata now, mirroring the dense with-comm precedent below.
