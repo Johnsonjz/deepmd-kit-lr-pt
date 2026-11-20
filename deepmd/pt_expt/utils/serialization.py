@@ -2023,11 +2023,16 @@ def _select_graph_lower_kind(data: dict, *, allow_canonical: bool) -> str | None
         from deepmd.pt_expt.kernels.dpa4c.canonical import (
             canonical_model_unsupported_reason as dpa4c_canonical_unsupported,
         )
+        from deepmd.pt_expt.kernels.dpa4.canonical import (
+            canonical_model_eligible as sezm_canonical_eligible,
+        )
 
         reason = dpa4c_canonical_unsupported(model)
         if reason is not None:
             raise ValueError(reason)
         if dpa4c_canonical_eligible(model):
+            return "dpa4c_canonical"
+        if sezm_canonical_eligible(model):
             return "dpa4c_canonical"
         if dpa1_canonical_eligible(model):
             return "dpa1_canonical"
