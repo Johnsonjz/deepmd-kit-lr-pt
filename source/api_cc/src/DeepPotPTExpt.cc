@@ -128,9 +128,11 @@ FrameParameterLayout resolve_frame_parameter_layout(const char* name,
 // or zero for a system that one rank holds whole. The handle itself is read
 // only by the operator, with the width of ``MPI_Comm`` in its MPI library.
 at::Tensor communicator_tensor(const void* world) {
+  // Pinned for the same reason as cell_tensor: it is a host input of a graph
+  // that may be captured.
   return torch::full(
       {1}, static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(world)),
-      torch::TensorOptions().dtype(torch::kInt64));
+      torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
 }
 
 // A capture waits for the device, empties the cache of the allocator and
@@ -146,8 +148,15 @@ constexpr std::int64_t kStableMeshCalls = 64;
 // tensor of shape (1, 9), the rows of the row-major cell its lattice vectors,
 // zero for a non-periodic frame.
 at::Tensor cell_tensor(const std::vector<double>& box) {
-  auto cell =
-      torch::zeros({1, 9}, torch::TensorOptions().dtype(torch::kFloat64));
+  // Pinned: this tensor is a *host* input of the exported graph, and ATen
+  // refuses a pageable host-to-device copy while a CUDA graph is being
+  // captured.  The capture is attempted by the AOTInductor container itself
+  // once the same shapes repeat, so a pageable cell made the run die with
+  // "Cannot copy between CPU and CUDA tensors during CUDA graph capture"
+  // at the second evaluation of every large message-passing frame.
+  auto cell = torch::zeros(
+      {1, 9},
+      torch::TensorOptions().dtype(torch::kFloat64).pinned_memory(true));
   if (!box.empty()) {
     std::copy(box.begin(), box.begin() + 9, cell.data_ptr<double>());
   }
