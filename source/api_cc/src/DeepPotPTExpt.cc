@@ -800,7 +800,7 @@ void DeepPotPTExpt::join_long_range_exchange(const void* world,
       torch::zeros({2, 3}, i64.dtype(torch::kFloat32)), torch::zeros({2}, i64),
       torch::zeros({2}, i64), torch::arange(2, i64),
       torch::zeros({1, 3}, i64.dtype(torch::kFloat64)), world,
-      cell_tensor(box));
+      cell_tensor(box), ptexpt::empty_halo(device));
 }
 
 std::vector<torch::Tensor> DeepPotPTExpt::run_model_with_comm(

@@ -1451,8 +1451,6 @@ class DeepPot : public DeepBaseModel {
   /**
    * @brief Query whether the compact canonical graph ABI is active.
    */
-  bool canonical_graph_requires_halo() const { return false; }
-
   bool uses_canonical_graph_inference() const {
     const bool result = DP_DeepPotUsesCanonicalGraphInference(dp);
     DP_CHECK_OK(DP_DeepPotCheckOK, dp);
