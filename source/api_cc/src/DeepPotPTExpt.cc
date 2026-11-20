@@ -674,7 +674,12 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph(
     const torch::Tensor& source_order,
     const torch::Tensor& coord,
     const void* world,
-    const torch::Tensor& cell) {
+    const torch::Tensor& cell,
+    const ptexpt::HaloTensors& halo) {
+  // The inputs that follow the graph come in the order of the compact lower:
+  // the positions, the communicator and the cell of a long-range module, and
+  // the communicator and the halo exchange of further message-passing blocks.
+  const bool reads_halo = canonical_graph_requires_halo();
   std::vector<torch::Tensor> inputs = {
       atype,          n_node,
       n_local,        canonicalIndexBytes(source),
@@ -682,8 +687,16 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph(
       source_row_ptr, source_order};
   if (long_range_) {
     inputs.push_back(coord);
+  }
+  if (long_range_ || reads_halo) {
     inputs.push_back(communicator_tensor(world));
+  }
+  if (long_range_) {
     inputs.push_back(cell);
+  }
+  if (reads_halo) {
+    inputs.push_back(halo.send_nodes);
+    inputs.push_back(halo.swaps);
   }
   const std::lock_guard<std::recursive_mutex> evaluation(evaluation_mutex_);
   return loader->run(inputs);
@@ -953,6 +966,12 @@ void DeepPotPTExpt::extract_outputs(
   for (size_t i = 0; i < output_keys.size(); ++i) {
     output_map[output_keys[i]] = flat_outputs[i];
   }
+  // Every caller reads some of these slots with reshape(), so an undefined one
+  // -- an operator exception the AOTI proxy executor caught and never
+  // rethrew -- must be reported HERE, by name.  Checking in the individual
+  // callers was not enough: the canonical-graph GPU entry point, which is the
+  // one `pair deepmd/kk` uses, reshapes the slots directly.
+  deepmd::require_defined_outputs(output_map, "DeepPotPTExpt");
 }
 
 template <typename VALUETYPE, typename ENERGYVTYPE>
@@ -1073,6 +1092,14 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
         "compressed DPA4C model frozen for a CUDA device uses when the "
         "long-range operator serves its long-range module; this archive uses "
         "another lower, so run it on a single rank.");
+  }
+  if (canonical_graph_requires_halo() && multi_rank &&
+      lmp_list.world == nullptr) {
+    throw deepmd::deepmd_exception(
+        "a model with further message-passing blocks exchanges the features "
+        "of ghost atoms between the ranks of a decomposed system through "
+        "their communicator, but the neighbor list carries none "
+        "(InputNlist::world).");
   }
   if (long_range_ && multi_rank && lmp_list.world == nullptr) {
     throw deepmd::deepmd_exception(
@@ -1218,6 +1245,10 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
           nlist_data.jlist, mapping_, nloc, nall_real,
           /*node_count=*/multi_rank ? nall_real : nloc,
           /*row_centers=*/&nlist_data.ilist, fold_to_local);
+      if (lower_input_is_canonical_ && has_message_passing_ && !multi_rank) {
+        ptexpt::check_reciprocal_nlist(nlist_data.jlist, nlist_data.ilist,
+                                       mapping_, dcoord, nloc, nall_real);
+      }
     } else {
       nlist_data.padding();
       firstneigh_tensor = createNlistTensor(nlist_data.jlist, nnei)
@@ -1559,35 +1590,18 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
           coord_Tensor.slice(1, 0, n_node_count).reshape({n_node_count, 3});
       if (lower_input_is_canonical_) {
         const auto compact = compactCanonicalGraph(graph_pack);
-        // A message-passing descriptor needs its ghost features refreshed
-        // between blocks; the plain compact ABI has no channel for that, so a
-        // decomposed frame runs on the with-comm sibling when the archive
-        // carries one.
-        std::vector<at::Tensor> canonical_comm;
-        if (multi_rank && has_message_passing_ && with_comm_loader) {
-          if (nall_real < nall) {
-            throw deepmd::deepmd_exception(
-                "the compact canonical with-comm lower does not serve "
-                "NULL-type atoms on several ranks.");
-          }
-          canonical_comm = deepmd::ptexpt::build_comm_tensors_positional(
-              lmp_list, lmp_list.sendlist, lmp_list.sendnum, lmp_list.recvnum,
-              nloc, nghost_real);
-        }
-        if (!canonical_comm.empty()) {
-          flat_outputs = run_model_canonical_graph_with_comm(
-              compact.atype, compact.n_node, compact.n_local, compact.source,
-              compact.edge_vec, compact.destination_row_ptr,
-              compact.source_row_ptr, compact.source_order, node_coord, world,
-              long_range_ ? cell_tensor(long_range_box) : torch::Tensor(),
-              canonical_comm);
-        } else {
-          flat_outputs = run_model_canonical_graph(
-              compact.atype, compact.n_node, compact.n_local, compact.source,
-              compact.edge_vec, compact.destination_row_ptr,
-              compact.source_row_ptr, compact.source_order, node_coord, world,
-              long_range_ ? cell_tensor(long_range_box) : torch::Tensor());
-        }
+        // Further message-passing blocks refresh the features of the ghost
+        // nodes of an extended node set from their owners through the swaps
+        // of the neighbor list; a folded node set holds no ghost nodes.
+        const ptexpt::HaloTensors halo =
+            canonical_graph_requires_halo() && multi_rank
+                ? ptexpt::halo_tensors(lmp_list, fwd_map, nloc, device)
+                : ptexpt::empty_halo(device);
+        flat_outputs = run_model_canonical_graph(
+            compact.atype, compact.n_node, compact.n_local, compact.source,
+            compact.edge_vec, compact.destination_row_ptr,
+            compact.source_row_ptr, compact.source_order, node_coord, world,
+            long_range_ ? cell_tensor(long_range_box) : torch::Tensor(), halo);
       } else {
         flat_outputs = run_model_graph(
             node_atype, n_node_tensor, n_local_tensor, graph_pack.edge_index,
@@ -1976,7 +1990,8 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
           compact.atype, compact.n_node, compact.n_local, compact.source,
           compact.edge_vec, compact.destination_row_ptr, compact.source_row_ptr,
           compact.source_order, node_coord, /*world=*/nullptr,
-          long_range_ ? cell_tensor(long_range_box) : torch::Tensor());
+          long_range_ ? cell_tensor(long_range_box) : torch::Tensor(),
+          ptexpt::empty_halo(compact.atype.device()));
     } else {
       flat_outputs = run_model_graph(
           graph_tensors.atype, graph_tensors.n_node, graph_tensors.n_local,
@@ -2564,6 +2579,16 @@ void DeepPotPTExpt::compute_edges_gpu_impl(double* d_atom_energy,
         "a graph-input model, or a message-passing model with its with-comm "
         "artifact and a comm_nlist.");
   }
+  if (extended && has_comm_artifact_ && !use_with_comm) {
+    // An artifact that was frozen with an exchange sibling refreshes its halo
+    // features inside the forward. Without the comm payload it would reuse the
+    // first block's features, answering for a system whose messages never
+    // crossed a rank boundary.
+    throw deepmd::deepmd_exception(
+        "compute_edges_gpu: this model was frozen with an exchange artifact, "
+        "which needs the swap metadata of the decomposition (comm_nlist) for a "
+        "frame with halo nodes.");
+  }
   // Fully device-resident inference for edge-input and graph-input models.
   //
   // The caller (an MD engine or the LAMMPS Kokkos pair) builds the neighbor
@@ -2889,6 +2914,23 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     throw deepmd::deepmd_exception(
         "compute_canonical_graph_gpu requires a compact canonical artifact.");
   }
+  // Further message-passing blocks read features of the sources of their
+  // edges, which the halo nodes of a node set receive from their owners
+  // through its halo exchange; every other model reads none.
+  const bool reads_halo = canonical_graph_requires_halo();
+  if (halo != nullptr && !reads_halo) {
+    throw deepmd::deepmd_exception(
+        "compute_canonical_graph_gpu: a halo exchange was given, but the "
+        "model has no further message-passing blocks that read it.");
+  }
+  if (reads_halo && halo == nullptr && nall_nodes > nloc) {
+    throw deepmd::deepmd_exception(
+        "compute_canonical_graph_gpu: a model with further message-passing "
+        "blocks reads features of the halo nodes from their owners, so a node "
+        "set with " +
+        std::to_string(nall_nodes - nloc) +
+        " halo nodes requires its halo exchange.");
+  }
   if (!gpu_enabled) {
     throw deepmd::deepmd_exception(
         "compute_canonical_graph_gpu requires a CUDA device.");
@@ -3027,7 +3069,6 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
                              ? torch::from_blob(const_cast<double*>(d_coord),
                                                 {nall_nodes, 3}, opt_f64)
                              : torch::Tensor();
-      std::map<std::string, torch::Tensor> output;
       // Kokkos supplies the halo plan, not the host int** table border_op
       // consumes; materialise the eight comm tensors and use the canonical
       // with-comm sibling for a decomposed frame.
@@ -3071,6 +3112,7 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
             torch::tensor((int64_t)(nall_nodes - nloc), i32),
         };
       }
+      std::map<std::string, torch::Tensor> output;
       if (!canonical_comm.empty()) {
         extract_outputs(output,
                         run_model_canonical_graph_with_comm(
@@ -3078,39 +3120,14 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
                             destination_row_ptr, source_row_ptr, source_order,
                             coord, world, cell, canonical_comm));
       } else {
-        extract_outputs(output, run_model_canonical_graph(
-                                    atype, n_node, n_local, source, edge_vec,
-                                    destination_row_ptr, source_row_ptr,
-                                    source_order, coord, world, cell));
-      }
-      // Debug: dump the compact canonical arrays and the outputs of this rank,
-      // so a replay through the Python model separates "the arrays are wrong"
-      // from "the model is wrong". Enabled by DEEPMD_CANONICAL_DUMP=<dir>; the
-      // rank suffix comes from the launcher's environment. One file per tensor
-      // keeps every write on the single-Tensor overload of torch::save.
-      if (const char* dump_dir = std::getenv("DEEPMD_CANONICAL_DUMP")) {
-        const char* rank_env = std::getenv("OMPI_COMM_WORLD_RANK");
-        const std::string dump_rank = rank_env != nullptr ? rank_env : "0";
-        const std::string prefix =
-            std::string(dump_dir) + "/rank" + dump_rank + "_";
-        auto write = [&prefix](const std::string& name,
-                               const torch::Tensor& value) {
-          torch::save(value.detach().cpu().clone(), prefix + name + ".pt");
-        };
-        write("atype", atype);
-        write("n_node", n_node);
-        write("n_local", n_local);
-        write("source", source);
-        write("edge_vec", edge_vec);
-        write("destination_row_ptr", destination_row_ptr);
-        write("source_row_ptr", source_row_ptr);
-        write("source_order", source_order);
-        if (coord.defined()) {
-          write("coord", coord);
-        }
-        for (const auto& entry : output) {
-          write("out_" + entry.first, entry.second);
-        }
+        extract_outputs(
+            output,
+            run_model_canonical_graph(
+                atype, n_node, n_local, source, edge_vec, destination_row_ptr,
+                source_row_ptr, source_order, coord, world, cell,
+                halo != nullptr
+                    ? ptexpt::halo_tensors(*halo, device, nloc, nall_nodes)
+                    : ptexpt::empty_halo(device)));
       }
       auto atom_energy = output["atom_energy"]
                              .reshape({nall_nodes})
@@ -3141,13 +3158,15 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     };
     // A graph without halo nodes keeps its extents from step to step, so its
     // evaluation is replayed; a domain's halo changes its extent at every
-    // neighbor rebuild, so a graph with halo nodes is evaluated eagerly. A
-    // model with a long-range module reads the node positions, whose address
-    // is then part of the key, and is evaluated eagerly over several ranks,
+    // neighbor rebuild, so a graph with halo nodes is evaluated eagerly, as
+    // is one whose halo exchange communicates between the kernels. A model
+    // with a long-range module reads the node positions, whose address is
+    // then part of the key, and is evaluated eagerly over several ranks,
     // where it may communicate between its kernels. A replay reads the cell
     // of its call, while the mesh size of the cell fixes the buffers and the
     // launches of the evaluation, so the size joins the key.
-    bool replay = nloc == nall_nodes && !(long_range && world != nullptr);
+    bool replay = nloc == nall_nodes && halo == nullptr &&
+                  !(long_range && world != nullptr);
     std::array<std::int64_t, 3> mesh = {};
     if (long_range) {
       if (!long_range_box.empty()) {
@@ -3280,8 +3299,8 @@ void DeepPotPTExpt::compute_canonical_graph_gpu(
   compute_canonical_graph_gpu_impl(
       d_atom_energy, d_force, d_virial, d_atom_virial, d_atype, d_source,
       index_width, d_edge_vec, d_destination_row_ptr, d_source_row_ptr,
-      d_source_order, d_coord, world, halo, box, nloc, nall_nodes,
-      edge_storage, stream);
+      d_source_order, d_coord, world, halo, box, nloc, nall_nodes, edge_storage,
+      stream);
 }
 
 bool DeepPotPTExpt::uses_fp32_edge_vectors() const {
@@ -3302,6 +3321,11 @@ bool DeepPotPTExpt::canonical_graph_requires_source_csr() const {
   return canonical_requires_source_csr_;
 }
 
+bool DeepPotPTExpt::canonical_graph_requires_halo() const {
+  return lower_input_is_canonical_ && has_message_passing_;
+}
+
 bool DeepPotPTExpt::has_long_range() const { return long_range_; }
+
 
 #endif

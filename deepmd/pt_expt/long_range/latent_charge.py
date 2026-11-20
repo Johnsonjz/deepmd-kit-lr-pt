@@ -52,7 +52,7 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
         return self.kernel.evaluate(r_sq, coefficients)
 
     def operator_eligible(self) -> bool:
-        """Whether :meth:`energy_force_from_coord` evaluates this module.
+        """Whether :meth:`energy_force_from_coord` evaluates this configuration.
 
         The operator evaluates the kernels, channel counts and B-spline orders
         it is instantiated for. The compact lower that calls it reads no frame
@@ -172,9 +172,8 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
         with torch.enable_grad():
             charge = self.charge_net.call_graph(leaf, atype)["latent_charge"]
         total_charge, channel = self.operator_constraint(n_node.shape[0], coord)
-        # The midtown mesh carries the CubeS2 spline: the 88-node stencil of
-        # order 6, or the 32-node stencil of order 4 when the configuration
-        # asks for it.  Never the B-spline default of 8.
+        # Both midtown families have a fixed order-4 or order-6 stencil, never
+        # the B-spline default of 8.
         if self.mesh_backend in ("midtown", "quads"):
             order = 4 if self.pme_order == 4 else 6
         else:

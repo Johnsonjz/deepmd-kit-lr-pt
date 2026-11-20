@@ -590,7 +590,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
   // from the ranks that own them, through the communicator and the swaps of
   // the communication, which a rank without nodes takes no part in.
   const DP_HaloExchange* const halo =
-      canonical_graph && multi_rank
+      canonical_halo && multi_rank
           ? halo_exchange.plan(comm, error, neighbor->ago == 0)
           : nullptr;
   void* const world_ptr = (long_range || halo != nullptr) && multi_rank

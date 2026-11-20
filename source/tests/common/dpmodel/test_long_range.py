@@ -4,6 +4,7 @@
 import itertools
 import pathlib
 
+import math
 import numpy as np
 import pytest
 from scipy.integrate import (
@@ -22,6 +23,11 @@ from deepmd.dpmodel.long_range import (
     LatentChargeLongRange,
     LESKernel,
     SOGKernel,
+)
+from deepmd.dpmodel.long_range.kernel import (
+    SOG_DEFAULT_BASE_WIDTH,
+    SOG_DEFAULT_M,
+    SOG_DEFAULT_WIDTH_RATIO,
 )
 from deepmd.dpmodel.model.model import (
     get_model,
@@ -146,10 +152,20 @@ def test_sog_kernel_closed_form_and_defaults() -> None:
     np.testing.assert_allclose(
         default.amplitude, np.sqrt(2 / np.pi) * np.log(1.5) / np.array([2.0, 3.0, 4.5])
     )
-    # The default kernel exerts the Coulomb force, r^2 K'(r) = -1, between a
-    # few times its first width and a fraction of its widest one.
+    # The default ladder is the SOG library one: M bands from the canonical
+    # base width, each the previous one times b.
     default = SOGKernel()
-    r = np.geomspace(6.5, 150.0, 200)
+    widths = np.exp(default.log_width)
+    np.testing.assert_allclose(
+        widths, SOG_DEFAULT_BASE_WIDTH * SOG_DEFAULT_WIDTH_RATIO ** np.arange(widths.size)
+    )
+    assert widths.size == SOG_DEFAULT_M
+    # The default kernel exerts the Coulomb force, r^2 K'(r) = -1, between a
+    # few times its first width and a fraction of its widest one.  The reach of
+    # the ladder grows with its band count, so the range is derived from the
+    # kernel rather than hard coded: at M = 7 it is [6.5, 14.3] A, at M = 12
+    # [6.5, 164] A.  Inside it the force matches 1/r to better than 0.4 %.
+    r = np.geomspace(3.0 * widths[0], 0.35 * widths[-1], 200)
     step = 1e-4 * r
     slope = (default((r + step) ** 2) - default((r - step) ** 2)) / (2 * step)
     np.testing.assert_allclose(r**2 * slope, -1.0, rtol=0, atol=5e-3)
@@ -969,9 +985,24 @@ def test_pme_mesh_follows_the_cells_of_the_batch() -> None:
         long_range, coord, np.array([4, 5]), 2.0 * _cells(), atype
     )
     spacing = long_range.mesh_spacing()
-    assert spacing == pytest.approx(
-        0.75 * np.pi / long_range.kernel.kspace_cutoff(long_range.kspace_tolerance)
+    # The module sizes the mesh from the measured error law of its own backend
+    # and spline order, not from the legacy ``0.75 pi / k_max`` fraction: assert
+    # it is exactly that law evaluated at the module's own parameters.
+    from deepmd.dpmodel.long_range import grid_rule
+
+    expected = grid_rule.spacing(
+        long_range.mesh_backend,
+        long_range.effective_order(),
+        long_range._sigma_min(),
+        long_range._k_max(),
+        grid_rule.DEFAULT_ACCURACY,
+        force_mode=long_range.force_mode,
     )
+    if long_range.mesh_backend == "bspline" and long_range.effective_order() >= 8:
+        # The PME model applies a Nyquist-fraction cap to the order-8
+        # extrapolation of the measured law (see LatentChargeLongRange).
+        expected = min(expected, 0.75 * math.pi / long_range._k_max())
+    assert spacing == pytest.approx(expected)
     for topologies, box in ((small, _cells()[:1]), (large, 2.0 * _cells())):
         mesh = topologies["pme_mesh"]
         dims = tuple(m.shape[0] for m in (mesh.mode_1, mesh.mode_2, mesh.mode_3))
@@ -1020,6 +1051,29 @@ def test_pme_round_trip() -> None:
     assert restored.pme_spacing == 1.0
     # the default order is recorded too, so that it survives a change of default
     assert _periodic_long_range().serialize()["pme_order"] == 8
+
+
+def test_mesh_spacing_threads_the_force_mode() -> None:
+    """The mesh spacing rule reads the force mode: an ik grid is never finer.
+
+    In ik mode the force keeps the energy exponent, so the same accuracy target
+    admits a coarser mesh than the weight-differentiated (AD) force; the
+    module must pass its ``force_mode`` through to :mod:`grid_rule`.
+    """
+    from deepmd.dpmodel.long_range import grid_rule
+
+    ik = _pme_long_range(mesh_backend="midtown", force_mode="ik")
+    expected = grid_rule.spacing(
+        "midtown",
+        ik.effective_order(),
+        ik._sigma_min(),
+        ik._k_max(),
+        grid_rule.DEFAULT_ACCURACY,
+        force_mode="ik",
+    )
+    assert ik.mesh_spacing() == pytest.approx(expected)
+    ad = _pme_long_range(mesh_backend="midtown", force_mode="ad")
+    assert ik.mesh_spacing() >= ad.mesh_spacing()
 
 
 @pytest.mark.parametrize("n", [6, 10, 20])

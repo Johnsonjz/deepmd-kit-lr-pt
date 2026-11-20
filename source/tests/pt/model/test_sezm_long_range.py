@@ -12,6 +12,10 @@ import unittest
 import numpy as np
 import torch
 
+from deepmd.dpmodel.long_range.latent_charge import (
+    RCUT_TO_SIGMA,
+    SOG_DEFAULT_B,
+)
 from deepmd.dpmodel.utils.neighbor_graph import (
     K_GRID,
     build_topologies,
@@ -228,11 +232,13 @@ class TestSeZMLongRange(unittest.TestCase):
         model = get_model(cfg).to("cpu")
         kernel = model.atomic_model.long_range.kernel
         widths = torch.exp(kernel.log_width)
-        # The geometric initial embedding reaches rcut before the single
-        # message-passing block, so the receptive field is (n_blocks + 1)*rcut.
-        n_layers = 1 + 1
-        sigma = n_layers * 4.0 / 1.9892536839080267
-        expected = sigma * (2.0 ** torch.arange(4, dtype=torch.float64, device="cpu"))
+        # One hop of the descriptor's cutoff, whatever the descriptor depth:
+        # a ladder tied to the message-passing receptive field starts wider
+        # than an ionic cell and carries no structure inside the box.
+        sigma = 4.0 / RCUT_TO_SIGMA
+        expected = sigma * (
+            SOG_DEFAULT_B ** torch.arange(4, dtype=torch.float64, device="cpu")
+        )
         torch.testing.assert_close(widths, expected)
 
     def test_ellipsoid_matches_fixed_and_ragged(self) -> None:

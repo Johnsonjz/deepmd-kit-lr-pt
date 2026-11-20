@@ -245,7 +245,9 @@ void fitting_energy_gradient_range(cudaStream_t stream,
                                    float* saved,
                                    double* e,
                                    float* d_x,
-                                   int64_t route);
+                                   int64_t route,
+                                   const float* add_jacobian = nullptr,
+                                   const float* add_v = nullptr);
 
 // Source-attributed per-node virial of a canonical graph from stored edge
 // cotangents, atom_virial[node] = sum(src=node) -g_e (x) edge_vec_e. The edge

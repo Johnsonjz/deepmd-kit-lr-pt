@@ -338,6 +338,20 @@ struct QuadsTab {
   int off[3][NORD];
 };
 
+// A separable QuadS stencil clipped to one brick: the 1-D values and slopes
+// plus the three clipped mesh coordinates of every 1-D stencil entry.  The
+// 3-D node loop is then a pair of coordinates (x,y) fixed per lane and a walk
+// in z, as in the B-spline AxisStencil path, instead of a per-node QNodeS
+// table lookup.  A coordinate of -1 marks an entry outside the brick.
+template<int NORD>
+struct QuadsBrickTab {
+  float v[3][NORD];
+  float d[3][NORD];
+  int cx[NORD];
+  int cy[NORD];
+  int cz[NORD];
+};
+
 // Values and slopes only: the brick kernels clip each node against the local
 // band (brick_coord), so their flat offset depends on the clip and cannot be
 // precomputed per axis.
@@ -2054,6 +2068,30 @@ __device__ __forceinline__ size_t bidx(int ix,int iy,int iz,int nx,int ny){
   return (size_t)iz*ny*nx+(size_t)iy*nx+ix;
 }
 
+template<int NORD>
+__device__ __forceinline__ void quads_fill_brick_tab(
+    QuadsBrickTab<NORD>& T,const float t[3],const int base[3],
+    int nx,int ny,int nz,int bxlo,int bxhi,int bylo,int byhi,
+    int bzlo,int bzhi,int lane){
+  constexpr int m=2*NORD;
+  #pragma unroll
+  for(int s=lane;s<3*m;s+=32){
+    const int ax=s/m,r=s-ax*m;
+    if(r<NORD) T.v[ax][r]=quads_w1d<NORD>(t[ax],r,false);
+    else       T.d[ax][r-NORD]=quads_w1d<NORD>(t[ax],r-NORD,true);
+  }
+  #pragma unroll
+  for(int s=lane;s<3*NORD;s+=32){
+    const int ax=s/NORD,k=s-ax*NORD;
+    const int g=base[ax]-NORD/2+1+k;
+    int c;
+    if(ax==0) c=brick_coord(g,nx,bxlo,bxhi);
+    else if(ax==1) c=brick_coord(g,ny,bylo,byhi);
+    else c=brick_coord(g,nz,bzlo,bzhi);
+    if(ax==0) T.cx[k]=c; else if(ax==1) T.cy[k]=c; else T.cz[k]=c;
+  }
+}
+
 // Packed 6th-order CubeS2 spread for the distributed brick.  Same 4-atoms/warp
 // table structure as the replicated packed kernel; the brick-local fast path
 // replaces the global-mesh base and falls back to brick_coord at the z halo.
@@ -2426,6 +2464,123 @@ __global__ void k_gather_cubes2_brick_ik(int nlocal,const FracNode* fr,
   if(lane!=0) return;
   force[3*i+comp]=-qscale*q[i]*s;
   if(want_pot) vpot[i]=qscale*gp;
+}
+
+// Separable QuadS brick spread in stencil form: one lane per (x,y) pair,
+// walking z, with the three clipped coordinates precomputed per axis.  This is
+// the B-spline AxisStencil schedule; the per-node QNodeS table is not needed.
+template<int NORD>
+__global__ void k_spread_quads_brick_stencil(int nlocal,const FracNode* fr,
+    const double*q,double rho_scale,int nx,int ny,int nz,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,
+    unsigned long long*rho){
+  using SL=QSlots<NORD>;
+  constexpr int P=NORD, kTab=9*P;
+  extern __shared__ float sh_tab[];
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  const int base[3]={ix0,iy0,iz0};
+  QuadsBrickTab<NORD>& T=
+      *reinterpret_cast<QuadsBrickTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_brick_tab<NORD>(T,tf,base,nx,ny,nz,bxlo,bxhi,bylo,byhi,
+                             bzlo,bzhi,lane);
+  __syncwarp();
+  const float qs=(float)rho_scale*(float)q[i];
+  const float kfs=(float)kFxScale;
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  #pragma unroll
+  for(int round=0;round<SL::kRounds;++round){
+    const int slot=lane+32*round;
+    const bool live=(slot<SL::kSlots);
+    const int ss=live?slot:(SL::kSlots-1);
+    const int g=ss/SL::kPairs, pair=ss-g*SL::kPairs;
+    const int kc=pair%P, kb=pair/P;
+    if(!live || T.cx[kc]<0 || T.cy[kb]<0) continue;
+    const float vxy=T.v[1][kb]*T.v[0][kc];
+    const int col=T.cx[kc]+bnx*T.cy[kb];
+    #pragma unroll
+    for(int ka=g;ka<P;ka+=SL::kGroups){
+      if(T.cz[ka]<0) continue;
+      const size_t m=(size_t)col+(size_t)(bnx*bny)*T.cz[ka];
+      atomicAdd(&rho[m],
+                (unsigned long long)(long long)__float2ll_rn(
+                    qs*vxy*T.v[2][ka]*kfs));
+    }
+  }
+}
+
+// Separable QuadS brick gather in the same stencil schedule: values, slopes
+// and clipped coordinates come from QuadsBrickTab; the inner z walk is a
+// shared read, a mesh read and four FMAs.
+template<int NORD>
+__global__ void k_gather_quads_brick_stencil(int nlocal,const FracNode* fr,
+    double lx,double ly,double lz,
+    const double*q,double qscale,int nx,int ny,int nz,
+    int bxlo,int bxhi,int bylo,int byhi,int bzlo,int bzhi,const float*u,
+    double*force,double*vpot){
+  using SL=QSlots<NORD>;
+  constexpr int P=NORD, kTab=9*P;
+  extern __shared__ float sh_tab[];
+  const int lane=threadIdx.x&31, warp=threadIdx.x>>5;
+  const int i=blockIdx.x*(blockDim.x>>5)+warp; if(i>=nlocal) return;
+  const FracNode& fo=fr[i];
+  const double fx=fo.i[0]+(double)fo.t[0];
+  const double fy=fo.i[1]+(double)fo.t[1];
+  const double fz=fo.i[2]+(double)fo.t[2];
+  const int ix0=(int)floor(fx),iy0=(int)floor(fy),iz0=(int)floor(fz);
+  const float tf[3]={(float)(fx-ix0),(float)(fy-iy0),(float)(fz-iz0)};
+  const int base[3]={ix0,iy0,iz0};
+  QuadsBrickTab<NORD>& T=
+      *reinterpret_cast<QuadsBrickTab<NORD>*>(sh_tab+warp*kTab);
+  quads_fill_brick_tab<NORD>(T,tf,base,nx,ny,nz,bxlo,bxhi,bylo,byhi,
+                             bzlo,bzhi,lane);
+  __syncwarp();
+  const int bnx=bxhi-bxlo+1,bny=byhi-bylo+1;
+  float dtx=0.f,dty=0.f,dtz=0.f,gp=0.f;
+  #pragma unroll
+  for(int round=0;round<SL::kRounds;++round){
+    const int slot=lane+32*round;
+    const bool live=(slot<SL::kSlots);
+    const int ss=live?slot:(SL::kSlots-1);
+    const int g=ss/SL::kPairs, pair=ss-g*SL::kPairs;
+    const int kc=pair%P, kb=pair/P;
+    if(!live || T.cx[kc]<0 || T.cy[kb]<0) continue;
+    const float vx=T.v[0][kc], vy=T.v[1][kb];
+    const float vxy=vx*vy;
+    const float h0=T.d[0][kc]*vy;
+    const float h1=vx*T.d[1][kb];
+    const int col=T.cx[kc]+bnx*T.cy[kb];
+    #pragma unroll
+    for(int ka=g;ka<P;ka+=SL::kGroups){
+      if(T.cz[ka]<0) continue;
+      const size_t m=(size_t)col+(size_t)(bnx*bny)*T.cz[ka];
+      const float up=live?u[m]:0.f;
+      const float vz=T.v[2][ka];
+      dtx+=h0*vz*up;
+      dty+=h1*vz*up;
+      dtz+=vxy*T.d[2][ka]*up;
+      gp +=vxy*vz*up;
+    }
+  }
+  #pragma unroll
+  for(int off2=16;off2>0;off2>>=1){
+    dtx+=__shfl_down_sync(0xffffffffu,dtx,off2);
+    dty+=__shfl_down_sync(0xffffffffu,dty,off2);
+    dtz+=__shfl_down_sync(0xffffffffu,dtz,off2);
+    gp +=__shfl_down_sync(0xffffffffu,gp ,off2);
+  }
+  if(lane!=0) return;
+  const double qi=q[i];
+  force[3*i+0]=-qscale*qi*dtx*(double)nx/lx;
+  force[3*i+1]=-qscale*qi*dty*(double)ny/ly;
+  force[3*i+2]=-qscale*qi*dtz*(double)nz/lz;
+  vpot[i]=qscale*gp;
 }
 
 template<int NORD>
@@ -4433,8 +4588,13 @@ extern "C" void sog_gpu_spread_brick_dev_ptr(SogGpuState*s,int nlocal,
       else if(bo==5) k_spread_bspline_brick<5><<<ga,tb>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
       else           k_spread_bspline_brick<6><<<ga,tb>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
     }else if(quads){
-      if(nord==4) k_spread_quads_brick<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
-      else k_spread_quads_brick<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      if(std::getenv("SOG_QUADS_STENCIL") != nullptr){
+        if(nord==4) k_spread_quads_brick_stencil<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+        else k_spread_quads_brick_stencil<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      } else {
+        if(nord==4) k_spread_quads_brick<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+        else k_spread_quads_brick<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
+      }
     }else{
       if(nord==4) k_spread_cubes2_brick<4><<<gw,tb,30*sizeof(float)*(tb/32)>>>(nlocal,frac,q,rho_scale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->s_brick_fx);
       else {
@@ -4503,8 +4663,13 @@ extern "C" void sog_gpu_gather_brick_dev_ptr(SogGpuState*s,int nlocal,
     else if(bo==5) k_gather_bspline_brick<5><<<ga,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
     else           k_gather_bspline_brick<6><<<ga,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
   }else if(quads){
-    if(nord==4) k_gather_quads_brick<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
-    else k_gather_quads_brick<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    if(std::getenv("SOG_QUADS_STENCIL") != nullptr){
+      if(nord==4) k_gather_quads_brick_stencil<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+      else k_gather_quads_brick_stencil<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    } else {
+      if(nord==4) k_gather_quads_brick<4><<<gw,tb,36*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+      else k_gather_quads_brick<6><<<gw,tb,54*sizeof(float)*(tb/32)>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
+    }
   }else{
     if(nord==4) k_gather_cubes2_brick<4><<<gw,tb>>>(nlocal,frac,lx,ly,lz,q,qscale,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);
     else if(s->term_ok) k_gather_cubes2_term_brick6<<<gw,tb>>>(nlocal,frac,q,qscale,lx,ly,lz,nx,ny,nz,nxlo,nxhi,nylo,nyhi,nzlo,nzhi,s->d_brick,dforce,dvpot);

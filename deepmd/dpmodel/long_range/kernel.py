@@ -35,6 +35,16 @@ from deepmd.utils.version import (
 COULOMB_CONSTANT = 14.3996454784255
 r"""Coulomb constant :math:`e^2 / (4 \pi \varepsilon_0)` in eV Å."""
 
+SOG_DEFAULT_BASE_WIDTH = 2.180230445405648
+r"""Width of the first Gaussian of the default :class:`SOGKernel` ladder, in Å."""
+
+SOG_DEFAULT_WIDTH_RATIO = 1.62976708826776469
+r"""Ratio of consecutive widths of the default :class:`SOGKernel` ladder."""
+
+SOG_DEFAULT_M = 7
+r"""Number of Gaussians of the default :class:`SOGKernel` ladder."""
+
+
 
 class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")):
     """Pair interaction kernel :math:`K(r)` in Å⁻¹ with its own parameters.
@@ -343,10 +353,12 @@ class SOGKernel(BaseInteractionKernel):
         The number :math:`M` of Gaussians of the default widths.
     base_width
         The width :math:`\sigma` of the first default Gaussian, in Å. ``None``
-        falls back to :data:`SOG_DEFAULT_BASE_WIDTH`.
+        leaves the ladder unset: the config layer then applies the SOG library
+        rule for a bare ``sog`` kernel, and the class constant
+        :data:`SOG_DEFAULT_BASE_WIDTH` is the final fallback.
     width_ratio
-        The ratio :math:`b > 1` of consecutive default widths. ``None`` falls
-        back to :data:`SOG_DEFAULT_WIDTH_RATIO`.
+        The ratio :math:`b > 1` of consecutive default widths. ``None`` behaves
+        as for ``base_width``.
     trainable
         Whether the amplitudes and widths are trained.
     precision
@@ -360,21 +372,21 @@ class SOGKernel(BaseInteractionKernel):
         self,
         amplitude: float | list[float] | None = None,
         width: list[float] | None = None,
-        n_gaussian: int = 12,
-        base_width: float | None = 2.180230445405648,
-        width_ratio: float | None = 1.62976708826776469,
+        n_gaussian: int = SOG_DEFAULT_M,
+        base_width: float | None = SOG_DEFAULT_BASE_WIDTH,
+        width_ratio: float | None = SOG_DEFAULT_WIDTH_RATIO,
         trainable: bool = True,
         precision: str = "default",
     ) -> None:
         super().__init__(trainable, precision)
         if width is None:
-            # A bare ``sog`` configuration leaves the ladder unset and lets the
-            # configuration layer derive it; the class constants are the final
-            # fallback.
+            # ``None`` means the ladder was left unset.  A bare ``sog`` config
+            # reaches this branch, so fall back to the class constants; an
+            # explicit ``width`` (e.g. the SOG library rule) skips it entirely.
             if base_width is None:
-                base_width = 2.180230445405648
+                base_width = SOG_DEFAULT_BASE_WIDTH
             if width_ratio is None:
-                width_ratio = 1.62976708826776469
+                width_ratio = SOG_DEFAULT_WIDTH_RATIO
             if n_gaussian < 1:
                 raise ValueError(f"`n_gaussian` must be positive, got {n_gaussian}")
             if not np.isfinite(base_width) or base_width <= 0.0:

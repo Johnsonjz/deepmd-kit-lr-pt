@@ -61,13 +61,19 @@ CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
 CHARGE_NET_NEURON = [64, 64]
 """Default hidden widths of the charge network."""
 
-RCUT_TO_SIGMA = 1.9892536839080267
-"""The SOG library's receptive field to width ratio, ``sigma = r_c / this``."""
+RCUT_TO_SIGMA = 10.0 / 3.633717409009413
+"""The SOG library's receptive field to width ratio, ``sigma = r_c / this``.
 
-SOG_DEFAULT_B = 2.0
-"""The SOG library's default width ratio."""
+``1 / this = 0.3633717409009413`` is the canonical scale of the
+sum-of-Gaussians decomposition of ``1/r``, so a single-hop descriptor with
+``rcut = 6`` Å starts at ``sigma = 2.180230445405648`` Å, the width the
+:class:`~deepmd.dpmodel.long_range.kernel.SOGKernel` ladder uses by default.
+"""
 
-SOG_DEFAULT_M = 12
+SOG_DEFAULT_B = 1.62976708826776469
+"""The SOG library's default width ratio, the canonical SOG ``b``."""
+
+SOG_DEFAULT_M = 7
 """The SOG library's default number of Gaussian bands."""
 
 
@@ -78,11 +84,16 @@ def sog_default_ladder(
 ) -> tuple[list[float], list[float]]:
     r"""Default SOG widths and amplitudes from the descriptor's receptive field.
 
-    The SOG library rule is :math:`\sigma = r_c / 1.9892536839080267` with
-    :math:`r_c = n_{layers} \, r_{cut}`.  The geometric initial embedding
-    already reaches ``rcut`` before the first message-passing block, so a
-    descriptor with ``B`` blocks sees ``(B + 1) * rcut``; a message-passing-free
-    descriptor such as DPA4C sees one hop.
+    The SOG library rule is ``sigma = rcut / RCUT_TO_SIGMA``, the canonical
+    sum-of-Gaussians decomposition of ``1/r`` at the descriptor's single-hop
+    cutoff.  Scaling the widest Gaussian with the descriptor's *receptive
+    field* instead makes it wider than a typical ionic cell, where a Gaussian
+    flat across the box carries no structure: the reciprocal sum then keeps
+    only the ``k = 0`` shell, which a neutral charge constraint removes, and
+    the long-range head contributes nothing.  The head therefore always starts
+    from one hop, whatever the descriptor depth; the message-passing layers
+    change how the descriptor *carries* information, not the length scale at
+    which the reciprocal term has to act.
 
     Parameters
     ----------
@@ -99,8 +110,7 @@ def sog_default_ladder(
         ``width`` and ``amplitude`` in the units of the upstream kernel,
         :math:`a_k = \sqrt{2/\pi}\ln b / \sigma_k`.
     """
-    n_layers = int(getattr(descriptor, "n_blocks", 0) or 0) + 1
-    sigma = n_layers * float(descriptor.get_rcut()) / RCUT_TO_SIGMA
+    sigma = float(descriptor.get_rcut()) / RCUT_TO_SIGMA
     widths = sigma * np.power(b, np.arange(n_gaussian, dtype=np.float64))
     amplitudes = np.sqrt(2.0 / np.pi) * np.log(b) / widths
     return widths.tolist(), amplitudes.tolist()
@@ -110,7 +120,11 @@ PME_ORDER = 8
 """Default order of the B-splines that spread the charges to the mesh."""
 
 PME_SPACING_FRACTION = 0.75
-"""Default mesh spacing, as a fraction of the Nyquist spacing of the wave-number cutoff.
+"""Fallback mesh spacing, as a fraction of the Nyquist spacing of the wave-number cutoff.
+
+Only used when the kernel's width is unknown to the error law of
+:mod:`deepmd.dpmodel.long_range.grid_rule`; a known width is sized by that law
+instead, with no Nyquist ceiling.
 
 At order 8 the mesh evaluation of a periodic frame then stays within a few
 parts in a million of the sum over the wave numbers, in the reciprocal energy
@@ -206,9 +220,11 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         live parameters. The frozen cutoff is serialized with the model.
         Requires ``periodic=True``.
     pme_spacing
-        The largest spacing of the mesh of a periodic frame, in Å; the
-        default is three quarters of the Nyquist spacing of the wave-number
-        cutoff, :math:`0.75 \pi / k_{max}`. Requires ``periodic=True``.
+        The largest spacing of the mesh of a periodic frame, in Å; overrides
+        ``pme_accuracy``. The default is the spacing the measured error law of
+        :mod:`deepmd.dpmodel.long_range.grid_rule` gives at that target (and
+        three quarters of the Nyquist spacing of the wave-number cutoff when
+        the kernel's width is unknown to the rule). Requires ``periodic=True``.
     pme_order
         The order of the B-splines that spread the charges to the mesh.
         Requires ``periodic=True``.
@@ -455,7 +471,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             kernel_config.get(key) is not None
             for key in ("width", "amplitude", "base_width", "width_ratio")
         ):
-            # The SOG library rule: sigma = nlayers * rcut / RCUT_TO_SIGMA.
+            # The SOG library rule: sigma = rcut / RCUT_TO_SIGMA (one hop).
             widths, amplitudes = sog_default_ladder(
                 descriptor,
                 n_gaussian=int(kernel_config.get("n_gaussian", SOG_DEFAULT_M)),
@@ -516,8 +532,10 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
 
         The configured ``pme_spacing``; otherwise the spacing that reaches the
         target force-relative accuracy under the measured error law of
-        :mod:`deepmd.dpmodel.long_range.grid_rule`, never coarser than
-        :data:`PME_SPACING_FRACTION` of the Nyquist spacing of the cutoff.
+        :mod:`deepmd.dpmodel.long_range.grid_rule`.  The law alone sizes the
+        grid; there is no extra Nyquist ceiling (the fitted law is measured at
+        1e-4 spacings well inside its band).  A kernel whose width the rule
+        does not know falls back to ``PME_SPACING_FRACTION * pi / k_max``.
         """
         if self.pme_spacing is not None:
             return self.pme_spacing
@@ -538,9 +556,11 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         )
         if self.mesh_backend == "bspline" and self.effective_order() >= 8:
             # The measured law stops at order 4/6; its order-8 extrapolation
-            # leaves the B-spline assignment aliasing above the target.  Keep
-            # the PME mesh inside the band where the assignment factor is
-            # accurate; the midtown backends have their own validity cap.
+            # leaves the B-spline assignment aliasing above the target (the
+            # PME model tests see ~2e-3 relative energy error at the default
+            # 1e-4).  A Nyquist-fraction cap keeps the high-order PME mesh
+            # inside the band where the assignment factor is accurate.  This
+            # is a PME-model policy; the general grid rule keeps its law.
             spacing = min(spacing, PME_SPACING_FRACTION * math.pi / k_max)
         return spacing
 

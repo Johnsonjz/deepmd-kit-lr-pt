@@ -2646,11 +2646,8 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             The overflow check frequency
         """
         # SeZM has no pair-tabulated descriptor to fold: every interaction is
-        # a learned SO(2)/SO(3) operator on the message-passing graph. The
-        # compact canonical lower of this descriptor is a graph adapter
-        # (deepmd.pt_expt.kernels.dpa4.canonical) that reconstructs the graph
-        # edge list from the canonical CSR; it needs no compression state.
-        # Keep this a no-op so `--compress` can select the canonical lower.
+        # a learned SO(2)/SO(3) operator on the message-passing graph, so there
+        # is no table to build.
         import logging
 
         logging.getLogger(__name__).info(
