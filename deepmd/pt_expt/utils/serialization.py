@@ -917,6 +917,7 @@ def build_synthetic_canonical_graph_inputs(
     e_max: int,
     *,
     device: torch.device,
+    nframes: int = 2,
     want_spin: bool = False,
     want_long_range: bool = False,
     want_border: bool = False,
@@ -949,6 +950,7 @@ def build_synthetic_canonical_graph_inputs(
     sample = build_synthetic_graph_inputs(
         model,
         e_max,
+        nframes=nframes,
         dtype=torch.float32,
         edge_dtype=torch.float32,
         device=device,
@@ -2642,6 +2644,7 @@ def _trace_and_export_impl(
                 model,
                 e_sample,
                 device=torch.device("cpu"),
+                nframes=1 if with_comm_dict else 2,
                 want_spin=is_native_spin,
                 want_long_range=want_long_range,
                 want_border=want_border,
