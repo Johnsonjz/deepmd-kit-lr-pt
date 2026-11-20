@@ -317,7 +317,14 @@ max|dE| 2e-6 (2.9e-7 relative), from 1.36 and 0.68.
 
 The frame virial is a share as well (see `docs/SEZM_1L_VIRIAL_BUG.md`): every
 midtown path returns `sum_owned F(x)r + n_owned (W - sum_all F(x)r) / N`, so
-the ranks add up to `W`, not `nranks * W`.  The replicated path returned `W`
+the ranks add up to `W`, not `nranks * W`.
+The node axis a distributed call receives also holds the ghost rows of the
+framework (zero charge, `node_mask == False`).  The midtown kernels used to let
+them into the charged-node count of the constraint, into the frame moment sum
+and into the per-row share of `W`; on the slab solve that left the frame with a
+net charge and over-counted the virial share by the ghost fraction, so energy
+and pressure drifted with np.  See `docs/SLAB_GHOST_ROW_BUG.md`.
+  The replicated path returned `W`
 on every rank before, which made the LAMMPS pressure of a 1L SeZM model drift
 by -462 atm per added rank; `mesh_sum` (bspline) always partitioned it, and
 `direct_sum` sums the per-node virials of its owners.

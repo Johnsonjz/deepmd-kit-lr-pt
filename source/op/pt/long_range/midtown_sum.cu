@@ -180,7 +180,11 @@ __global__ void k_midtown_charges1(int n, const float* raw, const bool* mask,
     const double m = mask[i] ? 1.0 : 0.0;
     const double v = static_cast<double>(raw[i]) * m;
     q[i] = v;
-    local[0] = 1.0;
+    // Only a charged node enters the count: a row the caller does not own (a
+    // ghost of a decomposed frame) carries no charge, and counting it would
+    // shrink the uniform shift of the constraint below by the ghost fraction,
+    // leaving the frame with a net charge and a wrong potential everywhere.
+    local[0] = m;
     local[1] = v;
   }
   #pragma unroll
@@ -241,7 +245,9 @@ __global__ void k_midtown_finish1(int n, const double* vpot, const double* f3,
       for (int a = 0; a < 3; ++a) {
       for (int b = 0; b < 3; ++b) {
         // Only the reduction needs it; finish2 recomputes the per-atom value.
-        local[1 + 3 * a + b] = f3[3 * i + a] * coord[3 * i + b];
+        // A ghost row's force is the real force at that position but the row
+        // owns no charge, so it must not enter the frame moment sum W - sum.
+        local[1 + 3 * a + b] = m * f3[3 * i + a] * coord[3 * i + b];
       }
     }
   }
@@ -295,7 +301,10 @@ __global__ void k_midtown_finish2(int n, const double* vpot, const double* q,
     for (int b = 0; b < 3; ++b) {
       const int t = 3 * a + b;
       const double mom = f3[3 * i + a] * coord[3 * i + b];
-      virial9[k + t] = static_cast<float>(mom + (W[t] - sums[1 + t]) / cnt);
+      // The share of the rest of W belongs to the charged nodes: a ghost row
+      // that took it would add to the caller's sum over every row.
+      virial9[k + t] =
+          static_cast<float>(m * (mom + (W[t] - sums[1 + t]) / cnt));
     }
   }
 }
