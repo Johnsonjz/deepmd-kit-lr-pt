@@ -626,8 +626,17 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
       // (4 B) and f_rho_fx (8 B) per grid point; keep 10% headroom for the
       // cuFFT work area.
       {
+        // cudaMemGetInfo is not permitted while the caller's stream is being
+        // captured, and this backend may rebuild its plan inside a capture
+        // (the whole evaluation runs there).  Query the capture state first,
+        // which is allowed, and skip the refusal when it is unknown.
         size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
+        cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &cap_status);
+        const bool capturing = cap_status != cudaStreamCaptureStatusNone;
+        if (!capturing) {
+          cudaMemGetInfo(&free_b, &total_b);
+        }
         const double ng = static_cast<double>(nx) * ny * nz;
         // f_gp (float2, 8 B) + f_rho_r (4) + f_rho_fx (8) per grid point.
         // QuadS adds its half-spectrum buffer (4 B) and the ik force mode the
@@ -637,7 +646,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
         const double per_point = 20.0 + (is_quads ? 4.0 : 0.0) +
                                  (force_mode != 0 ? 16.0 : 0.0);
         const double need = ng * per_point;
-        TORCH_CHECK(static_cast<double>(free_b) >= need * 1.10,
+        TORCH_CHECK(capturing || static_cast<double>(free_b) >= need * 1.10,
                     "midtown: the replicated mesh needs ",
                     need / 1073741824.0, " GiB of device memory for a ", nx,
                     "x", ny, "x", nz, " grid, but only ",
