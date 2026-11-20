@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""The with-comm gate of the compact canonical SeZM lower.
+
+The gate is CPU-only: it decides from the atomic model's capabilities whether
+a compact canonical artifact needs the eight-tensor border exchange.  The
+2L multi-rank parity itself is exercised on a GPU under MPI by
+``source/tests/pt_expt/kernels/test_long_range_multi_rank.py`` and by the
+deployment script, not here.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("torch")
+
+from deepmd.pt_expt.utils.serialization import (  # noqa: E402
+    _needs_canonical_with_comm,
+    _needs_with_comm_artifact,
+)
+
+
+class _AtomicModel:
+    def __init__(self, message_passing: bool, edge_parallel: bool = True) -> None:
+        self._message_passing = message_passing
+        self._edge_parallel = edge_parallel
+
+    def has_message_passing_across_ranks(self) -> bool:
+        return self._message_passing
+
+    def supports_edge_parallel(self) -> bool:
+        return self._edge_parallel
+
+
+class _Model:
+    def __init__(self, message_passing: bool, edge_parallel: bool = True) -> None:
+        self.atomic_model = _AtomicModel(message_passing, edge_parallel)
+
+
+@pytest.mark.parametrize("lower_kind", ["dpa4c_canonical", "dpa1_canonical"])
+def test_a_message_passing_canonical_model_builds_the_with_comm_sibling(
+    lower_kind: str,
+) -> None:
+    """A multi-block model's canonical lower must carry the border exchange."""
+    model = _Model(message_passing=True)
+    assert _needs_canonical_with_comm(model, lower_kind) is True
+    assert _needs_with_comm_artifact(model, lower_kind) is True
+
+
+def test_a_single_block_canonical_model_needs_no_sibling() -> None:
+    """A model without cross-rank message passing keeps the plain ABI."""
+    model = _Model(message_passing=False)
+    assert _needs_canonical_with_comm(model, "dpa4c_canonical") is False
+    assert _needs_with_comm_artifact(model, "dpa4c_canonical") is False
+
+
+def test_a_model_without_edge_parallel_support_needs_no_sibling() -> None:
+    """A module that cannot follow a decomposed frame keeps single rank."""
+    model = _Model(message_passing=True, edge_parallel=False)
+    assert _needs_canonical_with_comm(model, "dpa4c_canonical") is False
+    assert _needs_with_comm_artifact(model, "dpa4c_canonical") is False
