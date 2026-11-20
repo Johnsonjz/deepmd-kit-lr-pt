@@ -1123,7 +1123,23 @@ def _build_canonical_graph_dynamic_shapes_with_comm(
         shapes = (*shapes, {0: node_dim}, None, {0: nframes_val})
     elif len(shapes) == 8:
         shapes = (*shapes, None, None, None)
-    return (*shapes, *(None,) * 8)
+    # The swap table is a runtime property of the domain decomposition, not a
+    # constant of the artifact: every rank has a different nswap and different
+    # send/recv counts. The eight comm tensors therefore keep a dynamic first
+    # axis; freezing them at the synthetic sample made every non-matching
+    # decomposition run the baked-in exchange and lose the cross-rank features.
+    nswap_dim = torch.export.Dim("nswap", min=0)
+    comm_shapes = (
+        {0: nswap_dim},
+        {0: nswap_dim},
+        {0: nswap_dim},
+        {0: nswap_dim},
+        {0: nswap_dim},
+        None,
+        None,
+        None,
+    )
+    return (*shapes, *comm_shapes)
 
 
 def count_synthetic_graph_edges(
