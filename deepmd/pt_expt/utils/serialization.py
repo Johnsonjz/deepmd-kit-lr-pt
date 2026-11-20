@@ -2719,18 +2719,6 @@ def _trace_and_export_impl(
                 dynamic_shapes = _build_canonical_graph_dynamic_shapes_with_comm(
                     *sample_inputs, has_long_range=want_long_range
                 )
-            else:
-                traced = model.forward_lower_canonical_graph_exportable(
-                    *sample_inputs,
-                    do_atomic_virial=do_atomic_virial,
-                    tracing_mode="symbolic",
-                    _allow_non_fake_inputs=True,
-                )
-                dynamic_shapes = _build_canonical_graph_dynamic_shapes(
-                    is_native_spin=is_native_spin,
-                    long_range=want_long_range,
-                    border=want_border,
-                )
         elif with_comm_dict:
             # Load libdeepmd_op_pt.so and register border_op fake/autograd
             # metadata now, mirroring the dense with-comm precedent below.
