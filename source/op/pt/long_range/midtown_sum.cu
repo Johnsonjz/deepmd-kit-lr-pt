@@ -775,6 +775,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     // returns its share and the ranks add up to W (ops.cc).
     virial.narrow(0, f, 1)
         .copy_(atom_virial.narrow(0, owner_begin, owner_count)
+                   .to(torch::kFloat64)
                    .sum(0)
                    .reshape({1, 9})
                    .to(at::kFloat));
@@ -995,7 +996,9 @@ ChargeSumOutputs midtown_sum_local(
   atom_energy.copy_(energy_f.reshape({count, 1}));
   // The frame virial is the sum of the per-node shares of this rank; the
   // ranks add up to W (ops.cc).
-  virial.copy_(atom_virial.sum(0).reshape({1, 9}));
+  // The frame virial sums one share per node. At 1.1M atoms a float32
+  // reduction loses a few atm of pressure, so reduce in fp64 and cast back.
+  virial.copy_(atom_virial.to(torch::kFloat64).sum(0).reshape({1, 9}));
   return {atom_energy, charge_gradient, force, atom_virial, virial};
 }
 
@@ -1578,7 +1581,9 @@ ChargeSumOutputs midtown_sum_slab(
       charge_gradient.data_ptr<float>(), atom_virial.data_ptr<float>());
   // The frame virial is the sum of the per-node shares of this rank; the
   // ranks add up to W (ops.cc).
-  virial.copy_(atom_virial.sum(0).reshape({1, 9}));
+  // The frame virial sums one share per node. At 1.1M atoms a float32
+  // reduction loses a few atm of pressure, so reduce in fp64 and cast back.
+  virial.copy_(atom_virial.to(torch::kFloat64).sum(0).reshape({1, 9}));
   return {atom_energy, charge_gradient, force_out, atom_virial, virial};
 }
 
