@@ -14,16 +14,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 : "${WATER_SCAN0_LMP_DATA:?}" "${WATER_SCAN0_MODEL:?}"
 : "${LMP:?}" "${LMP_KK:?}" "${WATER_SCAN0_PLUGIN:?}" "${WATER_SCAN0_PLUGIN_KK:?}"
 
-run() { # engine plugin np extra...
-  local engine=$1 plugin=$2 np=$3; shift 3
-  "$engine" "$@" -var DATA "$WATER_SCAN0_LMP_DATA" \
-    -var MODEL "$WATER_SCAN0_MODEL" -var PLUGIN "$plugin" \
-    -log none -in "$here/in.water.lammps"
-}
-
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 for np in 1 2 4; do
-  run "$LMP" "$WATER_SCAN0_PLUGIN" "$np" | tee "$tmp/host$np.log" >/dev/null
   mpirun -np "$np" "$LMP" -var DATA "$WATER_SCAN0_LMP_DATA" \
     -var MODEL "$WATER_SCAN0_MODEL" -var PLUGIN "$WATER_SCAN0_PLUGIN" \
     -log none -in "$here/in.water.lammps" > "$tmp/host$np.log" 2>&1 || true
