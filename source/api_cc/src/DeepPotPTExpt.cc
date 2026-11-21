@@ -1241,9 +1241,12 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
       // Cache the skin topology destination-grouped. Single-rank folds ghosts
       // onto local owners; non-message-passing multi-rank keeps the extended
       // region so ghost forces reverse-comm to their owners.
+      const bool canonical_host_comm =
+          lower_input_is_canonical_ && has_comm_artifact_ && with_comm_loader;
       skin_topology_ = deepmd::buildSkinTopology(
           nlist_data.jlist, mapping_, nloc, nall_real,
-          /*node_count=*/multi_rank ? nall_real : nloc,
+          /*node_count=*/(multi_rank || canonical_host_comm) ? nall_real
+                                                             : nloc,
           /*row_centers=*/&nlist_data.ilist, fold_to_local);
       if (lower_input_is_canonical_ && has_message_passing_ && !multi_rank) {
         ptexpt::check_reciprocal_nlist(nlist_data.jlist, nlist_data.ilist,
@@ -1563,7 +1566,10 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
       // topology. Single-rank folds ghosts onto local owners (N == nloc);
       // non-message-passing multi-rank keeps the extended region
       // (N == nall_real) so reverse communication folds ghost forces back.
-      const std::int64_t n_node_count = multi_rank ? nall_real : nloc;
+      const bool canonical_host_comm =
+          lower_input_is_canonical_ && has_comm_artifact_ && with_comm_loader;
+      const std::int64_t n_node_count =
+          (multi_rank || canonical_host_comm) ? nall_real : nloc;
       at::Tensor n_node_tensor =
           torch::full({1}, n_node_count, int_option).to(device);
       at::Tensor n_local_tensor = torch::full({1}, nloc, int_option).to(device);
@@ -1597,7 +1603,7 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
             canonical_graph_requires_halo() && multi_rank
                 ? ptexpt::halo_tensors(lmp_list, fwd_map, nloc, device)
                 : ptexpt::empty_halo(device);
-        if (multi_rank && has_comm_artifact_ && with_comm_loader) {
+        if (canonical_host_comm) {
           // The host pair style must drive the same with-comm sibling as the
           // Kokkos device path.  Passing only the halo plan to the regular
           // canonical artifact skips the descriptor's ghost-feature exchange,
@@ -1666,7 +1672,10 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
     if (lower_input_is_canonical_) {
       deepmd::flatten_canonical_atom_virial(output_map);
     }
-    if (multi_rank) {
+    const bool extended_nodes =
+        multi_rank ||
+        (lower_input_is_canonical_ && has_comm_artifact_ && with_comm_loader);
+    if (extended_nodes) {
       // Extended region (N == nall_real): force is already per-extended-atom,
       // owned energy = sum over local atom energies, no zero-padding.  Ghost
       // forces fold back via LAMMPS reverse-comm (both the plain and with-comm
@@ -3108,7 +3117,8 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
       std::vector<std::vector<int>> kk_swaps;
       std::vector<int*> kk_ptrs;
       std::vector<at::Tensor> canonical_comm;
-      if (world != nullptr && with_comm_loader && lower_input_is_canonical_) {
+      if (world != nullptr && with_comm_loader && lower_input_is_canonical_ &&
+          halo != nullptr) {
         const int nswap = halo->nswap;
         int sent = 0;
         for (int s = 0; s < nswap; ++s) sent += halo->sendnum[s];

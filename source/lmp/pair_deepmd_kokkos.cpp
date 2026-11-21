@@ -242,7 +242,11 @@ void PairDeepMDKokkos<DeviceType>::init_style() {
 
   // The model node set is shared by both input schemas; type_idx_map is
   // populated by the base coeff().
-  compact_graph.setup(type_idx_map, multi_rank);
+  // A long-range module is evaluated by every rank, and the with-comm
+  // artifact expects the extended node set even on one rank: its ghost rows
+  // are the periodic images the reciprocal sum folds in.
+  const bool extended_nodes = multi_rank || (canonical_graph && long_range);
+  compact_graph.setup(type_idx_map, extended_nodes);
   // The halo exchange follows the swaps of the communication atom for atom,
   // which the nodes of an extended node set do only without virtual atoms.
   if (canonical_halo && multi_rank && compact_graph.has_null_types) {
@@ -589,11 +593,12 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
   // further message-passing blocks refreshes the features of the ghost nodes
   // from the ranks that own them, through the communicator and the swaps of
   // the communication, which a rank without nodes takes no part in.
+  const bool extended_nodes = multi_rank || (canonical_graph && long_range);
   const DP_HaloExchange* const halo =
-      canonical_halo && multi_rank
+      canonical_halo && extended_nodes
           ? halo_exchange.plan(comm, error, neighbor->ago == 0)
           : nullptr;
-  void* const world_ptr = (long_range || halo != nullptr) && multi_rank
+  void* const world_ptr = (long_range || halo != nullptr) && extended_nodes
                               ? static_cast<void*>(&world)
                               : nullptr;
   const bool joins_long_range = long_range && multi_rank;
