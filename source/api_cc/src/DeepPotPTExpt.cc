@@ -1597,11 +1597,43 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
             canonical_graph_requires_halo() && multi_rank
                 ? ptexpt::halo_tensors(lmp_list, fwd_map, nloc, device)
                 : ptexpt::empty_halo(device);
-        flat_outputs = run_model_canonical_graph(
-            compact.atype, compact.n_node, compact.n_local, compact.source,
-            compact.edge_vec, compact.destination_row_ptr,
-            compact.source_row_ptr, compact.source_order, node_coord, world,
-            long_range_ ? cell_tensor(long_range_box) : torch::Tensor(), halo);
+        if (multi_rank && has_comm_artifact_ && with_comm_loader) {
+          // The host pair style must drive the same with-comm sibling as the
+          // Kokkos device path.  Passing only the halo plan to the regular
+          // canonical artifact skips the descriptor's ghost-feature exchange,
+          // so every rank keeps the first block's ghost rows.
+          std::vector<std::vector<int>> remapped_sendlist;
+          std::vector<int*> remapped_sendlist_ptrs;
+          std::vector<int> remapped_sendnum, remapped_recvnum;
+          torch::Dict<std::string, torch::Tensor> comm_dict;
+          build_comm_dict_with_virtual_atoms(
+              comm_dict, lmp_list, fwd_map, remapped_sendlist,
+              remapped_sendlist_ptrs, remapped_sendnum, remapped_recvnum);
+          const auto i32 = torch::TensorOptions().dtype(torch::kInt32);
+          std::vector<at::Tensor> canonical_comm = {
+              comm_dict.at("send_list").clone(),
+              comm_dict.at("send_proc").clone(),
+              comm_dict.at("recv_proc").clone(),
+              comm_dict.at("send_num").clone(),
+              comm_dict.at("recv_num").clone(),
+              comm_dict.at("communicator").clone(),
+              torch::tensor((int64_t)nloc, i32),
+              torch::tensor((int64_t)(nall_real - nloc), i32),
+          };
+          flat_outputs = run_model_canonical_graph_with_comm(
+              compact.atype, compact.n_node, compact.n_local, compact.source,
+              compact.edge_vec, compact.destination_row_ptr,
+              compact.source_row_ptr, compact.source_order, node_coord, world,
+              long_range_ ? cell_tensor(long_range_box) : torch::Tensor(),
+              canonical_comm);
+        } else {
+          flat_outputs = run_model_canonical_graph(
+              compact.atype, compact.n_node, compact.n_local, compact.source,
+              compact.edge_vec, compact.destination_row_ptr,
+              compact.source_row_ptr, compact.source_order, node_coord, world,
+              long_range_ ? cell_tensor(long_range_box) : torch::Tensor(),
+              halo);
+        }
       } else {
         flat_outputs = run_model_graph(
             node_atype, n_node_tensor, n_local_tensor, graph_pack.edge_index,
