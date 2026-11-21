@@ -30,6 +30,7 @@
 // and the charged-node count) make the round trip.
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 #include <torch/types.h>
 
@@ -366,6 +367,59 @@ struct CpuTimer {
 };
 }  // namespace
 
+// Orders the legacy default stream of the SOG mesh kernels around the caller's
+// stream.  The SOG entry points take no stream (their cuFFT plans and NCCL
+// communicator are bound to the legacy default stream), while a caller such as
+// AOTInductor evaluates on a NON-BLOCKING side stream, which the legacy default
+// stream is not ordered against.  Without this scope the mesh kernels can read
+// half-produced inputs, the host collectives behind the charge constraint and
+// the frame sums can read half-written buffers, and the caller can read outputs
+// before they exist -- all of them silently, because the results look sane.
+// Measured on 1119744 atoms, np=2 and np=4, dpa4c-sog midtown: identical inputs
+// gave -3882 / -3961 / -3908 atm at np=2 and -4028 / -4031 / -4056 atm at np=4
+// against -3909.600 with CUDA_LAUNCH_BLOCKING=1.  The scope runs the tensor
+// operations of the call on the default stream too, orders that stream after
+// the caller's before the first launch, and orders the caller's stream after it
+// on the way out.  The event pair is per thread: the backend's mutex serializes
+// the calls, but this scope is entered before it is taken.
+class DefaultStreamScope {
+ public:
+  DefaultStreamScope()
+      : caller_(at::cuda::getCurrentCUDAStream()),
+        guard_(at::cuda::getDefaultCUDAStream()) {
+    if (caller_.stream() != nullptr) {
+      C10_CUDA_CHECK(cudaEventRecord(edge(0), caller_.stream()));
+      C10_CUDA_CHECK(cudaStreamWaitEvent(nullptr, edge(0), 0));
+    }
+  }
+
+  ~DefaultStreamScope() {
+    if (caller_.stream() == nullptr) {
+      return;
+    }
+    C10_CUDA_CHECK(cudaEventRecord(edge(1), nullptr));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(caller_.stream(), edge(1), 0));
+  }
+
+  DefaultStreamScope(const DefaultStreamScope&) = delete;
+  DefaultStreamScope& operator=(const DefaultStreamScope&) = delete;
+
+ private:
+  static cudaEvent_t edge(int which) {
+    // Per thread: the backend's own mutex serializes the calls, but the scope
+    // is entered before it is taken, so two threads must not share an event.
+    thread_local cudaEvent_t events[2] = {nullptr, nullptr};
+    if (events[which] == nullptr) {
+      C10_CUDA_CHECK(
+          cudaEventCreateWithFlags(&events[which], cudaEventDisableTiming));
+    }
+    return events[which];
+  }
+
+  at::cuda::CUDAStream caller_;
+  at::cuda::CUDAStreamGuard guard_;
+};
+
 ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              const torch::Tensor& charge,
                              const torch::Tensor& node_mask,
@@ -383,6 +437,9 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              const torch::Tensor* communicator,
                              int64_t force_mode,
                              bool quads) {
+  // This call's kernels and tensor operations run on the legacy default
+  // stream; see DefaultStreamScope.
+  DefaultStreamScope default_stream;
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   CpuTimer::cycle();
@@ -812,6 +869,7 @@ ChargeSumOutputs midtown_sum_local(
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
     const torch::Tensor* communicator) {
+  DefaultStreamScope default_stream;
   TORCH_CHECK(!form_a_requested(),
               "midtown: SOG_MIDTOWN_FORM_A is implemented on the replicated "
               "solve only; unset it for the local-spread path");
@@ -1073,6 +1131,7 @@ ChargeSumOutputs midtown_sum_slab(
     double prefactor, int64_t order, double spacing,
     const torch::Tensor* communicator, bool quads, bool bspline,
     int64_t force_mode) {
+  DefaultStreamScope default_stream;
   TORCH_CHECK(kernel == kSog, "the slab midtown backend evaluates the SOG kernel only");
   TORCH_CHECK(charge.size(1) == 1, "the slab midtown backend supports one channel");
   TORCH_CHECK(channel == -1 || channel == 0,
