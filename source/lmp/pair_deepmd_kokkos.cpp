@@ -687,7 +687,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
   atomKK->sync(execution_space, F_MASK);
   auto f = atomKK->k_f.template view<DeviceType>();
   auto out_force = d_out_force;
-  if (multi_rank) {
+  if (extended_nodes) {
     Kokkos::parallel_for(
         "deepmd/kk:clear_ghost_f",
         Kokkos::RangePolicy<DeviceType>(nlocal, nall),
@@ -706,7 +706,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
         f(i, 2) += fscale * out_force(3 * m + 2);
       });
   atomKK->modified(execution_space, F_MASK);
-  if (multi_rank) {
+  if (extended_nodes) {
     ghost_fold.fold(comm, world, this, 3);
     if (reverse_used_host) {
       atomKK->sync(execution_space, F_MASK);
@@ -781,7 +781,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
         cvatom[ii][k] += vscale * h_av(9 * m + map9[k]);
       }
     }
-    if (multi_rank) {
+    if (extended_nodes) {
       reverse_virial = true;
       k_reverse_virial.modify_host();
       auto h_reverse = k_reverse_virial.view_host();
