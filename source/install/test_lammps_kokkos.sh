@@ -132,6 +132,8 @@ DPA4SPIN_KOKKOS_REQUIRED=1 python -m pytest -v -s \
 # leads with the launcher of the MPI prefix, while pytest runs on the Python of
 # the job.
 PYTHON=$(command -v python)
-PATH=${MPI_ROOT}/bin:${PATH} DPA4C_LONG_RANGE_KOKKOS_REQUIRED=1 "${PYTHON}" -m pytest -v -s \
+PATH=${MPI_ROOT}/bin:${PATH} DPA4C_LONG_RANGE_KOKKOS_REQUIRED=1 DPA4_2L_KOKKOS_REQUIRED=1 \
+	"${PYTHON}" -m pytest -v -s \
 	"${REPO_ROOT}/source/lmp/tests/test_lammps_dpa4c_long_range_kokkos.py" \
+	"${REPO_ROOT}/source/lmp/tests/test_lammps_dpa4_2l_canonical.py" \
 	--junitxml="${TEST_REPORT_DIR}/long-range.xml"

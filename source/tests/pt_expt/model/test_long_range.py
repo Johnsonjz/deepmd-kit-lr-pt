@@ -2034,7 +2034,7 @@ def test_periodic_compressed_frozen_model_matches_uncompressed(
             )
     # A cell without volume marks no system, on either lower: the graph lower
     # meets it in the neighbor search, the compact lower at its input.
-    with pytest.raises((ValueError, RuntimeError), match=r"no volume|singular"):
+    with pytest.raises((ValueError, RuntimeError), match=r"(?i)no volume|singular"):
         dp.eval(periodic, np.zeros((1, 9)), atype)
 
 
