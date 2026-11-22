@@ -246,6 +246,16 @@ jobs:
           DPA4SPIN_LMP_REQUIRED: 1
           CUDA_VISIBLE_DEVICES: 0
           ENABLE_PADDLE: 0
+      - name: Test long-range multi-rank
+        if: matrix.suite == 'main'
+        run: |
+          export LD_LIBRARY_PATH=$MPI_HOME/lib:$CUDA_PATH/lib64:/usr/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
+          export PATH=$MPI_HOME/bin:$PATH
+          source/install/test_long_range_mpi.sh
+        env:
+          OMP_NUM_THREADS: 1
+          CUDA_VISIBLE_DEVICES: 0
+          DP_LONG_RANGE_RANKS: "2"
       - name: Upload C++ test reports
         if: ${{ always() && hashFiles('source/build_tests/generator-reports/**', 'source/build_tests/gtest-reports/**', 'source/build_tests/pytest-reports/**', 'source/build_lammps_kokkos/test-reports/**') != '' }}
         uses: actions/upload-artifact@v7
@@ -259,6 +269,60 @@ jobs:
             source/build_lammps_kokkos/test-reports/**
           if-no-files-found: ignore
           retention-days: 14
+  test_long_range_multi_gpu:
+    # Opt-in, separate from the pass gate: the per-rank device binding needs a
+    # runner with at least two GPUs.  Point the repository variable
+    # DP_MULTI_GPU_RUNNER at such a runner and label a pull request
+    # "Test Multi GPU"; without the variable the job falls back to the single
+    # GPU runner, where every rank binds to device 0 and the multi-rank legs
+    # still run.
+    name: Test long-range MPI and multi-GPU
+    runs-on: ${{ vars.DP_MULTI_GPU_RUNNER || 'gpu' }}
+    if: github.repository_owner == 'deepmodeling' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test Multi GPU'))
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: lukka/get-cmake@latest
+        with:
+          useLocalCache: true
+          useCloudCache: false
+      - run: |
+          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
+          OS_NAME="ubuntu${UBUNTU_VERSION}"
+          wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
+          && sudo dpkg -i cuda-keyring_1.1-1_all.deb \
+          && sudo apt-get update \
+          && sudo apt-get -y install cuda-toolkit-12-9
+          echo "CUDA_PATH=/usr/local/cuda-12.9" >> $GITHUB_ENV
+          echo "/usr/local/cuda-12.9/bin" >> $GITHUB_PATH
+      - run: python -m pip install -U uv
+      - run: source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_gpu --group pin_pytorch_gpu
+      - run: |
+          export PYTORCH_ROOT=$(python -c 'import torch;print(torch.__path__[0])')
+          export TENSORFLOW_ROOT=$(python -c 'import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec("tensorflow").origin).parent)')
+          source/install/uv_with_retry.sh pip install --system mpich
+          export MPI_HOME=$(python -c 'import sys; print(sys.prefix)')
+          export MPICC=$MPI_HOME/bin/mpicc
+          echo "MPI_HOME=$MPI_HOME" >> "$GITHUB_ENV"
+          source/install/uv_with_retry.sh pip install --system -v -e .[gpu,test,lmp,cu12,torch] mpi4py --reinstall-package deepmd-kit --reinstall-package mpi4py --no-binary mpi4py
+        env:
+          DP_VARIANT: cuda
+          DP_ENABLE_NATIVE_OPTIMIZATION: 1
+          DP_ENABLE_PYTORCH: 1
+      - run: dp --version
+      - name: Test long-range multi-rank
+        run: |
+          export LD_LIBRARY_PATH=$MPI_HOME/lib:$CUDA_PATH/lib64:/usr/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH
+          export PATH=$MPI_HOME/bin:$PATH
+          source/install/test_long_range_mpi.sh
+        env:
+          OMP_NUM_THREADS: 1
+          DP_LONG_RANGE_RANKS: "2 4"
+          DP_LONG_RANGE_TIMEOUT: "1800"
+
   pass:
     name: Pass testing on CUDA
     needs: [test_python, test_cc]
