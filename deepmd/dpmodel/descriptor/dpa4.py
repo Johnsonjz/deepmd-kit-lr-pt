@@ -2485,18 +2485,18 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         return True
 
     def has_message_passing_across_ranks(self) -> bool:
-        """SeZM reads ghost-neighbour features at every interaction block.
+        """Whether a further interaction block reads ghost features.
 
-        The GRAPH lower implements the exchange via per-block ``border_op``
-        (pt_expt ``exchange_ghost_features``), so multi-rank inference always
-        needs the with-comm artifact. Whether multi-rank is POSSIBLE at all
-        is :meth:`supports_edge_parallel`.
+        With one block the SeZM lower folds ghost neighbours through the
+        per-node graph and needs no cross-rank feature exchange; the with-comm
+        sibling is only required from the second block on.  Whether multi-rank
+        is possible at all is :meth:`supports_edge_parallel`.
 
         The DENSE (nlist) lower remains comm-less — see
         :meth:`dense_lower_supports_comm`; the freeze machinery consults both
         so nlist-kind artifacts carry ``has_comm_artifact=False``.
         """
-        return True
+        return int(getattr(self, "n_blocks", 1)) > 1
 
     def supports_edge_parallel(self) -> bool:
         """Bridging included: multi-rank is supported for every SeZM config.

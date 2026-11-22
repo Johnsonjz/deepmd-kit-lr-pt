@@ -313,6 +313,9 @@ void DeepPotPTExpt::init(const std::string& model,
             ? metadata["canonical_requires_source_csr"].as_bool()
             : lower_input_kind == "dpa1_canonical" ||
                   (lower_input_is_canonical_ && long_range_);
+    canonical_single_rank_only_ =
+        metadata.obj_val.count("canonical_single_rank_only") &&
+        metadata["canonical_single_rank_only"].as_bool();
   } else {
     lower_input_is_edge_ = false;
     lower_input_is_graph_ = false;
@@ -1131,6 +1134,12 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
   //     (``run_model_graph_with_comm``, below).  Fail fast before building any
   //     tensors when that artifact is missing, so callers get a clear message
   //     instead of a wrong answer or the loader's own runtime error.
+  if (lower_input_is_canonical_ && multi_rank && canonical_single_rank_only_) {
+    throw deepmd::deepmd_exception(
+        "this compact canonical long-range artifact was frozen without a "
+        "cross-rank message-passing exchange and is faithful on a single rank "
+        "only; run it on one rank, or use the graph lower for multi-rank");
+  }
   if (lower_input_is_graph_ && multi_rank && has_message_passing_) {
     if (!has_comm_artifact_ || !with_comm_loader) {
       throw deepmd::deepmd_exception(
@@ -2955,6 +2964,12 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     throw deepmd::deepmd_exception(
         "compute_canonical_graph_gpu requires a compact canonical artifact.");
   }
+  if (canonical_single_rank_only_ && world != nullptr) {
+    throw deepmd::deepmd_exception(
+        "this compact canonical long-range artifact was frozen without a "
+        "cross-rank message-passing exchange and is faithful on a single rank "
+        "only; run it on one rank, or use the graph lower for multi-rank");
+  }
   // Further message-passing blocks read features of the sources of their
   // edges, which the halo nodes of a node set receive from their owners
   // through its halo exchange; every other model reads none.
@@ -3384,7 +3399,12 @@ bool DeepPotPTExpt::canonical_graph_requires_source_csr() const {
 }
 
 bool DeepPotPTExpt::canonical_graph_requires_halo() const {
-  return lower_input_is_canonical_ && has_message_passing_;
+  // A message-passing descriptor needs the halo only when the artifact was
+  // frozen with the cross-rank sibling.  A one-block DPA4 model reports
+  // has_message_passing=true at the descriptor level yet freezes no sibling
+  // (canonical_single_rank_only), so keying on the descriptor alone makes the
+  // host pair style pass 11/13 inputs to an 8-input regular canonical program.
+  return lower_input_is_canonical_ && has_comm_artifact_;
 }
 
 bool DeepPotPTExpt::has_long_range() const { return long_range_; }

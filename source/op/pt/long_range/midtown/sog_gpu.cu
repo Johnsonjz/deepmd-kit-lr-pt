@@ -23,6 +23,9 @@
 
 #define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ \
   fprintf(stderr,"sog_gpu CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); }}while(0)
+namespace {
+__device__ __forceinline__ void atomic_add_double(double* address, double val);
+}
 
 // ── device state ──
 struct SogGpuState {
@@ -1391,7 +1394,7 @@ __global__ void k_kspace_h(int nx,int ny,int nz,double kfx,double kfy,double kfz
   if((int)threadIdx.x<7){
     double v=sred[threadIdx.x][0];
     for(int w2=1;w2<nwarps;++w2) v+=sred[threadIdx.x][w2];
-    atomicAdd(&red[threadIdx.x], v);
+    atomic_add_double(&red[threadIdx.x], v);
   }
 }
 
@@ -1426,7 +1429,7 @@ __global__ void k_spread_cubes2_warp(int nlocal,const double*x,const double*boxl
     const double w=(ORD==4)?cs2_w4(tx,ty,tz,nd,(double)xi_f):(double)cs2_w6_tab(tab,nd);
     if(w==0.0) continue;
     const int gx=wrap_near(ix0+nd.dx,nx),gy=wrap_near(iy0+nd.dy,ny),gz=wrap_near(iz0+nd.dz,nz);
-    atomicAdd(&rho[midx(gx,gy,gz,nx,ny)].x, qs*w);
+    atomic_add_double(&rho[midx(gx,gy,gz,nx,ny)].x, qs*w);
   }
 }
 
@@ -1496,7 +1499,7 @@ __global__ void k_spread_quads(int nlocal,const double*x,const double*boxlo,
   for(int a=0;a<NORD;++a){int gx=wrap(ix0+off+a,nx); double wa=wx[a]*qs;
     for(int b=0;b<NORD;++b){int gy=wrap(iy0+off+b,ny); double wab=wa*wy[b];
       for(int c=0;c<NORD;++c){int gz=wrap(iz0+off+c,nz);
-        atomicAdd(&rho[midx(gx,gy,gz,nx,ny)].x, wab*wz[c]); }}}
+        atomic_add_double(&rho[midx(gx,gy,gz,nx,ny)].x, wab*wz[c]); }}}
 }
 
 // ── Warp-cooperative QuadS kernels on the real / half-spectrum path ──
@@ -1742,7 +1745,7 @@ __global__ void k_kspace(int nx,int ny,int nz,double lx,double ly,double lz,
   if((int)threadIdx.x<7){
     double v=sred[threadIdx.x][0];
     for(int w=1;w<nwarps;++w) v+=sred[threadIdx.x][w];
-    atomicAdd(&red[threadIdx.x], v);
+    atomic_add_double(&red[threadIdx.x], v);
   }
   // gradient meshes: grad = i*k * (scaleinv*geff*rho)
   // Only real grid points may be written; out-of-range lanes operate on the
@@ -1824,7 +1827,7 @@ __global__ void k_kspace_f(int nx,int ny,int nz,double lx,double ly,double lz,
   if((int)threadIdx.x<7){
     double v=sred[threadIdx.x][0];
     for(int w=1;w<nwarps;++w) v+=sred[threadIdx.x][w];
-    atomicAdd(&red[threadIdx.x], v);
+    atomic_add_double(&red[threadIdx.x], v);
   }
   // gradient meshes: grad = i*k * (scaleinv*geff*rho)
   // Only real grid points may be written; out-of-range lanes operate on the
@@ -1909,7 +1912,7 @@ __global__ void k_green_pencil(int Nh,int nx,int ny,int nz,int ylo,int YL,
   if((int)threadIdx.x<7){
     double v=sred[threadIdx.x][0];
     for(int w=1;w<nwarps;++w) v+=sred[threadIdx.x][w];
-    atomicAdd(&red[threadIdx.x], v);
+    atomic_add_double(&red[threadIdx.x], v);
   }
   if(in_range){ pot[i].x=scaleinv*gee*rr; pot[i].y=scaleinv*gee*ri; }
 }
@@ -2048,12 +2051,12 @@ __global__ void k_gather_quads(int nlocal,const double*x,const double*boxlo,
   // r⊗F virial: exact, captures all position-dependent strain effects
   // that the analytic Fourier formula misses (matching CPU vv_rf).
   // red[14..19] holds Σ r_iα · F_iβ.
-  atomicAdd(&red[14], x[3*i+0]*fxs);  // r_x * F_x (xx)
-  atomicAdd(&red[15], x[3*i+1]*fys);  // r_y * F_y (yy)
-  atomicAdd(&red[16], x[3*i+2]*fzs);  // r_z * F_z (zz)
-  atomicAdd(&red[17], x[3*i+0]*fys);  // r_x * F_y (xy)
-  atomicAdd(&red[18], x[3*i+0]*fzs);  // r_x * F_z (xz)
-  atomicAdd(&red[19], x[3*i+1]*fzs);  // r_y * F_z (yz)
+  atomic_add_double(&red[14], x[3*i+0]*fxs);  // r_x * F_x (xx)
+  atomic_add_double(&red[15], x[3*i+1]*fys);  // r_y * F_y (yy)
+  atomic_add_double(&red[16], x[3*i+2]*fzs);  // r_z * F_z (zz)
+  atomic_add_double(&red[17], x[3*i+0]*fys);  // r_x * F_y (xy)
+  atomic_add_double(&red[18], x[3*i+0]*fzs);  // r_x * F_z (xz)
+  atomic_add_double(&red[19], x[3*i+1]*fzs);  // r_y * F_z (yz)
 }
 
 // ── Distributed Grid3d local-brick kernels ──
@@ -3378,6 +3381,27 @@ extern "C" int sog_gpu_slab_unpack_green_izpack(SogGpuState*s,int nx,int ny,
 // communicator cannot be created, every entry returns non-zero and the caller
 // keeps using the host-staged MPI path.
 namespace {
+
+// Double atomicAdd is native from sm_60; the upstream CUDA arch list still
+// contains sm_50.  Keep the older target buildable (the kernel does not run
+// there) with the usual CAS loop.
+__device__ __forceinline__ void atomic_add_double(double* address, double val) {
+#if defined(__CUDA_ARCH__)
+#if __CUDA_ARCH__ < 600
+  auto* addr = reinterpret_cast<unsigned long long*>(address);
+  unsigned long long old = *addr;
+  unsigned long long assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(addr, assumed,
+                    __double_as_longlong(val + __longlong_as_double(assumed)));
+  } while (assumed != old);
+#else
+  atomicAdd(address, val);
+#endif
+#endif
+}
+
 // ncclUniqueId is a 128-byte struct passed BY VALUE to ncclCommInitRank; using
 // a pointer in the function-pointer cast changes the ABI and NCCL answers
 // "invalid argument".
@@ -3432,6 +3456,10 @@ constexpr int kNcclSum=0;       // ncclRedOp_t
 // One communicator per process: neutralize/qmean (which have no handle) and
 // solve_auto share it, so the first collective can be the neutralization.
 void *g_comm=nullptr;
+// Stream of the current solve, used by the NCCL exchange.  The SOG entry
+// point runs on the caller's stream (AOTI side streams included); NCCL must
+// join that stream, not the legacy default stream.  The op serializes solves.
+static thread_local cudaStream_t g_sog_stream=nullptr;
 int g_rank=-1, g_np=-1, g_state=0;   // 0 = not tried, 1 = usable, -1 = unavailable
 }  // namespace
 
@@ -3474,9 +3502,9 @@ extern "C" int sog_gpu_nccl_alltoall(SogGpuState*s,const float*send,
   if(!a.ok||g_state!=1) return -1;
   if(a.group_start()!=0) return -2;
   for(int d=0;d<np;++d)
-    a.send(send+sdisp[d],(size_t)scnt[d],kNcclFloat32,d,g_comm,(cudaStream_t)0);
+    a.send(send+sdisp[d],(size_t)scnt[d],kNcclFloat32,d,g_comm,g_sog_stream);
   for(int r=0;r<np;++r)
-    a.recv(recv+rdisp[r],(size_t)rcnt[r],kNcclFloat32,r,g_comm,(cudaStream_t)0);
+    a.recv(recv+rdisp[r],(size_t)rcnt[r],kNcclFloat32,r,g_comm,g_sog_stream);
   return a.group_end()==0 ? 0 : -3;
 }
 
@@ -3493,10 +3521,10 @@ extern "C" int sog_gpu_nccl_halo2(SogGpuState*s,int prev,int next,
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1) return -1;
   if(a.group_start()!=0) return -2;
-  a.send(send_prev,(size_t)cnt_prev,dtype,prev,g_comm,(cudaStream_t)0);
-  a.recv(recv_next,(size_t)cnt_next,dtype,next,g_comm,(cudaStream_t)0);
-  a.send(send_next,(size_t)cnt_next,dtype,next,g_comm,(cudaStream_t)0);
-  a.recv(recv_prev,(size_t)cnt_prev,dtype,prev,g_comm,(cudaStream_t)0);
+  a.send(send_prev,(size_t)cnt_prev,dtype,prev,g_comm,g_sog_stream);
+  a.recv(recv_next,(size_t)cnt_next,dtype,next,g_comm,g_sog_stream);
+  a.send(send_next,(size_t)cnt_next,dtype,next,g_comm,g_sog_stream);
+  a.recv(recv_prev,(size_t)cnt_prev,dtype,prev,g_comm,g_sog_stream);
   return a.group_end()==0 ? 0 : -3;
 }
 
@@ -3591,7 +3619,7 @@ extern "C" int sog_gpu_nccl_halo_fwd(SogGpuState*s,int prev,int next,
 extern "C" int sog_gpu_nccl_allreduce_dev_dtype(void *buf,size_t n,int dtype){
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1) return -1;
-  return a.all_reduce(buf,buf,n,dtype,kNcclSum,g_comm,(cudaStream_t)0)==0
+  return a.all_reduce(buf,buf,n,dtype,kNcclSum,g_comm,g_sog_stream)==0
              ? 0 : -2;
 }
 extern "C" int sog_gpu_nccl_allreduce_dev(void *buf,size_t n){
@@ -3617,7 +3645,7 @@ extern "C" int sog_gpu_nccl_allreduce_red(SogGpuState*s){
   NcclApi &a=nccl_api();
   if(!a.ok||g_state!=1||s->d_red==nullptr) return -1;
   return a.all_reduce(s->d_red,s->d_red,(size_t)7,kNcclDouble,kNcclSum,
-                      g_comm,(cudaStream_t)0)==0 ? 0 : -2;
+                      g_comm,g_sog_stream)==0 ? 0 : -2;
 }
 
 extern "C" void sog_gpu_red_download(SogGpuState*s,double*host){
@@ -4238,6 +4266,7 @@ static double sog_gpu_compute_core(SogGpuState*s,int nlocal,const double*d_x,con
     double*d_force,double*d_vpot,double self_coeff,double qsqsum,int remove_self,int force_mode,
     double*virial6,int host_reduction){
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  g_sog_stream = stream;
   // Every kernel, memset and transform of the step runs on the caller's
   // stream: the AOTI backend captures the evaluation on a side stream, so a
   // launch on the legacy default stream is not part of the graph (it runs

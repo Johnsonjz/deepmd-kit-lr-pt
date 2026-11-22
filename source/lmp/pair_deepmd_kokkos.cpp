@@ -486,9 +486,12 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
     d_eatom = k_eatom.template view<DeviceType>();
   }
   int nedge = 0;
-  // The source CSR feeds the source-attributed per-atom virial, and every
-  // force assembly of an artifact that groups edges by source.
-  const bool source_csr = canonical_source_csr || cvflag_atom;
+  // The source CSR feeds the source-attributed per-atom virial, every force
+  // assembly of an artifact that groups edges by source, and the with-comm
+  // canonical sibling.  The sibling consumes the full CSR even when the
+  // metadata reports canonical_requires_source_csr=false; passing the
+  // two-slot placeholder makes AOTI fail on the first call.
+  const bool source_csr = canonical_source_csr || cvflag_atom || canonical_halo;
   if (canonical_graph) {
     compact_graph.build(list, cutoff, dist_unit_cvt_factor, source_csr);
   } else {

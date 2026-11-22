@@ -56,6 +56,27 @@ namespace {
 constexpr double kLn2 = 0.69314718055994530942;
 constexpr double kTwoPi = 6.28318530717958647692;
 
+// Double atomicAdd is a native instruction only from sm_60.  The default
+// upstream CUDA architecture list still contains sm_50, where the call fails
+// to compile; a CAS loop keeps that pass buildable while older devices are
+// unsupported for this kernel anyway.
+__device__ __forceinline__ void atomic_add_double(double* address, double val) {
+#if defined(__CUDA_ARCH__)
+#if __CUDA_ARCH__ < 600
+  auto* addr = reinterpret_cast<unsigned long long*>(address);
+  unsigned long long old = *addr;
+  unsigned long long assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(addr, assumed,
+                    __double_as_longlong(val + __longlong_as_double(assumed)));
+  } while (assumed != old);
+#else
+  atomicAdd(address, val);
+#endif
+#endif
+}
+
 // One device state per process; the op serializes its calls.
 struct MidtownState {
   SogGpuState* state = nullptr;
@@ -205,7 +226,7 @@ __global__ void k_midtown_charges1(int n, const float* raw, const bool* mask,
   if (static_cast<int>(threadIdx.x) < 2) {
     double v = ssum[threadIdx.x][0];
     for (int w = 1; w < nwarps; ++w) v += ssum[threadIdx.x][w];
-    atomicAdd(&sums[threadIdx.x], v);
+    atomic_add_double(&sums[threadIdx.x], v);
   }
 }
 
@@ -271,7 +292,7 @@ __global__ void k_midtown_finish1(int n, const double* vpot, const double* f3,
   if (static_cast<int>(threadIdx.x) < 10) {
     double v = ssum[threadIdx.x][0];
     for (int w = 1; w < nwarps; ++w) v += ssum[threadIdx.x][w];
-    atomicAdd(&sums[threadIdx.x], v);
+    atomic_add_double(&sums[threadIdx.x], v);
   }
 }
 
@@ -367,59 +388,6 @@ struct CpuTimer {
 };
 }  // namespace
 
-// Orders the legacy default stream of the SOG mesh kernels around the caller's
-// stream.  The SOG entry points take no stream (their cuFFT plans and NCCL
-// communicator are bound to the legacy default stream), while a caller such as
-// AOTInductor evaluates on a NON-BLOCKING side stream, which the legacy default
-// stream is not ordered against.  Without this scope the mesh kernels can read
-// half-produced inputs, the host collectives behind the charge constraint and
-// the frame sums can read half-written buffers, and the caller can read outputs
-// before they exist -- all of them silently, because the results look sane.
-// Measured on 1119744 atoms, np=2 and np=4, dpa4c-sog midtown: identical inputs
-// gave -3882 / -3961 / -3908 atm at np=2 and -4028 / -4031 / -4056 atm at np=4
-// against -3909.600 with CUDA_LAUNCH_BLOCKING=1.  The scope runs the tensor
-// operations of the call on the default stream too, orders that stream after
-// the caller's before the first launch, and orders the caller's stream after it
-// on the way out.  The event pair is per thread: the backend's mutex serializes
-// the calls, but this scope is entered before it is taken.
-class DefaultStreamScope {
- public:
-  DefaultStreamScope()
-      : caller_(at::cuda::getCurrentCUDAStream()),
-        guard_(at::cuda::getDefaultCUDAStream()) {
-    if (caller_.stream() != nullptr) {
-      C10_CUDA_CHECK(cudaEventRecord(edge(0), caller_.stream()));
-      C10_CUDA_CHECK(cudaStreamWaitEvent(nullptr, edge(0), 0));
-    }
-  }
-
-  ~DefaultStreamScope() {
-    if (caller_.stream() == nullptr) {
-      return;
-    }
-    C10_CUDA_CHECK(cudaEventRecord(edge(1), nullptr));
-    C10_CUDA_CHECK(cudaStreamWaitEvent(caller_.stream(), edge(1), 0));
-  }
-
-  DefaultStreamScope(const DefaultStreamScope&) = delete;
-  DefaultStreamScope& operator=(const DefaultStreamScope&) = delete;
-
- private:
-  static cudaEvent_t edge(int which) {
-    // Per thread: the backend's own mutex serializes the calls, but the scope
-    // is entered before it is taken, so two threads must not share an event.
-    thread_local cudaEvent_t events[2] = {nullptr, nullptr};
-    if (events[which] == nullptr) {
-      C10_CUDA_CHECK(
-          cudaEventCreateWithFlags(&events[which], cudaEventDisableTiming));
-    }
-    return events[which];
-  }
-
-  at::cuda::CUDAStream caller_;
-  at::cuda::CUDAStreamGuard guard_;
-};
-
 ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              const torch::Tensor& charge,
                              const torch::Tensor& node_mask,
@@ -437,9 +405,8 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
                              const torch::Tensor* communicator,
                              int64_t force_mode,
                              bool quads) {
-  // This call's kernels and tensor operations run on the legacy default
-  // stream; see DefaultStreamScope.
-  DefaultStreamScope default_stream;
+  // This call's kernels and tensor operations run on the caller's stream;
+  // the NCCL exchange and cuFFT plans follow it in sog_gpu.cu.
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   CpuTimer::cycle();
@@ -630,7 +597,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     auto raw = charge.narrow(0, begin, count).select(1, 0);
     auto q = at::empty({count}, double_options);
     auto csums = at::zeros({2}, double_options);
-    const int qblocks = static_cast<int>((count + 255) / 256);
+    const int qblocks = std::max(1, static_cast<int>((count + 255) / 256));
     k_midtown_charges1<<<qblocks, 256,0,stream>>>(
         static_cast<int>(count), raw.data_ptr<float>(), mask_f.data_ptr<bool>(),
         q.data_ptr<double>(), csums.data_ptr<double>());
@@ -810,7 +777,7 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
     force.narrow(0, begin, count).copy_(f3);
 
     auto sums = at::zeros({10}, double_options);
-    const int fblocks = static_cast<int>((count + 255) / 256);
+    const int fblocks = std::max(1, static_cast<int>((count + 255) / 256));
     // The energy lands in the output directly: no buffer, no copy.
     double* energy_out = atom_energy.data_ptr<double>() + begin;
     k_midtown_finish1<<<fblocks, 256,0,stream>>>(
@@ -869,7 +836,6 @@ ChargeSumOutputs midtown_sum_local(
     const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
     double prefactor, int64_t order, double spacing,
     const torch::Tensor* communicator) {
-  DefaultStreamScope default_stream;
   TORCH_CHECK(!form_a_requested(),
               "midtown: SOG_MIDTOWN_FORM_A is implemented on the replicated "
               "solve only; unset it for the local-spread path");
@@ -930,7 +896,7 @@ ChargeSumOutputs midtown_sum_local(
   auto raw = charge.narrow(0, 0, count).select(1, 0);
   auto q = at::empty({count}, double_options);
   auto csums = at::zeros({2}, double_options);
-  const int qblocks = static_cast<int>((count + 255) / 256);
+  const int qblocks = std::max(1, static_cast<int>((count + 255) / 256));
   k_midtown_charges1<<<qblocks, 256>>>(static_cast<int>(count),
                                        raw.data_ptr<float>(),
                                        mask_f.data_ptr<bool>(),
@@ -1033,7 +999,7 @@ ChargeSumOutputs midtown_sum_local(
   force.copy_(f_s);
   auto sums = at::zeros({10}, double_options);
   auto energy_f = at::empty({count}, double_options);
-  const int fblocks = static_cast<int>((count + 255) / 256);
+  const int fblocks = std::max(1, static_cast<int>((count + 255) / 256));
   k_midtown_finish1<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       f_s.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),
@@ -1131,7 +1097,6 @@ ChargeSumOutputs midtown_sum_slab(
     double prefactor, int64_t order, double spacing,
     const torch::Tensor* communicator, bool quads, bool bspline,
     int64_t force_mode) {
-  DefaultStreamScope default_stream;
   TORCH_CHECK(kernel == kSog, "the slab midtown backend evaluates the SOG kernel only");
   TORCH_CHECK(charge.size(1) == 1, "the slab midtown backend supports one channel");
   TORCH_CHECK(channel == -1 || channel == 0,
@@ -1320,7 +1285,7 @@ ChargeSumOutputs midtown_sum_slab(
   auto raw = charge.narrow(0, 0, count).select(1, 0);
   auto q = at::empty({count}, double_options);
   auto csums = at::zeros({2}, double_options);
-  const int qblocks = static_cast<int>((count + 255) / 256);
+  const int qblocks = std::max(1, static_cast<int>((count + 255) / 256));
   k_midtown_charges1<<<qblocks, 256>>>(static_cast<int>(count),
                                        raw.data_ptr<float>(),
                                        mask_f.data_ptr<bool>(),
@@ -1623,7 +1588,7 @@ ChargeSumOutputs midtown_sum_slab(
   force_out.copy_(d_force.reshape({count, 3}));
 
   auto sums = at::zeros({10}, double_options);
-  const int fblocks = static_cast<int>((count + 255) / 256);
+  const int fblocks = std::max(1, static_cast<int>((count + 255) / 256));
   k_midtown_finish1<<<fblocks, 256>>>(
       static_cast<int>(count), d_vpot.data_ptr<double>(),
       d_force.data_ptr<double>(), q.data_ptr<double>(), mask_f.data_ptr<bool>(),

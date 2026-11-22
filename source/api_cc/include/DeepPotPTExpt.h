@@ -501,6 +501,10 @@ class DeepPotPTExpt : public DeepPotBackend {
   // the source CSR an input of every evaluation rather than of the per-atom
   // virial alone.
   bool canonical_requires_source_csr_ = false;
+  // A canonical artifact with no cross-rank sibling (one-block DPA4) is
+  // faithful on one rank only; multi-rank dispatch must reject it instead of
+  // silently evaluating each domain without the ghost exchange.
+  bool canonical_single_rank_only_ = false;
   // Two-entry source CSR placeholders that decline the per-atom virial.
   at::Tensor source_row_placeholder_;
   at::Tensor source_order_placeholder_;

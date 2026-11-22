@@ -1,9 +1,6 @@
 # water-scan0 2L DPA4-SOG canonical .pt2, one frame, no dynamics.
 # Pass the data/model/plugin through -var; no dataset path is committed.
-variable DATA  index ${WATER_SCAN0_LMP_DATA}
-variable MODEL index ${WATER_SCAN0_MODEL}
-variable PLUGIN index ${WATER_SCAN0_PLUGIN}
-
+# DATA/MODEL/PLUGIN come from -var on the LAMMPS command line.
 plugin load ${PLUGIN}
 units metal
 boundary p p p

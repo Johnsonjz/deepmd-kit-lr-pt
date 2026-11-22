@@ -102,8 +102,20 @@ def _system(atoms: int = 192, length: float = 12.4447):
 
 
 @pytest.mark.parametrize("mesh_backend", ["bspline", "midtown"])
-def test_rank_shares_add_up_to_the_frame_virial(mesh_backend: str) -> None:
-    """The shares of the ranks sum to the frame virial of one domain."""
+@pytest.mark.parametrize("slab", [False, True])
+def test_rank_shares_add_up_to_the_frame_virial(
+    mesh_backend: str, slab: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shares of the ranks sum to the frame virial of one domain.
+
+    ``slab`` exercises the z-slab distributed mesh (two NCCL transposes); at
+    two ranks the slab and the replicated solve must return the same per-node
+    parts and the same frame virial.
+    """
+    monkeypatch.delenv("SOG_MIDTOWN_SLAB", raising=False)
+    monkeypatch.delenv("SOG_MIDTOWN_FULLBRICK", raising=False)
+    if mesh_backend == "midtown":
+        monkeypatch.setenv("SOG_MIDTOWN_FORM_A", "0")
     mpi, world = _world()
     if mpi is None:
         pytest.skip("the test needs an OpenMPI world communicator")
@@ -131,11 +143,22 @@ def test_rank_shares_add_up_to_the_frame_virial(mesh_backend: str) -> None:
         "mesh_backend": mesh_backend,
     }
     reference = latent_charge_sum(coord, charge, mask, n_node, total, **common)
+    if slab:
+        monkeypatch.setenv("SOG_MIDTOWN_SLAB", "1")
 
-    # The nodes of this domain, a strided split so that the gathered frame
-    # interleaves the ranks as a domain decomposition does.
+    # The nodes of this domain.  The slab solve needs contiguous z slabs
+    # (the LAMMPS processor grid is 1 x 1 x nprocs); the replicated solve
+    # accepts the same split, so use it for both.
     atoms = coord.shape[0]
-    owned = torch.arange(rank, atoms, size, dtype=torch.long, device="cuda")
+    if slab:
+        # Assign atoms to the z slab that contains them, exactly as a
+        # 1 x 1 x nprocs LAMMPS processor grid would.  Splitting by atom
+        # count would let a rank own atoms on both sides of its slab.
+        length = float(box[0, 0])
+        slab_of = (coord[:, 2] / length * size).floor().clamp(0, size - 1)
+        owned = torch.nonzero(slab_of == rank, as_tuple=False).flatten()
+    else:
+        owned = torch.arange(rank, atoms, size, dtype=torch.long, device="cuda")
     handle = ctypes.c_void_p(world.value)
     communicator = torch.tensor(
         [ctypes.addressof(handle)], dtype=torch.int64, device="cpu"
@@ -200,3 +223,68 @@ def test_rank_shares_add_up_to_the_frame_virial(mesh_backend: str) -> None:
             TAG,
             world,
         )
+
+
+@pytest.mark.parametrize("mesh_backend", ["bspline", "midtown"])
+def test_an_empty_rank_joins_the_slab_collective(
+    mesh_backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rank with no atoms still enters the z-slab NCCL collectives.
+
+    This is the shape a LAMMPS ``1 x 1 x nprocs`` grid produces when one
+    subdomain is empty.  The call must return empty per-node outputs on that
+    rank and finite shares on the owner, not abort inside a kernel launch or
+    hang in an all-to-all.
+    """
+    mpi, world = _world()
+    if mpi is None:
+        pytest.skip("the test needs an OpenMPI world communicator")
+    rank = ctypes.c_int()
+    size = ctypes.c_int()
+    mpi.MPI_Comm_rank(world, ctypes.byref(rank))
+    mpi.MPI_Comm_size(world, ctypes.byref(size))
+    rank, size = rank.value, size.value
+    if size < 2:
+        pytest.skip("the test needs at least two MPI ranks (mpirun -np 2)")
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+
+    coord, charge, mask, n_node, total, box = _system()
+    owned = (
+        torch.arange(coord.shape[0], dtype=torch.long, device="cuda")
+        if rank == 0
+        else torch.empty(0, dtype=torch.long, device="cuda")
+    )
+    kernel = SOGKernel(
+        amplitude=[0.7, -0.2, 0.1], width=[0.8, 1.7, 3.2], precision="float32"
+    )
+    handle = ctypes.c_void_p(world.value)
+    communicator = torch.tensor(
+        [ctypes.addressof(handle)], dtype=torch.int64, device="cpu"
+    )
+    monkeypatch.delenv("SOG_MIDTOWN_SLAB", raising=False)
+    monkeypatch.setenv("SOG_MIDTOWN_SLAB", "1")
+    if mesh_backend == "midtown":
+        monkeypatch.setenv("SOG_MIDTOWN_FORM_A", "0")
+    out = latent_charge_sum(
+        coord[owned].contiguous(),
+        charge[owned].contiguous(),
+        mask[owned].contiguous(),
+        torch.tensor([owned.numel()], dtype=torch.long, device="cuda"),
+        total,
+        communicator=communicator,
+        kernel=kernel,
+        channel=0,
+        prefactor=COULOMB,
+        box=box,
+        order=6,
+        spacing=0.4,
+        mesh_backend=mesh_backend,
+    )
+    torch.cuda.synchronize()
+    n = owned.numel()
+    assert out[0].shape == (n, 1)
+    assert out[1].shape == (n, 1)
+    assert out[2].shape == (n, 3)
+    assert out[3].shape == (n, 9)
+    assert out[4].shape == (1, 9)
+    assert torch.isfinite(out[4]).all()

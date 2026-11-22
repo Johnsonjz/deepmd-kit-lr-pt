@@ -74,6 +74,17 @@ production form for long-range (`latent_charge`) models: it is markedly faster
 and much smaller than the default graph lower, and it is **required for
 multi-rank** (np>1) inference — a default graph-lower long-range artifact
 raises "run on a single rank" under MPI. `--compress` requires `--pt-expt`.
+
+A DPA4 model with two or more message-passing blocks freezes an additional
+compact canonical sibling at `model/extra/forward_lower_with_comm.pt2` and
+records `has_comm_artifact: true`. Multi-rank runs use that sibling for the
+cross-rank halo exchange. A DPA4C model has one block and no cross-rank
+message passing, so its compact artifact records `has_comm_artifact: false`
+and has no sibling. A one-block DPA4 model also records
+`canonical_single_rank_only: true`: it is faithful on one rank and a
+multi-rank caller receives an explicit error asking for the graph lower. Both forms report their topologies in
+`topology_params`; a periodic long-range model includes `pme_mesh` with the
+spacing selected by the grid rule.
 :::
 
 :::{tab-item} Paddle {{ paddle_icon }}

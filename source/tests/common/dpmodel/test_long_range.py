@@ -1003,6 +1003,11 @@ def test_pme_mesh_follows_the_cells_of_the_batch() -> None:
         # extrapolation of the measured law (see LatentChargeLongRange).
         expected = min(expected, 0.75 * math.pi / long_range._k_max())
     assert spacing == pytest.approx(expected)
+    # The spacing the rule selects is what an artifact records for the
+    # reciprocal-space topology; LAMMPS sizes its mesh from that metadata.
+    assert long_range.topology_params()["pme_mesh"]["spacing"] == pytest.approx(
+        spacing
+    )
     for topologies, box in ((small, _cells()[:1]), (large, 2.0 * _cells())):
         mesh = topologies["pme_mesh"]
         dims = tuple(m.shape[0] for m in (mesh.mode_1, mesh.mode_2, mesh.mode_3))

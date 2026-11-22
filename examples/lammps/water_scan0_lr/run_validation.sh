@@ -12,18 +12,43 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 : "${WATER_SCAN0_LMP_DATA:?}" "${WATER_SCAN0_MODEL:?}"
-: "${LMP:?}" "${LMP_KK:?}" "${WATER_SCAN0_PLUGIN:?}" "${WATER_SCAN0_PLUGIN_KK:?}"
+: "${LMP:?}" "${WATER_SCAN0_PLUGIN:?}"
+run_kk=${WATER_SCAN0_RUN_KK:-0}
+if [[ "$run_kk" == 1 ]]; then
+  : "${LMP_KK:?}" "${WATER_SCAN0_PLUGIN_KK:?}"
+fi
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+failed=0
+run() {
+  local log=$1; shift
+  if ! "$@" > "$log" 2>&1; then
+    echo "validation run failed; see $log" >&2
+    failed=1
+  fi
+}
+run_env() {
+  local log=$1; shift
+  if ! env "$@" > "$log" 2>&1; then
+    echo "validation run failed; see $log" >&2
+    failed=1
+  fi
+}
 for np in 1 2 4; do
-  mpirun -np "$np" "$LMP" -var DATA "$WATER_SCAN0_LMP_DATA" \
-    -var MODEL "$WATER_SCAN0_MODEL" -var PLUGIN "$WATER_SCAN0_PLUGIN" \
-    -log none -in "$here/in.water.lammps" > "$tmp/host$np.log" 2>&1 || true
-  mpirun -np "$np" "$LMP_KK" -k on g 1 -sf kk \
+  if [[ "$run_kk" == 1 ]]; then
+    kk_ld="${WATER_SCAN0_BACKEND_PLUGIN_KK:-}:${LD_LIBRARY_PATH:-}"
+    run_env "$tmp/kk$np.log" \
+      "DP_BACKEND_PLUGIN_PATH=${WATER_SCAN0_BACKEND_PLUGIN_KK:-$DP_BACKEND_PLUGIN_PATH}" \
+      "LD_LIBRARY_PATH=$kk_ld" \
+      mpirun -np "$np" "$LMP_KK" -k on g 1 -sf kk \
+        -var DATA "$WATER_SCAN0_LMP_DATA" -var MODEL "$WATER_SCAN0_MODEL" \
+        -var PLUGIN "$WATER_SCAN0_PLUGIN_KK" -log none -in "$here/in.water.lammps"
+  fi
+  run "$tmp/host$np.log" mpirun -np "$np" "$LMP" \
     -var DATA "$WATER_SCAN0_LMP_DATA" -var MODEL "$WATER_SCAN0_MODEL" \
-    -var PLUGIN "$WATER_SCAN0_PLUGIN_KK" \
-    -log none -in "$here/in.water.lammps" > "$tmp/kk$np.log" 2>&1 || true
+    -var PLUGIN "$WATER_SCAN0_PLUGIN" -log none -in "$here/in.water.lammps"
 done
+[[ "$failed" == 0 ]] || exit 1
 python3 - "$tmp" <<'PY'
 import pathlib, re, sys
 root=pathlib.Path(sys.argv[1]); rows={}
