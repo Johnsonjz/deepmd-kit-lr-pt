@@ -8,6 +8,7 @@ converted to torch tensors at the boundary.
 
 import functools
 import logging
+import math
 import time
 from collections.abc import (
     Callable,
@@ -1839,6 +1840,16 @@ class _CompiledModel(torch.nn.Module):
 # ---------------------------------------------------------------------------
 
 
+LONG_RANGE_KERNEL_TAG = "long_range.kernel."
+"""Name fragment of the long-range interaction kernel parameters."""
+
+LONG_RANGE_KERNEL_AMPLITUDE_TAG = "long_range.kernel.amplitude"
+"""Name fragment of the SOG amplitudes, the ones the positive floor applies to."""
+
+LONG_RANGE_KERNEL_LOG_WIDTH_TAG = "long_range.kernel.log_width"
+"""Name fragment of the SOG log-widths, the ones the width floor applies to."""
+
+
 class Trainer(AbstractTrainer):
     """Training driver for the pt_expt backend.
 
@@ -2483,6 +2494,42 @@ class Trainer(AbstractTrainer):
         if opt_type not in ("Adam", "AdamW", "HybridMuon"):
             raise ValueError(f"Unsupported optimizer type: {opt_type}")
         self.opt_type = opt_type
+        # The long-range interaction kernel gets its own learning rate, and its
+        # amplitudes can be projected back to the positive orthant after every
+        # step.  Both are opt-in: the defaults reproduce the single-group,
+        # unconstrained behaviour.
+        self.kernel_lr_scale = float(
+            optimizer_params.get("long_range_kernel_lr_scale", 1.0)
+        )
+        self.kernel_amp_floor = float(
+            optimizer_params.get("long_range_kernel_amp_floor", 0.0)
+        )
+        self.kernel_width_floor = float(
+            optimizer_params.get("long_range_kernel_width_floor", 0.0)
+        )
+        _start = optimizer_params.get("long_range_kernel_lr_scale_start")
+        self.kernel_lr_scale_start = (
+            self.kernel_lr_scale if _start is None else float(_start)
+        )
+        self.kernel_lr_ramp_frac = float(
+            optimizer_params.get("long_range_kernel_lr_ramp_frac", 0.0)
+        )
+        # Absolute ramp length.  An explicit step count wins over the fraction of
+        # the total budget, so the kernel can finish its ramp before the run does.
+        _ramp_steps = optimizer_params.get("long_range_kernel_lr_ramp_steps")
+        if _ramp_steps is not None:
+            self.kernel_lr_ramp_steps = int(_ramp_steps)
+        else:
+            # Resolved once the step budget is known.
+            self.kernel_lr_ramp_steps = int(
+                self.kernel_lr_ramp_frac * float(getattr(self, "num_steps", 0) or 0)
+            )
+        # Absolute step at which the kernel leaves its frozen state and starts
+        # training; the learning-rate ramp above is measured from this step.
+        self.kernel_train_start_step = int(
+            optimizer_params.get("long_range_kernel_train_start_step", 0) or 0
+        )
+        self._kernel_group = -1
         # LambdaLR multiplies each param group's initial learning rate by the
         # lambda value.  Warmup schedules legitimately return zero at step 0,
         # so use the nonzero schedule base as the denominator and let the
@@ -2532,8 +2579,18 @@ class Trainer(AbstractTrainer):
 
         if optimizer_state_dict is not None:
             self._load_optimizer_state(optimizer_state_dict)
-        for param_group in self.optimizer.param_groups:
-            param_group["initial_lr"] = initial_lr
+        # A group may carry its own lr (the long-range kernel one does); the
+        # schedule multiplies every group by the same lambda, so each group's
+        # base must be its own construction lr or the ratio is lost on the
+        # first scheduler step.  The base is rebuilt from the schedule rather
+        # than read back from the checkpoint: a resumed group lr already holds
+        # the schedule value of the saved step, and using it as the base would
+        # multiply the schedule by itself once more (the run would silently
+        # continue with a much smaller learning rate than a fresh run).
+        for index, param_group in enumerate(self.optimizer.param_groups):
+            param_group["initial_lr"] = initial_lr * (
+                self.kernel_lr_scale if index == self._kernel_group else 1.0
+            )
 
         # The resumed step offset is carried by last_epoch; the lambda must not
         # add it again, which would advance the schedule twice.
@@ -3114,13 +3171,44 @@ class Trainer(AbstractTrainer):
             two on FSDP2 already shards the state that the optimizer derives
             from its sharded parameters.
         """
+        params: Any = self.wrapper.parameters()
+        scale = getattr(self, "kernel_lr_scale", 1.0)
+        freeze_start = int(getattr(self, "kernel_train_start_step", 0) or 0)
+        base_lr = kwargs.get("lr")
+        if (scale != 1.0 or freeze_start > 0) and base_lr is not None:
+            # Split by name so the interaction kernel trains at base_lr * scale.
+            # The groups carry their own `lr`, which LambdaLR then scales, so the
+            # ratio survives the schedule; a frozen kernel needs the group too so
+            # its gradients can be held at zero until it becomes trainable.
+            kernel, rest = [], []
+            for name, param in self.wrapper.named_parameters():
+                if LONG_RANGE_KERNEL_TAG in name:
+                    kernel.append(param)
+                else:
+                    rest.append(param)
+            if kernel:
+                extra = {k: v for k, v in kwargs.items() if k != "lr"}
+                params = [
+                    {"params": rest, "lr": base_lr},
+                    {"params": kernel, "lr": base_lr * scale},
+                ]
+                kwargs = extra
+                self._kernel_group = 1
         if self.sharding.stage == 1:
-            return ZeroRedundancyOptimizer(
-                self.wrapper.parameters(),
+            opt = ZeroRedundancyOptimizer(
+                params,
                 optimizer_class=optimizer_class,
                 **kwargs,
             )
-        return optimizer_class(self.wrapper.parameters(), **kwargs)
+        else:
+            opt = optimizer_class(params, **kwargs)
+        if self.rank == 0:
+            log.info(
+                "optimizer learning rates %s (long-range kernel scale %s)",
+                [g["lr"] for g in opt.param_groups],
+                scale,
+            )
+        return opt
 
     @property
     def _local_optimizer(self) -> torch.optim.Optimizer:
@@ -3461,8 +3549,88 @@ class Trainer(AbstractTrainer):
         Dynamo intercepts tensor creation inside Adam._init_group,
         which can trigger CUDA init on CPU-only builds.
         """
+        # The kernel is frozen by ``_freeze_kernel_if_needed`` before the
+        # gradient-norm clip of the training step, so a held kernel neither
+        # updates nor inflates the clip norm.
         self.optimizer.step()
+        floor = getattr(self, "kernel_amp_floor", 0.0)
+        width_floor = getattr(self, "kernel_width_floor", 0.0)
+        if floor > 0.0 or width_floor > 0.0:
+            # Projected gradient: keep the kernel a positive sum of Gaussians
+            # and bound its narrowest width, so the wave-number cutoff stays
+            # inside the configured k grid.
+            with torch.no_grad():
+                for name, param in self.wrapper.named_parameters():
+                    if floor > 0.0 and LONG_RANGE_KERNEL_AMPLITUDE_TAG in name:
+                        param.clamp_(min=floor)
+                    elif width_floor > 0.0 and LONG_RANGE_KERNEL_LOG_WIDTH_TAG in name:
+                        param.clamp_(min=math.log(width_floor))
         self.scheduler.step()
+        self._rescale_kernel_lr()
+
+    @torch.compiler.disable
+    def _freeze_kernel_if_needed(self) -> None:
+        """Hold the long-range kernel fixed until it becomes trainable.
+
+        Before ``long_range_kernel_train_start_step`` the kernel parameters are
+        not updated at all: their gradients are dropped right after the
+        backward pass, so neither the optimizer (no update, no weight decay,
+        no momentum) nor the gradient-norm clip of that step sees them.
+        ``requires_grad`` is left untouched, so the compiled
+        forward/backward graph is never re-traced by the switch.
+        """
+        idx = getattr(self, "_kernel_group", -1)
+        if idx < 0:
+            return
+        groups = self.optimizer.param_groups
+        if not 0 <= idx < len(groups):
+            return
+        start = int(getattr(self, "kernel_train_start_step", 0) or 0)
+        if start <= 0:
+            return
+        # ``last_epoch`` counts completed steps, so the step about to execute is
+        # one more.  It is measured in the same absolute step index the ramp and
+        # the resumed offset use.
+        step = int(getattr(self.scheduler, "last_epoch", -1)) + 1
+        if step >= start:
+            return
+        for param in groups[idx]["params"]:
+            if param.grad is not None:
+                param.grad = None
+
+    @torch.compiler.disable
+    def _rescale_kernel_lr(self) -> None:
+        """Re-apply the long-range kernel's learning-rate multiplier.
+
+        The scheduler rewrites every group's lr as ``initial_lr * lambda(step)``
+        with one lambda, so the kernel group would drift back to the global
+        rate.  Multiplying it by a ramp factor here keeps the ratio, and lets
+        the kernel start nearly frozen and open up over training.  Only the
+        optimizer state changes: the compiled graph does not see learning rates.
+        """
+        idx = getattr(self, "_kernel_group", -1)
+        if idx < 0:
+            return
+        groups = self.optimizer.param_groups
+        if not 0 <= idx < len(groups):
+            return
+        end = getattr(self, "kernel_lr_scale", 1.0)
+        start = getattr(self, "kernel_lr_scale_start", end)
+        ramp = int(getattr(self, "kernel_lr_ramp_steps", 0) or 0)
+        if start == end or ramp <= 0:
+            return
+        step = max(0, int(getattr(self.scheduler, "last_epoch", 0)))
+        # The ramp is measured from the step the kernel leaves its frozen state,
+        # so a kernel held fixed early on warms up only after it can train.
+        frozen = int(getattr(self, "kernel_train_start_step", 0) or 0)
+        t = min(1.0, max(0.0, step - frozen) / float(ramp))
+        scale = start * (end / start) ** t if start > 0.0 else end
+        base = (
+            max(group["lr"] for i, group in enumerate(groups) if i != idx)
+            if len(groups) > 1
+            else groups[idx]["lr"]
+        )
+        groups[idx]["lr"] = base * scale
 
     def _make_training_tasks(self) -> TrainingTaskCollection:
         """Build the backend-independent task collection."""
@@ -3683,6 +3851,11 @@ class Trainer(AbstractTrainer):
             task_key=task_key,
         )
         loss.backward()
+
+        # Hold the long-range kernel fixed, if its training has not started
+        # yet.  This runs before the gradient-norm clip so that a frozen
+        # kernel contributes neither to the update nor to the clipped norm.
+        self._freeze_kernel_if_needed()
 
         if self.gradient_max_norm > 0.0:
             self.nonfinite_grad_guard.update(
