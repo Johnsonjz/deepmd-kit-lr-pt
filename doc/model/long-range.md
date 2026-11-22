@@ -42,7 +42,9 @@ composition of models.
 
 The module is a `long_range` section of a standard energy model, beside the
 descriptor and the fitting. It is currently available with the
-[DPA4C](./dpa4c.md) descriptor:
+[DPA4](./dpa4.md) (SeZM) and [DPA4C](./dpa4c.md) descriptors. DPA4 may have
+several message-passing blocks; DPA4C has one block and no cross-rank message
+passing.
 
 ```json
 "model": {
@@ -153,9 +155,16 @@ selects how training evaluates the sum:
   mesh that resolves every cell of the batch at
   {ref}`pme_spacing <model[standard]/long_range[latent_charge]/pme_spacing>`,
   whose transform gives the sum; the cost grows nearly linearly with the
-  number of atoms. With the default order 8 and spacing $0.75\pi/k_{max}$, the
-  energy and the forces stay within a few parts in a million of the sum over
-  the wave numbers.
+  number of atoms. The default spacing is not a fixed fraction of the Nyquist
+  spacing: it is the largest spacing that reaches
+  {ref}`pme_accuracy <model[standard]/long_range[latent_charge]/pme_accuracy>`
+  under the measured energy-error law of
+  `deepmd.dpmodel.long_range.grid_rule` for the selected backend, spline order
+  and force mode. An explicit
+  {ref}`pme_spacing <model[standard]/long_range[latent_charge]/pme_spacing>`
+  overrides the law. For the B-spline at order 8 the law is extrapolated and
+  capped at $0.75\pi/k_{max}$; other orders use the measured or interpolated
+  law directly.
 - `ragged`: over the wave numbers of every frame within $k_{max}$, listed for
   every batch; their number grows with the volume of the cell.
 - `fixed`: over one integer grid shared by the frames of a batch, sized by the
@@ -203,6 +212,15 @@ numbers or the mesh of each batch are built outside the compiled region and
 enter it as inputs of dynamic size. Compiled training of a periodic model in
 the `pme` mode on the CPU requires PyTorch 2.13 or later.
 
+The SOG kernel can be held fixed while the rest of the model warms up, then
+trained with its own learning-rate ramp. The optimizer options are
+`long_range_kernel_train_start_step` (0 keeps the kernel training from the
+first step), `long_range_kernel_lr_scale` (the final scale of the kernel
+group relative to the global rate), `long_range_kernel_lr_scale_start` and
+`long_range_kernel_lr_ramp_steps` or `long_range_kernel_lr_ramp_frac` (the
+geometric ramp). The kernel parameters and their group learning rate are
+recorded in the checkpoint, so a restart resumes the schedule.
+
 `dp --pt-expt freeze` exports the model, long-range module included, to
 `.pt2` or `.pte`, and `dp --pt-expt compress` compresses its descriptor into a
 `.pt2` archive while the networks of the long-range module stay as they are.
@@ -217,15 +235,30 @@ serves no periodic system with non-periodic boundaries (`f`, `s` or `m`) in
 every dimension, and a model with `periodic: true` with boundaries periodic in
 every dimension or in none. Several models given to `pair_style deepmd` for
 the model deviation evaluate a non-periodic system together only when every
-one of them carries a long-range module. A model that the dedicated operator described
-below evaluates, a compressed DPA4C model frozen for a CUDA device, also runs
-on several MPI ranks: every rank gathers the positions and charges of the
-atoms of all ranks over MPI and evaluates its own atoms against all of them,
-so that the ranks share the cost of the direct sum, while each evaluates the
-mesh of a periodic system whole. This requires DeePMD-kit built with MPI. Any
-other model, like an uncompressed one, runs on a single rank;
+one of them carries a long-range module. A model that the dedicated operator described below evaluates, a compressed
+DPA4C model frozen for a CUDA device, also runs on several MPI ranks. A DPA4C
+model has one block and needs no cross-rank message passing; a DPA4 model with
+two or more blocks uses the with-comm sibling described under
+[freezing](../freeze/freeze.md); a one-block DPA4 canonical artifact has no
+sibling and is single-rank only (use the graph lower for multi-rank). For a periodic system the mesh is replicated
+on every rank by default, so each rank holds the full grid and shares the
+particle work. A z-slab distributed mesh is available behind
+`SOG_MIDTOWN_SLAB=1` (and `SOG_SLAB_IK=1` for `force_mode="ik"`): every rank
+holds a pencil of the grid, the two Fourier transposes use NCCL, and the
+B-spline, CubeS2 and QuadS backends share the same path. A rank without atoms
+must still join the collective. This requires DeePMD-kit built with MPI and
+NCCL. A two-block DPA4 canonical artifact runs multi-rank through both `pair_style deepmd` and `pair_style deepmd/kk`; the Kokkos path requests the source CSR
+for the with-comm sibling and exchanges the halo features. The 1.12M-atom
+DPA4 2L case still hits the AOTI sort limit; the 192/12k fixtures pass on the
+Kokkos path. Any other
+model, like an uncompressed one, runs on a single rank;
 `pair_style deepmd/kk` evaluates an uncompressed model on non-periodic systems
-only.
+only. A C++ caller of the compact canonical lower can query
+`DP_DeepPotCanonicalGraphRequiresHalo` and
+`DP_DeepPotCanonicalGraphRequiresSourceCSR` to decide whether the frame needs
+the eight-tensor border exchange and the source CSR; both are false for a
+one-block DPA4C model and true for a multi-block DPA4 model that reads ghost
+features.
 
 Compressing a descriptor conditioned on `charge_spin` specializes the model
 to one charge state at a time, and a constraint that reads its total charge
@@ -244,10 +277,65 @@ non-periodic system with memory that grows with the square of the number of
 atoms. A module with one charge channel and a charge network in `float32` with
 `tanh` or `silu` hidden layers whose widths are multiples of four and without
 `resnet_dt`, which the defaults give in a compressed model, runs faster still.
-A compressed DPA4C model with several message-passing blocks requires such a
-module on a CUDA device, on one MPI rank or on several.
+A compressed DPA4 model with several message-passing blocks uses the
+with-comm sibling described under [freezing](../freeze/freeze.md) on a CUDA
+device, on one MPI rank or on several; the one-block DPA4C model needs no
+sibling.
+
+The dedicated operator chooses its mesh solver with
+{ref}`mesh_backend <model[standard]/long_range[latent_charge]/mesh_backend>`:
+`bspline` (the default) for the smooth particle-mesh Ewald sum, `midtown` for
+the CubeS2 splines and cuFFT of the SOG library, or `quads` for the separable
+QuadS stencil of the same solver. The `midtown` and `quads` solvers serve the
+`sog` kernel and one charge channel. Its force is differentiated by
+{ref}`force_mode <model[standard]/long_range[latent_charge]/force_mode>`:
+`ad` (the default) differentiates the assignment weights and gives the exact
+gradient of the mesh energy, while `ik` differentiates the potential in
+Fourier space, one order more accurate in the mesh spacing but at three extra
+inverse transforms and without the exact-gradient property; `ik` requires the
+`midtown` or `quads` solver. The target of the mesh-spacing rule is the
+relative energy error
+{ref}`pme_accuracy <model[standard]/long_range[latent_charge]/pme_accuracy>`
+(1e-4 by default), which
+{ref}`pme_spacing <model[standard]/long_range[latent_charge]/pme_spacing>`
+overrides with an explicit spacing. A model evaluated by the graph lower,
+such as an uncompressed one, always uses the B-spline solver.
 
 The following are not supported for a model with a long-range module:
 multi-rank (domain-decomposed) inference of a model that the dedicated
 operator does not evaluate, such as an uncompressed one, spin models, the
 tabulated ZBL potential, and short-range bridging.
+
+(canonical-cpp-api)=
+
+### Compact canonical C++ ABI
+
+The compact canonical lower is a graph of nodes and directed edges before any
+descriptor-specific work. A C++ caller builds the graph, then calls
+`DP_DPA4ComputeCanonicalGraphGPU2` with:
+
+- the model-node types, node count, and owned-node count;
+- the source index column (four or eight bytes, see
+  `DP_CanonicalIndexWidth`), the FP32 edge vectors, the destination CSR row
+  pointers, and the source-grouped edge order;
+- the positions (and, for a long-range module, the cell and communicator);
+- the optional `DP_HaloExchange` of the node set and the stream of the model
+  device.
+
+Two query functions decide the optional payloads:
+
+| function                                    | true means                                                                                                                                |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `DP_DeepPotCanonicalGraphRequiresSourceCSR` | pass the source row pointers and source order on every evaluation, not only for the per-atom virial                                       |
+| `DP_DeepPotCanonicalGraphRequiresHalo`      | a node set with halo nodes must pass its `DP_HaloExchange`; it is true for a multi-block DPA4 model and false for a one-block DPA4C model |
+
+`DP_HaloExchange` describes a LAMMPS brick forward exchange in model-node
+space: `nswap`, the per-swap `sendproc`/`recvproc`/`sendnum`/`recvnum`/
+`firstrecv` arrays in host memory, and the concatenated `d_sendlist` on the
+model device. Swap `s` receives `recvnum[s]` nodes into the halo nodes
+starting at `firstrecv[s]`; the first swap receives into node `nloc`, and the
+swaps run in order. `DP_DeepPotCanonicalGraphRequiresHalo` is false for a
+model whose only block reads no ghost feature; pass `NULL` then. The model
+refreshes the halo nodes from their owners before each block that reads them
+and evaluates the owned nodes, so a rank with no atoms still joins the
+collectives of the with-comm sibling.
