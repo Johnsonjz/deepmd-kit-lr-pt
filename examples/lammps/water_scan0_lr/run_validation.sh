@@ -40,10 +40,15 @@ run_env() {
 for np in 1 2 4; do
 	if [[ "$run_kk" == 1 ]]; then
 		kk_ld="${WATER_SCAN0_BACKEND_PLUGIN_KK:-}:${LD_LIBRARY_PATH:-}"
+		# One GPU per rank: the Kokkos binary reads the device LAMMPS was
+		# launched on, so without the remap every rank would share GPU 0 and
+		# the run fails once np exceeds 1.
 		run_env "$tmp/kk$np.log" \
 			"DP_BACKEND_PLUGIN_PATH=${WATER_SCAN0_BACKEND_PLUGIN_KK:-$DP_BACKEND_PLUGIN_PATH}" \
 			"LD_LIBRARY_PATH=$kk_ld" \
-			mpirun -np "$np" "$LMP_KK" -k on g 1 -sf kk \
+			mpirun -np "$np" bash -c \
+			'export CUDA_VISIBLE_DEVICES=${OMPI_COMM_WORLD_LOCAL_RANK:-0}; exec "$@"' \
+			bash "$LMP_KK" -k on g 1 -sf kk \
 			-var DATA "$WATER_SCAN0_LMP_DATA" -var MODEL "$WATER_SCAN0_MODEL" \
 			-var PLUGIN "$WATER_SCAN0_PLUGIN_KK" -log none -in "$here/in.water.lammps"
 	fi

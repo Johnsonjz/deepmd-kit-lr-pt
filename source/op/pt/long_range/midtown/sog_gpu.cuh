@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // sog_gpu.cuh — plugin-internal GPU SOG kspace (raw CUDA + cuFFT).
-// Called from SOGKSpace::compute_single when `use_gpu` is set. Keeping the GPU
-// path inside SOGKSpace leaves the fix sog/response interface
-// (dynamic_cast<SOGKSpace*>, get_potential()) untouched — no in-tree LAMMPS
-// build, no lib/gpu.
+// Included by midtown_sum.cu, which dispatches to the GPU path when the mesh
+// runs on a device; the CPU mesh stays the reference implementation.
 #ifndef SOG_GPU_CUH
 #define SOG_GPU_CUH
 

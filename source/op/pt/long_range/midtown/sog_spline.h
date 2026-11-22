@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-/* -*- c++ -*- ----------------------------------------------------------
-   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
-   FastSOG shared spline definitions (B-spline + CubeS₂ Midtown splines)
-------------------------------------------------------------------------- */
+// sog_spline.h — shared spline definitions for the SOG k-space custom op:
+// B-spline and CubeS₂ midtown node tables, plus the QuadS window helpers.
 
-#ifndef LMP_SOG_SPLINE_H
-#define LMP_SOG_SPLINE_H
+#ifndef SOG_SPLINE_H
+#define SOG_SPLINE_H
 
 #include <array>
 #include <cmath>
@@ -13,10 +11,9 @@
 
 namespace LAMMPS_NS {
 
-// ── B-spline order (legacy fastsog, order 5 only) ──
-// For generalized B-spline (orders 4/5/6), see sog_bspline_weights_1d_order()
-// in sog.cpp. This fastsog copy uses std::array<double,5> for CUDA
-// compatibility (sog_gpu.cu includes this header).
+// ── B-spline order (order 5 only) ──
+// The weights use std::array<double,5> for CUDA compatibility
+// (sog_gpu.cu includes this header).
 
 constexpr int kSog_BSplineOrder = 5;
 

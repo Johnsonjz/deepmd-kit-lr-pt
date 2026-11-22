@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // sog_green.h — CubeS₂ green tables for the SOG kspace custom op.
 //
-// Ported line-for-line from source/lmp/sog.cpp so the op reproduces the
-// DEPLOYED chain's discretization, not an approximation of it:
-//   * green tables       : SOGKSpace::precompute_green_functions
-//   (sog.cpp:1413-1671,
-//                          spline_type >= 4 / CubeS₂ branch)
-// Keeping the two implementations separate is deliberate: sog_op.py's python
-// green builder is an independent second implementation, and validate192.py
-// checks the op against the LAMMPS run-0 energy, so a transcription error in
-// either one shows up as a disagreement.
+// The tables reproduce the discretization of the reference SOG k-space
+// implementation, not an approximation of it: the CubeS₂ branch of the green
+// table precomputation for spline_type >= 4.  Keeping a second, independent
+// implementation in Python (deepmd/dpmodel/long_range/) is deliberate: a
+// transcription error in either one shows up as a disagreement against the
+// reference run-0 energy.
 //
 // GRID SIZING IS NOT HERE.  The number of mesh points is decided in Python, by
 // deepmd/dpmodel/long_range/grid_rule.py, and reaches the operator as the
@@ -25,7 +22,7 @@
 // spline = 100 + order (104/106): its separable 1-D window symbol is inverted
 // exactly (Form A), so the variance-subtraction D factor is replaced by
 // 1/quads_influence_1d per axis.  The legacy B-spline (spline_type == 0) branch
-// needs the sinc alias tables that live in the SOGKSpace class and is not here.
+// needs the sinc alias tables of the legacy path and is not here.
 #ifndef SOG_GREEN_H
 #define SOG_GREEN_H
 
@@ -66,7 +63,7 @@ inline void integer_bspline_weights(int order, double* w) {
   }
 }
 
-// SOGKSpace::precompute_green_functions, CubeS₂ branch (sog.cpp:1413-1565).
+// CubeS₂ branch of the green-table precomputation.
 // Fills the five tables flat in mesh_index(ix,iy,iz) = ix + nx*(iy + ny*iz).
 // Only the three deconvolved tables are produced.  The bare K and K_v "self"
 // tables that used to live alongside them are gone: the self-energy term is
@@ -98,14 +95,14 @@ inline void build_green_range(int nx,
   gv.assign(ng, 0.0);
 
   const double dx = lx / nx, dy = ly / ny, dz = lz / nz;
-  // Grid Nyquist for the CubeS₂ family (sog.cpp:1428-1433).
+  // Grid Nyquist for the CubeS₂ family.
   const double k_sq_max =
       M_PI * M_PI * (1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz));
   const double tx = 2.0 * M_PI / lx, ty = 2.0 * M_PI / ly, tz = 2.0 * M_PI / lz;
 
   // QuadS is spline = 100 + order: its separable window is inverted exactly
   // (Form A), so D_alpha is 1/|W_alpha|^2 instead of the Gaussian variance
-  // subtraction.  sog.cpp:1559-1600 is the deployed reference.
+  // subtraction.
   const bool is_quads = spline >= 100 && spline < 200;
   const int nord = is_quads ? spline - 100 : (spline == 6 ? 6 : 4);
   const double xi_q = is_quads ? LAMMPS_NS::quads_xi(nord) : 0.0;
@@ -354,7 +351,7 @@ inline void build_green_slab_half(int nx,
   }
 }
 
-// Full-grid tables (replicated path and LAMMPS kspace).
+// Full-grid tables (replicated path and the k-space solve).
 inline void build_green(int nx,
                         int ny,
                         int nz,

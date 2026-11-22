@@ -7,9 +7,9 @@
 //   gather.
 // Two splines: separable QuadS (PRIMARY — 3D tensor-product 1D weights,
 // GPU-friendly scatter once cuFFT makes the FFT ~free and spreading dominates)
-// and CubeS2-4 (BASELINE — bit-matches CPU sog.cpp). Math ported from
-// sog.cpp::compute_single. cuFFT is unnormalized against LAMMPS FFT3d 1/ngrid,
-// so the normalization constants below follow that convention.
+// and CubeS2-4 (BASELINE — bit-matches the CPU k-space path).  The math
+// follows the single-frame CPU solve.  cuFFT is unnormalized (no 1/ngrid), so
+// the normalization constants below follow that convention.
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -121,7 +121,7 @@ struct SogGpuState {
   // Same precision contract as the replicated solve: a float32 mesh, a 64-bit
   // fixed-point (2^40) density accumulation, a compact half spectrum (R2C) and
   // a packed (green energy, green virial) float table.  The fp64 d_rho / d_pot
-  // grid set belongs to the LAMMPS replicated-grid entry points alone; the slab
+  // grid set belongs to the replicated-grid entry points alone; the slab
   // keeps its own s_* buffers so the two never alias across a mode switch.
   bool slab_mode = false;
   int slab_Y = 0;       // this rank's y length (pencil slab)
@@ -187,7 +187,7 @@ __device__ __forceinline__ int wrap_near(int i, int n) {
 }
 __device__ __forceinline__ size_t midx(int ix, int iy, int iz, int nx, int ny) {
   return (size_t)iz * ny * nx + (size_t)iy * nx +
-         ix;  // matches sog.cpp mesh_index (x fastest)
+         ix;  // mesh index with x fastest
 }
 
 // ── separable QuadS 1D weights — correct port of sog_spline.h /
@@ -506,7 +506,7 @@ __device__ __forceinline__ void quads_fill_tab(QuadsTab<NORD>& T,
   }
 }
 
-// ── CubeS₂ device port — EXACT port of sog_spline.h (bit-matches CPU sog.cpp)
+// ── CubeS₂ device port — EXACT port of sog_spline.h (bit-matches the CPU path)
 // ── Node tables live in __constant__ memory (uploaded once at create). GpuNode
 // layout == CubeS2Node4.
 typedef LAMMPS_NS::CubeS2Node4 GpuNode;
@@ -3669,9 +3669,9 @@ __global__ void k_gather_quads_brick_ik(int nlocal,
 }
 
 // ── B-spline brick stencils (cardinal B-spline of order NORD) ──────────────
-// Ported from the deployed LAMMPS GPU B-spline path; same Cox-de Boor
-// recurrence as the CPU mesh_sum.cu weights, so the slab solve and the
-// replicated SPME evaluate the same assignment.  The B-spline reaches NORD
+// Same Cox-de Boor recurrence as the CPU mesh_sum.cu weights, so the slab
+// solve and the replicated SPME evaluate the same assignment.  The B-spline
+// reaches NORD
 // points per axis starting at floor(u) - (NORD-1)/2, matching the
 // assignment factor |D_d(m)|^-2 that build_green_slab_half inverts.
 template <int N>
@@ -6443,8 +6443,8 @@ static double sog_gpu_compute_core(SogGpuState* s,
   //     g(0) = sum_m A_m,   A_m = amp_m (2 pi bw_m)^(-3/2).
   // So "remove self interaction" is exactly ½·qsum_sq·g(0) -- a real-space
   // quantity, independent of any k-truncation, and exactly proportional to q^2.
-  // Algebraically this equals the RBSOG closed form that sog.cpp already builds
-  // for internally-generated kernels (`log(b)/(sqrt(2 pi) sigma)(w0 + sum
+  // Algebraically this equals the RBSOG closed form built for
+  // internally-generated kernels (`log(b)/(sqrt(2 pi) sigma)(w0 + sum
   // b^-m)`), verified to all 15 digits.  Callers therefore pass it in
   // `self_coeff`; it must NOT be zeroed for externally-supplied amp/bandwidth
   // (the DeePMD path).
@@ -6476,7 +6476,7 @@ static double sog_gpu_compute_core(SogGpuState* s,
   // The strain-derivative of |ρ̂(k)|² is identically ZERO under fractional-
   // coordinate charge spreading + Form-B deconvolution. The r⊗F approach
   // (red[14..19]) is INCOMPLETE — it omits the box-explicit strain term.
-  // This matches fastsog.cpp, PPPM vg, and the CPU sog.cpp analytic path.
+  // This matches the RBSOG closed form and the CPU analytic path.
   // red[1..6] = fv_local; red[14..19] = r⊗F (retained for diagnostics).
   for (int j = 0; j < 6; ++j) {
     virial6[j] = 0.5 * volume * qscale * red[1 + j];
@@ -6976,7 +6976,7 @@ extern "C" void sog_gpu_gather_brick(SogGpuState* s,
                            force, vpot);
 }
 
-// ── Host-buffer wrapper (kept for the non-Kokkos call sites in sog.cpp) ──
+// ── Host-buffer wrapper: copies host arrays in, solves, copies back. ──
 extern "C" double sog_gpu_compute(SogGpuState* s,
                                   int nlocal,
                                   const double* x,
