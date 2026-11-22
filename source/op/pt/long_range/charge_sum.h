@@ -102,14 +102,22 @@ ChargeSumOutputs midtown_sum(const torch::Tensor& coord,
 // The z-slab distributed solve (NCCL between the transform stages).  `quads`
 // selects the QuadS separable spline, `bspline` the cardinal B-spline of order
 // 4/5/6; both false is CubeS2.
-ChargeSumOutputs midtown_sum_slab(
-    const torch::Tensor& coord, const torch::Tensor& charge,
-    const torch::Tensor& node_mask, const torch::Tensor& n_node_per_frame,
-    const torch::Tensor& total_charge, const torch::Tensor& box,
-    const torch::Tensor& coefficient, int64_t kernel, int64_t channel,
-    double prefactor, int64_t order, double spacing,
-    const torch::Tensor* communicator, bool quads = false,
-    bool bspline = false, int64_t force_mode = 0);
+ChargeSumOutputs midtown_sum_slab(const torch::Tensor& coord,
+                                  const torch::Tensor& charge,
+                                  const torch::Tensor& node_mask,
+                                  const torch::Tensor& n_node_per_frame,
+                                  const torch::Tensor& total_charge,
+                                  const torch::Tensor& box,
+                                  const torch::Tensor& coefficient,
+                                  int64_t kernel,
+                                  int64_t channel,
+                                  double prefactor,
+                                  int64_t order,
+                                  double spacing,
+                                  const torch::Tensor* communicator,
+                                  bool quads = false,
+                                  bool bspline = false,
+                                  int64_t force_mode = 0);
 
 ChargeSumOutputs midtown_sum_local(const torch::Tensor& coord,
                                    const torch::Tensor& charge,

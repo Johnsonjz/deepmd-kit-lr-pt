@@ -157,7 +157,8 @@ def test_sog_kernel_closed_form_and_defaults() -> None:
     default = SOGKernel()
     widths = np.exp(default.log_width)
     np.testing.assert_allclose(
-        widths, SOG_DEFAULT_BASE_WIDTH * SOG_DEFAULT_WIDTH_RATIO ** np.arange(widths.size)
+        widths,
+        SOG_DEFAULT_BASE_WIDTH * SOG_DEFAULT_WIDTH_RATIO ** np.arange(widths.size),
     )
     assert widths.size == SOG_DEFAULT_M
     # The default kernel exerts the Coulomb force, r^2 K'(r) = -1, between a
@@ -1005,9 +1006,7 @@ def test_pme_mesh_follows_the_cells_of_the_batch() -> None:
     assert spacing == pytest.approx(expected)
     # The spacing the rule selects is what an artifact records for the
     # reciprocal-space topology; LAMMPS sizes its mesh from that metadata.
-    assert long_range.topology_params()["pme_mesh"]["spacing"] == pytest.approx(
-        spacing
-    )
+    assert long_range.topology_params()["pme_mesh"]["spacing"] == pytest.approx(spacing)
     for topologies, box in ((small, _cells()[:1]), (large, 2.0 * _cells())):
         mesh = topologies["pme_mesh"]
         dims = tuple(m.shape[0] for m in (mesh.mode_1, mesh.mode_2, mesh.mode_3))
@@ -1126,7 +1125,7 @@ def test_mesh_backend_force_mode_and_accuracy_round_trip() -> None:
 
 def test_force_mode_ik_requires_a_cubes2_mesh() -> None:
     """The Fourier force is defined for the midtown and quads meshes only."""
-    with pytest.raises(ValueError, match="midtown.*quads"):
+    with pytest.raises(ValueError, match=r"midtown.*quads"):
         _periodic_long_range(force_mode="ik")
 
 

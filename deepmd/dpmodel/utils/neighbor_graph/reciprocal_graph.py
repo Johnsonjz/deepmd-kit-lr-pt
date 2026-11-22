@@ -494,8 +494,8 @@ def build_ellipsoid_k_grid(
     nk = np.asarray(to_numpy_array(nk), dtype=np.int64).reshape(-1)
     if nk.shape != (3,) or np.any(nk < 1):
         raise ValueError(f"`nk` must be three positive integers, got {nk.tolist()}")
-    diag = np.zeros_like(cells)
-    index = np.arange(3)
+    diag = np.zeros_like(cells, dtype=np.float64)
+    index = np.arange(3, dtype=np.int64)
     diag[:, index, index] = cells[:, index, index]
     if np.any(np.abs(cells - diag) > 1e-8):
         raise ValueError(

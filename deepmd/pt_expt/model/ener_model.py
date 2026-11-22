@@ -880,7 +880,6 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             nghost,
         )
 
-
     def forward(
         self,
         coord: torch.Tensor,

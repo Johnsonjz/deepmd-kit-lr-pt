@@ -1831,7 +1831,6 @@ void DP_DPA4ComputeCanonicalGraphGPU(DP_DeepPot* dp,
                                      const int64_t* d_source_order,
                                      const double* d_coord,
                                      void* world,
-                                     const DP_HaloExchange* halo,
                                      const double* box,
                                      int64_t nloc,
                                      int64_t nall_nodes,
@@ -1925,7 +1924,6 @@ bool DP_DeepPotHasLongRange(DP_DeepPot* dp) {
     return false;
   }
 }
-
 
 // multiple frames
 void DP_DeepPotCompute2(DP_DeepPot* dp,

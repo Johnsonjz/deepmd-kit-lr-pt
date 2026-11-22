@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """The with-comm gate of the compact canonical SeZM lower.
 
-The gate is CPU-only: it decides from the atomic model's capabilities whether
-a compact canonical artifact needs the eight-tensor border exchange.  The
-canonical ghost fold is exercised on one rank by
-``source/tests/pt_expt/model/test_dpa4c_parallel.py``; an end-to-end 2L
-GPU/MPI canonical test is tracked separately and is not covered here.
+The gate itself is CPU-only: it decides from the atomic model's capabilities
+whether a compact canonical artifact needs the eight-tensor border exchange.
+The export-tracing tests that need the CUDA exporter are skipped without CUDA.
+The canonical ghost fold is exercised on one rank by
+``source/tests/pt_expt/model/test_dpa4c_parallel.py`` and end to end under
+LAMMPS/MPI by ``source/tests/pt_expt/model/test_dpa4_canonical_lammps.py``.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from deepmd.pt_expt.model.get_model import get_model  # noqa: E402
-from deepmd.pt_expt.utils.serialization import (  # noqa: E402
+from deepmd.pt_expt.model.get_model import get_model
+from deepmd.pt_expt.utils.serialization import (
     _needs_canonical_with_comm,
     _needs_with_comm_artifact,
     _trace_and_export,
@@ -62,6 +63,7 @@ def test_a_model_without_edge_parallel_support_needs_no_sibling() -> None:
     assert _needs_canonical_with_comm(model, "dpa4c_canonical") is False
     assert _needs_with_comm_artifact(model, "dpa4c_canonical") is False
 
+
 def test_a_real_two_block_sezm_model_needs_the_canonical_sibling() -> None:
     """The gate sees the real descriptor capability, not only a fake model."""
     config = {
@@ -91,7 +93,10 @@ def test_a_real_two_block_sezm_model_needs_the_canonical_sibling() -> None:
     assert _needs_canonical_with_comm(model, "dpa4c_canonical") is True
     assert _needs_with_comm_artifact(model, "dpa4c_canonical") is True
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="canonical export is CUDA-only")
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="canonical export is CUDA-only"
+)
 def test_a_real_one_block_sezm_model_needs_no_canonical_sibling() -> None:
     """A one-block DPA4 reads no ghost feature beyond its own block."""
     config = {
@@ -122,6 +127,9 @@ def test_a_real_one_block_sezm_model_needs_no_canonical_sibling() -> None:
     assert _needs_with_comm_artifact(model, "dpa4c_canonical") is False
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="canonical export is CUDA-only"
+)
 def test_two_block_canonical_export_traces_the_border_exchange() -> None:
     """The 2L DPA4 canonical with-comm program traces the border exchange."""
     config = {

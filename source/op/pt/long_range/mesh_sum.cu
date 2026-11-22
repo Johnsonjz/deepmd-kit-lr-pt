@@ -1225,8 +1225,8 @@ inline void timing_report(MeshTiming& tm, cudaStream_t stream) {
       "ms/step sum=%.3f\n",
       n, tm.acc[0] / n, tm.acc[1] / n, tm.acc[2] / n, tm.acc[3] / n,
       tm.acc[4] / n, tm.acc[5] / n, tm.acc[6] / n, tm.acc[7] / n,
-      (tm.acc[0] + tm.acc[1] + tm.acc[2] + tm.acc[3] + tm.acc[4] +
-       tm.acc[5] + tm.acc[6] + tm.acc[7]) /
+      (tm.acc[0] + tm.acc[1] + tm.acc[2] + tm.acc[3] + tm.acc[4] + tm.acc[5] +
+       tm.acc[6] + tm.acc[7]) /
           n);
   fflush(stdout);
   for (int i = 0; i < MeshTiming::kPhases; ++i) {

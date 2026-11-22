@@ -15,8 +15,8 @@
 #include <torch/types.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <string>
 
@@ -76,8 +76,7 @@ struct Evaluation {
             /*quads=*/mesh_backend == 2);
       }
       TORCH_CHECK(mesh_backend == 0,
-                  "latent_charge_sum: unknown mesh backend code ",
-                  mesh_backend,
+                  "latent_charge_sum: unknown mesh backend code ", mesh_backend,
                   "; expected 0 (bspline), 1 (midtown) or 2 (quads)");
       TORCH_CHECK(force_mode == 0,
                   "latent_charge_sum: force_mode != 0 (ik) needs the midtown "
@@ -197,13 +196,13 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                   (coefficient.is_cuda() || coefficients_on_host),
               "latent_charge_sum: inputs must be CUDA tensors, except box and "
               "communicator");
-  TORCH_CHECK(charge.device() == coord.device() &&
-                  node_mask.device() == coord.device() &&
-                  n_node_per_frame.device() == coord.device() &&
-                  total_charge.device() == coord.device() &&
-                  (coefficient.device() == coord.device() ||
-                   coefficients_on_host),
-              "latent_charge_sum: inputs must share one device");
+  TORCH_CHECK(
+      charge.device() == coord.device() &&
+          node_mask.device() == coord.device() &&
+          n_node_per_frame.device() == coord.device() &&
+          total_charge.device() == coord.device() &&
+          (coefficient.device() == coord.device() || coefficients_on_host),
+      "latent_charge_sum: inputs must share one device");
   TORCH_CHECK(coord.dim() == 2 && coord.size(1) == 3 &&
                   coord.scalar_type() == torch::kFloat64,
               "latent_charge_sum: coord must be float64 with shape (N, 3)");
@@ -261,8 +260,8 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
   const bool periodic = periodic_frames(box);
   const torch::Tensor cells = periodic ? box->contiguous() : torch::Tensor();
   coefficient = coefficient.contiguous();
-  const Evaluation evaluation{cells,     coefficient,  kernel,  channel,
-                              prefactor, order,        spacing, periodic,
+  const Evaluation evaluation{cells,        coefficient, kernel,  channel,
+                              prefactor,    order,       spacing, periodic,
                               mesh_backend, force_mode};
   const int64_t ranks = deepmd::long_range::domain_count(communicator);
   // The z-slab distributed solve runs behind an opt-in switch.  It now serves
@@ -318,8 +317,8 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                 "the slab B-spline backend evaluates the SOG kernel only");
     return deepmd::long_range::midtown_sum_slab(
         coord, charge, node_mask, n_node_per_frame, total_charge, cells,
-        coefficient, kernel, channel, prefactor, order, spacing,
-        &communicator, /*quads=*/mesh_backend == 2,
+        coefficient, kernel, channel, prefactor, order, spacing, &communicator,
+        /*quads=*/mesh_backend == 2,
         /*bspline=*/mesh_backend == 0, force_mode);
   }
   const char* dist_env = std::getenv("SOG_MIDTOWN_DIST");
@@ -336,8 +335,7 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                 "the distributed midtown backend needs periodic frames");
     return deepmd::long_range::midtown_sum_local(
         coord, charge, node_mask, n_node_per_frame, total_charge, cells,
-        coefficient, kernel, channel, prefactor, order, spacing,
-        &communicator);
+        coefficient, kernel, channel, prefactor, order, spacing, &communicator);
   }
   if (mesh_backend == 1 && ranks > 1 && want_dist && force_mode != 0) {
     // Same fallback as the slab branch above, but this one has no ik path at

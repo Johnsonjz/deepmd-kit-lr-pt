@@ -2583,7 +2583,9 @@ def _trace_and_export_impl(
                     canonical_model_eligible,
                 )
 
-                if not (canonical_model_eligible(model) or sezm_canonical_eligible(model)):
+                if not (
+                    canonical_model_eligible(model) or sezm_canonical_eligible(model)
+                ):
                     raise NotImplementedError(
                         "compact canonical export requires an eligible compressed "
                         "DPA1, DPA4C or SeZM energy model"
@@ -2648,7 +2650,10 @@ def _trace_and_export_impl(
             # The compact lower of a model with further message-passing blocks
             # reads the border plan of a decomposed frame, whose extents are
             # kept distinct from the other axes.
-            want_border = bool(model.atomic_model.has_message_passing_across_ranks()) and not with_comm_dict
+            want_border = (
+                bool(model.atomic_model.has_message_passing_across_ranks())
+                and not with_comm_dict
+            )
             border_sizes = (
                 next_safe_prime(
                     e_sample + 3,
@@ -2714,9 +2719,15 @@ def _trace_and_export_impl(
                 if not want_long_range and len(compact_inputs) == 8:
                     compact_inputs = (
                         *compact_inputs,
-                        torch.empty((0, 3), dtype=torch.float64),
-                        torch.empty((0,), dtype=torch.int64),
-                        torch.empty((0, 9), dtype=torch.float64),
+                        torch.empty(
+                            (0, 3), dtype=torch.float64, device=sample_inputs[0].device
+                        ),
+                        torch.empty(
+                            (0,), dtype=torch.int64, device=sample_inputs[0].device
+                        ),
+                        torch.empty(
+                            (0, 9), dtype=torch.float64, device=sample_inputs[0].device
+                        ),
                     )
                 nnode = int(sample_inputs[1].reshape(-1)[0])
                 nloc = int(sample_inputs[2].reshape(-1)[0])

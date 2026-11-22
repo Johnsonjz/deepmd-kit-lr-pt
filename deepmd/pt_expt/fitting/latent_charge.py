@@ -48,10 +48,7 @@ class LatentChargeFitting(LatentChargeFittingDP):
                 torch.as_tensor(value).detach().clone(),
                 requires_grad=self._bias_requires_grad(),
             )
-        elif (
-            name in self.TRAINABLE_BIASES
-            and isinstance(value, torch.nn.Parameter)
-        ):
+        elif name in self.TRAINABLE_BIASES and isinstance(value, torch.nn.Parameter):
             value.requires_grad_(self._bias_requires_grad())
         super().__setattr__(name, value)
 

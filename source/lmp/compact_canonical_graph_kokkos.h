@@ -1775,7 +1775,7 @@ class CompactCanonicalGraphKokkos : protected Pointers {
   bool has_null_types;  // some LAMMPS type maps to no model element
   // LAMMPS type (1-based) -> model type, resident on the device.
   Kokkos::View<int*, DeviceType> d_type_map;
-  DAT::tdual_int_1d k_model2loc;      // (nall) model node index -> atom index
+  DAT::tdual_int_1d k_model2loc;  // (nall) model node index -> atom index
   // Host mirror of the atom -> model-node map, which a caller that states atom
   // indices to a model reading node indices (the message-passing swap lists)
   // translates through. Valid once ``refresh_nodes`` has run for this step.

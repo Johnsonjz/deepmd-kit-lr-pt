@@ -15,7 +15,6 @@
 #include <map>
 #include <numeric>
 #include <sstream>
-#include <unordered_map>
 #include <type_traits>
 #include <unordered_map>
 
@@ -738,17 +737,15 @@ std::vector<torch::Tensor> DeepPotPTExpt::run_model_canonical_graph_with_comm(
       source_row_ptr, source_order};
   // The traced with-comm ABI always carries the three long-range slots, even
   // for a short-range-only model; the artifact ignores empty ones.
-  inputs.push_back(coord.defined() ? coord
-                                   : torch::empty(
-                                         {0, 3},
-                                         torch::TensorOptions()
-                                             .dtype(torch::kFloat64)));
+  inputs.push_back(coord.defined()
+                       ? coord
+                       : torch::empty({0, 3}, torch::TensorOptions().dtype(
+                                                  torch::kFloat64)));
   inputs.push_back(communicator_tensor(world));
-  inputs.push_back(cell.defined() ? cell
-                                  : torch::empty(
-                                        {0, 9},
-                                        torch::TensorOptions()
-                                            .dtype(torch::kFloat64)));
+  inputs.push_back(cell.defined()
+                       ? cell
+                       : torch::empty({0, 9}, torch::TensorOptions().dtype(
+                                                  torch::kFloat64)));
   for (const auto& t : comm_tensors) {
     inputs.push_back(t);
   }
@@ -802,8 +799,8 @@ void DeepPotPTExpt::join_long_range_exchange(const void* world,
       torch::zeros({2}, i64.dtype(torch::kInt32)),
       torch::zeros({2, 3}, i64.dtype(torch::kFloat32)), torch::zeros({2}, i64),
       torch::zeros({2}, i64), torch::arange(2, i64),
-      torch::zeros({1, 3}, i64.dtype(torch::kFloat64)), world,
-      cell_tensor(box), ptexpt::empty_halo(device));
+      torch::zeros({1, 3}, i64.dtype(torch::kFloat64)), world, cell_tensor(box),
+      ptexpt::empty_halo(device));
 }
 
 std::vector<torch::Tensor> DeepPotPTExpt::run_model_with_comm(
@@ -1254,8 +1251,7 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
           lower_input_is_canonical_ && has_comm_artifact_ && with_comm_loader;
       skin_topology_ = deepmd::buildSkinTopology(
           nlist_data.jlist, mapping_, nloc, nall_real,
-          /*node_count=*/(multi_rank || canonical_host_comm) ? nall_real
-                                                             : nloc,
+          /*node_count=*/(multi_rank || canonical_host_comm) ? nall_real : nloc,
           /*row_centers=*/&nlist_data.ilist, fold_to_local);
       if (lower_input_is_canonical_ && has_message_passing_ && !multi_rank) {
         ptexpt::check_reciprocal_nlist(nlist_data.jlist, nlist_data.ilist,
@@ -3136,7 +3132,9 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
           halo != nullptr) {
         const int nswap = halo->nswap;
         int sent = 0;
-        for (int s = 0; s < nswap; ++s) sent += halo->sendnum[s];
+        for (int s = 0; s < nswap; ++s) {
+          sent += halo->sendnum[s];
+        }
         kk_nodes.resize(sent);
         if (sent > 0) {
           cudaDeviceSynchronize();
@@ -3156,14 +3154,17 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
         const auto i64 = torch::TensorOptions().dtype(torch::kInt64);
         canonical_comm = {
             at::from_blob(kk_ptrs.data(), {nswap}, i64).clone(),
-            at::from_blob(const_cast<int*>(halo->sendproc), {nswap}, i32).clone(),
-            at::from_blob(const_cast<int*>(halo->recvproc), {nswap}, i32).clone(),
-            at::from_blob(const_cast<int*>(halo->sendnum), {nswap}, i32).clone(),
-            at::from_blob(const_cast<int*>(halo->recvnum), {nswap}, i32).clone(),
-            torch::tensor(
-                (int64_t)reinterpret_cast<std::uintptr_t>(
-                    *reinterpret_cast<void* const*>(world)),
-                i64),
+            at::from_blob(const_cast<int*>(halo->sendproc), {nswap}, i32)
+                .clone(),
+            at::from_blob(const_cast<int*>(halo->recvproc), {nswap}, i32)
+                .clone(),
+            at::from_blob(const_cast<int*>(halo->sendnum), {nswap}, i32)
+                .clone(),
+            at::from_blob(const_cast<int*>(halo->recvnum), {nswap}, i32)
+                .clone(),
+            torch::tensor((int64_t)reinterpret_cast<std::uintptr_t>(
+                              *reinterpret_cast<void* const*>(world)),
+                          i64),
             torch::tensor((int64_t)nloc, i32),
             torch::tensor((int64_t)(nall_nodes - nloc), i32),
         };
@@ -3181,10 +3182,9 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
             torch::empty({0}, i32),
             torch::empty({0}, i32),
             torch::empty({0}, i32),
-            torch::tensor(
-                (int64_t)reinterpret_cast<std::uintptr_t>(
-                    *reinterpret_cast<void* const*>(world)),
-                i64),
+            torch::tensor((int64_t)reinterpret_cast<std::uintptr_t>(
+                              *reinterpret_cast<void* const*>(world)),
+                          i64),
             torch::tensor((int64_t)nloc, i32),
             torch::tensor((int64_t)(nall_nodes - nloc), i32),
         };
@@ -3408,6 +3408,5 @@ bool DeepPotPTExpt::canonical_graph_requires_halo() const {
 }
 
 bool DeepPotPTExpt::has_long_range() const { return long_range_; }
-
 
 #endif

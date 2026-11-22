@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // sog_green.h — CubeS₂ green tables for the SOG kspace custom op.
 //
 // Ported line-for-line from source/lmp/sog.cpp so the op reproduces the
 // DEPLOYED chain's discretization, not an approximation of it:
-//   * green tables       : SOGKSpace::precompute_green_functions (sog.cpp:1413-1671,
+//   * green tables       : SOGKSpace::precompute_green_functions
+//   (sog.cpp:1413-1671,
 //                          spline_type >= 4 / CubeS₂ branch)
 // Keeping the two implementations separate is deliberate: sog_op.py's python
 // green builder is an independent second implementation, and validate192.py
@@ -36,26 +38,30 @@
 
 namespace sog_green {
 
-constexpr double kCubes2Xi4 = 0.5773502691896258;   // sog_spline.h:46
-constexpr double kCubes2Xi6 = 0.6503998764035732;   // sog_spline.h:48
+constexpr double kCubes2Xi4 = 0.5773502691896258;  // sog_spline.h:46
+constexpr double kCubes2Xi6 = 0.6503998764035732;  // sog_spline.h:48
 
 // The integer weights M_p(1), ..., M_p(p-1) of the cardinal-B-spline assignment
 // factor (identical to mesh_sum.cu's integer_bspline_weights): the B-spline
 // value at the integer points, from the truncated-power form
 //   M_p(x) = 1/(p-1)! sum_j (-1)^j C(p,j) (x-j)_+^{p-1}.
-// The B-spline deconvolution is |D_d(m)|^-2 with D_d(m) = sum_l w_l e^{i theta l}.
-inline void integer_bspline_weights(int order, double *w) {
+// The B-spline deconvolution is |D_d(m)|^-2 with D_d(m) = sum_l w_l e^{i theta
+// l}.
+inline void integer_bspline_weights(int order, double* w) {
   for (int l = 0; l < order - 1; ++l) {
     const double x = l + 1.0;
     double value = 0.0, binomial = 1.0;
     for (int j = 0; j <= order; ++j) {
-      if (j > 0) binomial = binomial * (order - j + 1) / j;
+      if (j > 0) {
+        binomial = binomial * (order - j + 1) / j;
+      }
       const double base = std::max(x - static_cast<double>(j), 0.0);
-      value += (j % 2 == 0 ? 1.0 : -1.0) * binomial *
-               std::pow(base, order - 1);
+      value += (j % 2 == 0 ? 1.0 : -1.0) * binomial * std::pow(base, order - 1);
     }
     double factorial = 1.0;
-    for (int k = 2; k < order; ++k) factorial *= k;
+    for (int k = 2; k < order; ++k) {
+      factorial *= k;
+    }
     w[l] = value / factorial;
   }
 }
@@ -71,12 +77,21 @@ inline void integer_bspline_weights(int order, double *w) {
 // uses (0, ny, ny), the per-rank slab uses (ylo, YL, YL) and stores
 // idx = ix + nx*(iyl + YL*iz).  Both variants run the SAME arithmetic, so a
 // slab value at a given (ix,iy,iz) is bit-identical to the full table.
-inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
-                              double lz, const std::vector<double> &amp,
-                              const std::vector<double> &bandwidth, int spline,
-                              int ylo, int YL, int ystride,
-                              std::vector<double> &ge, std::vector<double> &gf,
-                              std::vector<double> &gv) {
+inline void build_green_range(int nx,
+                              int ny,
+                              int nz,
+                              double lx,
+                              double ly,
+                              double lz,
+                              const std::vector<double>& amp,
+                              const std::vector<double>& bandwidth,
+                              int spline,
+                              int ylo,
+                              int YL,
+                              int ystride,
+                              std::vector<double>& ge,
+                              std::vector<double>& gf,
+                              std::vector<double>& gv) {
   const size_t ng = static_cast<size_t>(nx) * YL * nz;
   ge.assign(ng, 0.0);
   gf.assign(ng, 0.0);
@@ -84,8 +99,8 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
 
   const double dx = lx / nx, dy = ly / ny, dz = lz / nz;
   // Grid Nyquist for the CubeS₂ family (sog.cpp:1428-1433).
-  const double k_sq_max = M_PI * M_PI *
-                          (1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz));
+  const double k_sq_max =
+      M_PI * M_PI * (1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz));
   const double tx = 2.0 * M_PI / lx, ty = 2.0 * M_PI / ly, tz = 2.0 * M_PI / lz;
 
   // QuadS is spline = 100 + order: its separable window is inverted exactly
@@ -111,8 +126,9 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
     } else {
       Dx[ix] = std::exp(sig_x2 * k2);
     }
-    for (size_t m = 0; m < M; ++m)
+    for (size_t m = 0; m < M; ++m) {
       Bx[m * nx + ix] = std::exp(-0.5 * bandwidth[m] * k2);
+    }
   }
   for (int iy = 0; iy < ny; ++iy) {
     const int mode = iy - ny * (2 * iy / ny);
@@ -123,8 +139,9 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
     } else {
       Dy[iy] = std::exp(sig_y2 * k2);
     }
-    for (size_t m = 0; m < M; ++m)
+    for (size_t m = 0; m < M; ++m) {
       By[m * ny + iy] = std::exp(-0.5 * bandwidth[m] * k2);
+    }
   }
   for (int iz = 0; iz < nz; ++iz) {
     const int mode = iz - nz * (2 * iz / nz);
@@ -135,8 +152,9 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
     } else {
       Dz[iz] = std::exp(sig_z2 * k2);
     }
-    for (size_t m = 0; m < M; ++m)
+    for (size_t m = 0; m < M; ++m) {
       Bz[m * nz + iz] = std::exp(-0.5 * bandwidth[m] * k2);
+    }
   }
 
 #pragma omp parallel for schedule(static)
@@ -151,15 +169,18 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
         const int mx = ix - nx * (2 * ix / nx);
         const double kx = tx * mx;
         const double sqk = kx * kx + ky * ky + kz * kz;
-        if (!(sqk > 0.0 && sqk <= k_sq_max)) continue;   // k == 0 dropped
-        const size_t idx = static_cast<size_t>(ix) +
-                           nx * (static_cast<size_t>(iyl) +
-                                 static_cast<size_t>(ystride) * static_cast<size_t>(iz));
+        if (!(sqk > 0.0 && sqk <= k_sq_max)) {
+          continue;  // k == 0 dropped
+        }
+        const size_t idx =
+            static_cast<size_t>(ix) +
+            nx * (static_cast<size_t>(iyl) +
+                  static_cast<size_t>(ystride) * static_cast<size_t>(iz));
         double kfac = 0.0, kfacv = 0.0;
         for (size_t m = 0; m < M; ++m) {
           const double p = Bx[m * nx + ix] * By[m * ny + iy] * Bz[m * nz + iz];
           kfac += amp[m] * p;
-          kfacv += amp[m] * bandwidth[m] * p;   // amp_virial[m] = amp[m]*beta[m]
+          kfacv += amp[m] * bandwidth[m] * p;  // amp_virial[m] = amp[m]*beta[m]
         }
         const double dc = Dx[ix] * Dy[iy] * Dz[iz];
         ge[idx] = kfac * dc;
@@ -174,15 +195,21 @@ inline void build_green_range(int nx, int ny, int nz, double lx, double ly,
 // stored, because the (x,y) transform is real-to-complex and the green
 // function depends on kx^2 only.  Layout: idx = kh + Nh*(iyl + YL*iz).
 // Values are identical to the full table's column ix = kh.
-inline void build_green_slab_half(int nx, int ny, int nz, double lx,
-                                  double ly, double lz,
-                                  const std::vector<double> &amp,
-                                  const std::vector<double> &bandwidth,
-                                  int spline, int ylo, int YL,
-                                  std::vector<double> &ge,
-                                  std::vector<double> &gf,
-                                  std::vector<double> &gv,
-                                  const double *window = nullptr,
+inline void build_green_slab_half(int nx,
+                                  int ny,
+                                  int nz,
+                                  double lx,
+                                  double ly,
+                                  double lz,
+                                  const std::vector<double>& amp,
+                                  const std::vector<double>& bandwidth,
+                                  int spline,
+                                  int ylo,
+                                  int YL,
+                                  std::vector<double>& ge,
+                                  std::vector<double>& gf,
+                                  std::vector<double>& gv,
+                                  const double* window = nullptr,
                                   double window_floor = 1e-4) {
   const int Nh = nx / 2 + 1;
   const size_t ng = static_cast<size_t>(Nh) * YL * nz;
@@ -191,8 +218,8 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
   gv.assign(ng, 0.0);
 
   const double dx = lx / nx, dy = ly / ny, dz = lz / nz;
-  const double k_sq_max = M_PI * M_PI *
-                          (1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz));
+  const double k_sq_max =
+      M_PI * M_PI * (1.0 / (dx * dx) + 1.0 / (dy * dy) + 1.0 / (dz * dz));
   const double tx = 2.0 * M_PI / lx, ty = 2.0 * M_PI / ly, tz = 2.0 * M_PI / lz;
   // QuadS is spline = 100 + order; it inverts the separable window exactly
   // (Form A), like build_green_range.  The x axis is stored as the compact
@@ -204,18 +231,21 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
   // inverts), so the slab solve reproduces the replicated SPME.
   const bool is_quads = spline >= 100 && spline < 200;
   const bool is_bspline = spline >= 200;
-  const int nord = is_quads ? spline - 100
-                            : (is_bspline ? spline - 200 : (spline == 6 ? 6 : 4));
+  const int nord = is_quads
+                       ? spline - 100
+                       : (is_bspline ? spline - 200 : (spline == 6 ? 6 : 4));
   const double xi_q = is_quads ? LAMMPS_NS::quads_xi(nord) : 0.0;
   const double xi = (spline == 6) ? kCubes2Xi6 : kCubes2Xi4;
   const double sig_y2 = (xi * dy) * (xi * dy);
   const double sig_z2 = (xi * dz) * (xi * dz);
   // The B-spline integer weights M_p(1..p-1) and the per-mode |D(m)|^-2.
   double iw[16];
-  if (is_bspline) integer_bspline_weights(nord, iw);
+  if (is_bspline) {
+    integer_bspline_weights(nord, iw);
+  }
   auto bspline_d = [&](int m, int n) -> double {
-    const double theta = 2.0 * M_PI * static_cast<double>(m) /
-                         static_cast<double>(n);
+    const double theta =
+        2.0 * M_PI * static_cast<double>(m) / static_cast<double>(n);
     double re = 0.0, im = 0.0;
     for (int l = 0; l < nord - 1; ++l) {
       re += iw[l] * std::cos(theta * l);
@@ -228,7 +258,7 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
   std::vector<double> Bx(M * Nh), By(M * ny), Bz(M * nz);
   std::vector<double> Dx(Nh), Dy(ny), Dz(nz);
   for (int kh = 0; kh < Nh; ++kh) {
-    const double k = tx * kh, k2 = k * k;   // +kx representative
+    const double k = tx * kh, k2 = k * k;  // +kx representative
     if (is_bspline) {
       Dx[kh] = bspline_d(kh, nx);
     } else if (is_quads) {
@@ -237,7 +267,9 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
     } else {
       Dx[kh] = std::exp((xi * dx) * (xi * dx) * k2);
     }
-    for (size_t m = 0; m < M; ++m) Bx[m * Nh + kh] = std::exp(-0.5 * bandwidth[m] * k2);
+    for (size_t m = 0; m < M; ++m) {
+      Bx[m * Nh + kh] = std::exp(-0.5 * bandwidth[m] * k2);
+    }
   }
   for (int iy = 0; iy < ny; ++iy) {
     const int mode = iy - ny * (2 * iy / ny);
@@ -250,7 +282,9 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
     } else {
       Dy[iy] = std::exp(sig_y2 * k2);
     }
-    for (size_t m = 0; m < M; ++m) By[m * ny + iy] = std::exp(-0.5 * bandwidth[m] * k2);
+    for (size_t m = 0; m < M; ++m) {
+      By[m * ny + iy] = std::exp(-0.5 * bandwidth[m] * k2);
+    }
   }
   for (int iz = 0; iz < nz; ++iz) {
     const int mode = iz - nz * (2 * iz / nz);
@@ -263,7 +297,9 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
     } else {
       Dz[iz] = std::exp(sig_z2 * k2);
     }
-    for (size_t m = 0; m < M; ++m) Bz[m * nz + iz] = std::exp(-0.5 * bandwidth[m] * k2);
+    for (size_t m = 0; m < M; ++m) {
+      Bz[m * nz + iz] = std::exp(-0.5 * bandwidth[m] * k2);
+    }
   }
 
 #pragma omp parallel for schedule(static)
@@ -277,10 +313,13 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
       for (int kh = 0; kh < Nh; ++kh) {
         const double kx = tx * kh;
         const double sqk = kx * kx + ky * ky + kz * kz;
-        if (!(sqk > 0.0 && sqk <= k_sq_max)) continue;   // k == 0 dropped
-        const size_t idx = static_cast<size_t>(kh) +
-                           Nh * (static_cast<size_t>(iyl) +
-                                 static_cast<size_t>(YL) * static_cast<size_t>(iz));
+        if (!(sqk > 0.0 && sqk <= k_sq_max)) {
+          continue;  // k == 0 dropped
+        }
+        const size_t idx =
+            static_cast<size_t>(kh) +
+            Nh * (static_cast<size_t>(iyl) +
+                  static_cast<size_t>(YL) * static_cast<size_t>(iz));
         double kfac = 0.0, kfacv = 0.0;
         for (size_t m = 0; m < M; ++m) {
           const double p = Bx[m * Nh + kh] * By[m * ny + iy] * Bz[m * nz + iz];
@@ -292,13 +331,14 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
           // exact measured window <|W|^2>, so ge = kfac / <|W|^2>.  The slab
           // entry (kh, iyl, iz) maps to the global compact index
           // kh + nh*(iy + ny*iz) of the measured window (iy = ylo + iyl).
-          const size_t gi = static_cast<size_t>(kh) +
-                            static_cast<size_t>(Nh) *
-                                (static_cast<size_t>(iy) +
-                                 static_cast<size_t>(ny) * static_cast<size_t>(iz));
+          const size_t gi =
+              static_cast<size_t>(kh) +
+              static_cast<size_t>(Nh) *
+                  (static_cast<size_t>(iy) +
+                   static_cast<size_t>(ny) * static_cast<size_t>(iz));
           const double w = window[gi];
           if (!(w > window_floor)) {
-            continue;   // near-zero window at the Nyquist corner: drop the mode
+            continue;  // near-zero window at the Nyquist corner: drop the mode
           }
           ge[idx] = kfac / w;
           gf[idx] = kfac / w;
@@ -315,11 +355,18 @@ inline void build_green_slab_half(int nx, int ny, int nz, double lx,
 }
 
 // Full-grid tables (replicated path and LAMMPS kspace).
-inline void build_green(int nx, int ny, int nz, double lx, double ly, double lz,
-                        const std::vector<double> &amp,
-                        const std::vector<double> &bandwidth, int spline,
-                        std::vector<double> &ge, std::vector<double> &gf,
-                        std::vector<double> &gv) {
+inline void build_green(int nx,
+                        int ny,
+                        int nz,
+                        double lx,
+                        double ly,
+                        double lz,
+                        const std::vector<double>& amp,
+                        const std::vector<double>& bandwidth,
+                        int spline,
+                        std::vector<double>& ge,
+                        std::vector<double>& gf,
+                        std::vector<double>& gv) {
   build_green_range(nx, ny, nz, lx, ly, lz, amp, bandwidth, spline, 0, ny, ny,
                     ge, gf, gv);
 }
@@ -338,11 +385,16 @@ inline void build_green(int nx, int ny, int nz, double lx, double ly, double lz,
 // longer factors over the axes, so the tables cost one exp per band and mode:
 // a rebuild is O(M nx ny nz).  It happens only when the cell or the kernel
 // changes, not per step.
-inline void build_green_metric(int nx, int ny, int nz, const double W[9],
-                               const std::vector<double> &amp,
-                               const std::vector<double> &bandwidth, int spline,
-                               std::vector<double> &ge, std::vector<double> &gf,
-                               std::vector<double> &gv) {
+inline void build_green_metric(int nx,
+                               int ny,
+                               int nz,
+                               const double W[9],
+                               const std::vector<double>& amp,
+                               const std::vector<double>& bandwidth,
+                               int spline,
+                               std::vector<double>& ge,
+                               std::vector<double>& gf,
+                               std::vector<double>& gv) {
   const size_t ng = static_cast<size_t>(nx) * ny * nz;
   ge.assign(ng, 0.0);
   gf.assign(ng, 0.0);
@@ -396,10 +448,11 @@ inline void build_green_metric(int nx, int ny, int nz, const double W[9],
           kfacv += e * bandwidth[m];
         }
         const double dc = Dx[ix] * Dy[iy] * Dz[iz];
-        const size_t idx = static_cast<size_t>(ix) +
-                           static_cast<size_t>(nx) *
-                               (static_cast<size_t>(iy) +
-                                static_cast<size_t>(ny) * static_cast<size_t>(iz));
+        const size_t idx =
+            static_cast<size_t>(ix) +
+            static_cast<size_t>(nx) *
+                (static_cast<size_t>(iy) +
+                 static_cast<size_t>(ny) * static_cast<size_t>(iz));
         ge[idx] = kfac * dc;
         gf[idx] = kfac * dc;
         gv[idx] = kfacv * dc;
@@ -411,14 +464,22 @@ inline void build_green_metric(int nx, int ny, int nz, const double W[9],
 // This rank's y-slab of the tables (distributed path): YL*nx*nz entries,
 // indexed ix + nx*(iyl + YL*iz).  The green pencil kernel consumes exactly
 // this layout, so per-rank green memory is 1/np of the full tables.
-inline void build_green_slab(int nx, int ny, int nz, double lx, double ly,
-                             double lz, const std::vector<double> &amp,
-                             const std::vector<double> &bandwidth, int spline,
-                             int ylo, int YL, std::vector<double> &ge,
-                             std::vector<double> &gf,
-                             std::vector<double> &gv) {
-  build_green_range(nx, ny, nz, lx, ly, lz, amp, bandwidth, spline, ylo, YL,
-                    YL, ge, gf, gv);
+inline void build_green_slab(int nx,
+                             int ny,
+                             int nz,
+                             double lx,
+                             double ly,
+                             double lz,
+                             const std::vector<double>& amp,
+                             const std::vector<double>& bandwidth,
+                             int spline,
+                             int ylo,
+                             int YL,
+                             std::vector<double>& ge,
+                             std::vector<double>& gf,
+                             std::vector<double>& gv) {
+  build_green_range(nx, ny, nz, lx, ly, lz, amp, bandwidth, spline, ylo, YL, YL,
+                    ge, gf, gv);
 }
 
 }  // namespace sog_green

@@ -6,9 +6,10 @@ test runs only when the caller provides the same environment as the
 ``examples/lammps/water_scan0_lr`` harness:
 
 ``WATER_SCAN0_LMP_DATA``, ``WATER_SCAN0_MODEL``, ``WATER_SCAN0_PLUGIN``,
-``LMP`` and ``mpirun`` on PATH.  It exercises the host pair style at
-np=1/2/4; the Kokkos leg is deliberately not part of this test because a
-two-block canonical long-range artifact is not Kokkos-capable yet.
+``LMP`` and ``mpirun`` on PATH drive the host pair style at np=1/2/4.  The
+Kokkos leg is a second test that additionally needs ``WATER_SCAN0_PLUGIN_KK``,
+``WATER_SCAN0_BACKEND_PLUGIN_KK`` and ``LMP_KK``; it runs the same fixture on
+the 192-atom two-block canonical with-comm sibling.
 """
 
 from __future__ import annotations
@@ -26,7 +27,12 @@ import pytest
 pytestmark = pytest.mark.skipif(
     not all(
         os.environ.get(name)
-        for name in ("WATER_SCAN0_LMP_DATA", "WATER_SCAN0_MODEL", "WATER_SCAN0_PLUGIN", "LMP")
+        for name in (
+            "WATER_SCAN0_LMP_DATA",
+            "WATER_SCAN0_MODEL",
+            "WATER_SCAN0_PLUGIN",
+            "LMP",
+        )
     )
     or shutil.which("mpirun") is None,
     reason="the optional LAMMPS/model fixture is not configured",
@@ -74,9 +80,7 @@ def test_two_block_canonical_runs_kokkos_multi_rank() -> None:
         for p in env.get("LD_LIBRARY_PATH", "").split(":")
         if p and os.path.abspath(p) != host_lib
     ]
-    env["LD_LIBRARY_PATH"] = ":".join(
-        [env["WATER_SCAN0_BACKEND_PLUGIN_KK"], *other]
-    )
+    env["LD_LIBRARY_PATH"] = ":".join([env["WATER_SCAN0_BACKEND_PLUGIN_KK"], *other])
     results = []
     for np in (1, 2, 4):
         cmd = [
@@ -85,8 +89,7 @@ def test_two_block_canonical_runs_kokkos_multi_rank() -> None:
             str(np),
             "bash",
             "-c",
-            'export CUDA_VISIBLE_DEVICES=${OMPI_COMM_WORLD_LOCAL_RANK:-0}; '
-            'exec "$@"',
+            'export CUDA_VISIBLE_DEVICES=${OMPI_COMM_WORLD_LOCAL_RANK:-0}; exec "$@"',
             "bash",
             env["LMP_KK"],
             "-k",
@@ -110,7 +113,11 @@ def test_two_block_canonical_runs_kokkos_multi_rank() -> None:
             str(input_file),
         ]
         proc = subprocess.run(
-            cmd, cwd=input_file.parent, env=env, text=True, capture_output=True,
+            cmd,
+            cwd=input_file.parent,
+            env=env,
+            text=True,
+            capture_output=True,
         )
         assert proc.returncode == 0, proc.stderr
         out = proc.stdout

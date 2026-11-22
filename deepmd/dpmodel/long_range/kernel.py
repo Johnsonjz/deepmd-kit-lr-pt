@@ -45,7 +45,6 @@ SOG_DEFAULT_M = 7
 r"""Number of Gaussians of the default :class:`SOGKernel` ladder."""
 
 
-
 class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")):
     """Pair interaction kernel :math:`K(r)` in Å⁻¹ with its own parameters.
 

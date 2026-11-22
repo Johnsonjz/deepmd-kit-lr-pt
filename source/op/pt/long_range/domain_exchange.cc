@@ -69,7 +69,8 @@ void broadcast_bytes(const torch::Tensor& communicator, void* data, int count) {
   if (communicator_address(communicator, kOperator) == 0) {
     return;
   }
-  MPI_Bcast(data, count, MPI_BYTE, 0, communicator_handle(communicator, kOperator));
+  MPI_Bcast(data, count, MPI_BYTE, 0,
+            communicator_handle(communicator, kOperator));
 #else
   TORCH_CHECK(false,
               "broadcast_bytes: an evaluation across MPI ranks requires "

@@ -995,8 +995,7 @@ inline void remap_graph_outputs_to_dense_keys(
  * @throws deepmd::deepmd_exception when any value is undefined.
  */
 inline void require_defined_outputs(
-    const std::map<std::string, torch::Tensor>& output_map,
-    const char* where) {
+    const std::map<std::string, torch::Tensor>& output_map, const char* where) {
   std::string bad;
   for (const auto& entry : output_map) {
     if (!entry.second.defined()) {
@@ -1010,8 +1009,8 @@ inline void require_defined_outputs(
     return;
   }
   throw deepmd::deepmd_exception(
-      std::string(where) + ": the exported graph returned undefined output(s) " +
-      bad +
+      std::string(where) +
+      ": the exported graph returned undefined output(s) " + bad +
       ". A custom operator inside the graph threw and the AOTI proxy executor "
       "caught it instead of propagating it, so the model still 'returned' its "
       "outputs with those slots unset. The operator's own message is the "

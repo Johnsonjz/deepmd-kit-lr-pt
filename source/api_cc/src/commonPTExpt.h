@@ -466,8 +466,8 @@ class GraphReplay {
           free_bytes < static_cast<std::size_t>(eager_footprint_ * 1.2)) {
         if (std::getenv("DP_REPLAY_DEBUG") != nullptr) {
           std::cerr << "[replay] skip capture: free " << free_bytes / 1048576
-                    << " MiB, footprint " << eager_footprint_ / 1048576 << " MiB"
-                    << std::endl;
+                    << " MiB, footprint " << eager_footprint_ / 1048576
+                    << " MiB" << std::endl;
         }
         capturable_ = false;
         return false;
