@@ -1123,11 +1123,21 @@ class GeneralFitting(NativeOP, BaseFitting):
                 outs -= self.nets[()](xx_zeros)
             if xx_vac is not None:
                 outs = outs - self.vacuum_output(self.nets[()](xx_vac), atype)
-        bias_atom_e = xp.asarray(
-            self.bias_atom_e,
-            dtype=outs.dtype,
-            device=array_api_compat.device(outs),
-        )
+        # ``array_api_compat``'s ``asarray`` drops ``requires_grad`` on a
+        # torch Parameter (it calls ``torch.asarray`` with the default
+        # ``requires_grad=False``), which silently freezes the trainable
+        # per-type bias on the first forward. Use a differentiable cast for a
+        # tensor backend and keep the array-API conversion for the others.
+        if hasattr(self.bias_atom_e, "requires_grad"):
+            bias_atom_e = self.bias_atom_e.to(
+                dtype=outs.dtype, device=array_api_compat.device(outs)
+            )
+        else:
+            bias_atom_e = xp.asarray(
+                self.bias_atom_e,
+                dtype=outs.dtype,
+                device=array_api_compat.device(outs),
+            )
         outs += xp.reshape(
             xp.take(
                 bias_atom_e,

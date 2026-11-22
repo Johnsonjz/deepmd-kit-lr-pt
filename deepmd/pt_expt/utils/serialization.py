@@ -225,8 +225,9 @@ def _needs_with_comm_artifact(
     per-lower capability instead of assuming both lowers agree. The dense
     lower checks ``dense_lower_supports_comm()`` (``True`` for
     dpa2/dpa3, whose dense lower is the production multi-rank path).
-    Compact canonical lowers never use a separate with-comm artifact; the
-    multi-block DPA4C lower carries halo exchange in its main ABI.
+    A compact canonical lower of a message-passing model uses the eight-tensor
+    with-comm sibling; the fused DPA4C lower carries its halo exchange in the
+    main ABI and does not need it.
 
     Native spin participates on the GRAPH lower, matching pt's
     ``SeZMModel.supports_edge_parallel`` (which ``SeZMNativeSpinModel`` does
@@ -253,6 +254,10 @@ def _needs_with_comm_artifact(
         NativeSpinModelKind,
     )
 
+    if lower_kind in ("dpa1_canonical", "dpa4c_canonical"):
+        # The compact canonical lower has no border exchange in its main ABI;
+        # a message-passing model needs the eight-tensor with-comm sibling.
+        return _needs_canonical_with_comm(model, lower_kind)
     if lower_kind not in ("graph", "nlist"):
         return False
 
@@ -274,6 +279,25 @@ def _needs_with_comm_artifact(
         return True
     # The dense wrapper requires its own cross-rank communication contract.
     return bool(atomic_model.dense_lower_supports_comm())
+
+
+def _needs_canonical_with_comm(model: Any, lower_kind: str) -> bool:
+    """Whether the compact canonical lower of this model needs a comm sibling.
+
+    The plain canonical ABI carries no border exchange, so a message-passing
+    descriptor reuses the ghost features of its first block for every later
+    one. The with-comm sibling carries the eight comm tensors the descriptor's
+    ``border_op`` drives. A model with a long-range module qualifies as soon as
+    its module serves a decomposed frame: the module reads the same
+    communicator through the operator, and nothing else about the canonical
+    lower changes.
+    """
+    if lower_kind not in ("dpa1_canonical", "dpa4c_canonical"):
+        return False
+    atomic_model = model.atomic_model
+    if not atomic_model.has_message_passing_across_ranks():
+        return False
+    return bool(atomic_model.supports_edge_parallel())
 
 
 def check_graph_trace_torch_version(model: torch.nn.Module) -> None:
@@ -893,6 +917,7 @@ def build_synthetic_canonical_graph_inputs(
     e_max: int,
     *,
     device: torch.device,
+    nframes: int = 2,
     want_spin: bool = False,
     want_long_range: bool = False,
     want_border: bool = False,
@@ -925,6 +950,7 @@ def build_synthetic_canonical_graph_inputs(
     sample = build_synthetic_graph_inputs(
         model,
         e_max,
+        nframes=nframes,
         dtype=torch.float32,
         edge_dtype=torch.float32,
         device=device,
@@ -1047,6 +1073,73 @@ def _build_canonical_graph_dynamic_shapes(
         trailing.append({0: torch.export.Dim("n_halo_send", min=0)})
         trailing.append({0: torch.export.Dim("n_halo_swap", min=0)})
     return (*shapes, *trailing)
+
+
+def _build_canonical_graph_dynamic_shapes_with_comm(
+    *sample_inputs: torch.Tensor | None,
+    has_long_range: bool,
+) -> tuple:
+    """Dynamic-shape specs for the compact canonical with-comm export.
+
+    The compact eight keep their dynamic node and edge axes, except that the
+    frame axis is static at one: the border exchange is driven one frame at a
+    time. A model with a long-range module adds its positions (extended node
+    axis) and its cells (one frame) after them. The eight comm tensors follow
+    and are all static — ``nswap`` and the send counts are baked in at the
+    trace value, as for the graph with-comm tail.
+
+    Parameters
+    ----------
+    *sample_inputs
+        The traced inputs, in the order
+        :meth:`~deepmd.pt_expt.model.ener_model.EnergyModel.forward_lower_canonical_graph_exportable_with_comm`
+        takes them.
+    has_long_range
+        Whether the positions and the cells are present after the compact
+        eight.
+
+    Returns
+    -------
+    tuple
+        One specification per input.
+    """
+    nframes_val = 1
+    node_dim = torch.export.Dim("n_node_total", min=1)
+    edge_storage_dim = torch.export.Dim("nedge_storage", min=2)
+    source_row_dim = torch.export.Dim("n_source_row", min=2)
+    source_order_dim = torch.export.Dim("n_source_order", min=2)
+    word_bytes_dim = torch.export.Dim("index_word_bytes", min=4, max=8)
+    shapes = (
+        {0: node_dim},
+        {0: nframes_val},
+        {0: nframes_val},
+        {0: edge_storage_dim, 1: word_bytes_dim},
+        {0: edge_storage_dim},
+        {0: node_dim + 1},
+        {0: source_row_dim},
+        {0: source_order_dim},
+    )
+    if has_long_range:
+        shapes = (*shapes, {0: node_dim}, None, {0: nframes_val})
+    elif len(shapes) == 8:
+        shapes = (*shapes, None, None, None)
+    # The swap table is a runtime property of the domain decomposition, not a
+    # constant of the artifact: every rank has a different nswap and different
+    # send/recv counts. The eight comm tensors therefore keep a dynamic first
+    # axis; freezing them at the synthetic sample made every non-matching
+    # decomposition run the baked-in exchange and lose the cross-rank features.
+    nswap_dim = torch.export.Dim("nswap", min=0)
+    comm_shapes = (
+        {0: nswap_dim},
+        {0: nswap_dim},
+        {0: nswap_dim},
+        {0: nswap_dim},
+        {0: nswap_dim},
+        None,
+        None,
+        None,
+    )
+    return (*shapes, *comm_shapes)
 
 
 def count_synthetic_graph_edges(
@@ -1586,6 +1679,21 @@ def _collect_metadata(
         meta["canonical_requires_source_csr"] = _canonical_requires_source_csr(
             model, lower_kind
         )
+        # A compact canonical artifact without the with-comm sibling runs its
+        # descriptor with comm_dict=None and reuses the ghost features of its
+        # first block for every later one. Record the limitation so a
+        # deployment can refuse the multi-rank case instead of running it.
+        single_rank_only = bool(
+            meta["has_message_passing"]
+            and not _needs_canonical_with_comm(model, lower_kind)
+        )
+        meta["canonical_single_rank_only"] = single_rank_only
+        if single_rank_only:
+            log.warning(
+                "the compact canonical lower of this model has no cross-rank "
+                "message-passing exchange; the artifact is faithful on a single "
+                "rank only. Run it with one rank, or deploy the graph lower."
+            )
 
     # Model-level pair-type exclusion (``pair_exclude_types``): a list of
     # ``[ti, tj]`` type pairs whose interaction is dropped.  Exclusion is a
@@ -1952,11 +2060,16 @@ def _select_graph_lower_kind(data: dict, *, allow_canonical: bool) -> str | None
         from deepmd.pt_expt.kernels.dpa4c.canonical import (
             canonical_model_unsupported_reason as dpa4c_canonical_unsupported,
         )
+        from deepmd.pt_expt.kernels.dpa4.canonical import (
+            canonical_model_eligible as sezm_canonical_eligible,
+        )
 
         reason = dpa4c_canonical_unsupported(model)
         if reason is not None:
             raise ValueError(reason)
         if dpa4c_canonical_eligible(model):
+            return "dpa4c_canonical"
+        if sezm_canonical_eligible(model):
             return "dpa4c_canonical"
         if dpa1_canonical_eligible(model):
             return "dpa1_canonical"
@@ -2463,19 +2576,30 @@ def _trace_and_export_impl(
             )
         if canonical:
             if lower_kind == "dpa4c_canonical":
+                from deepmd.pt_expt.kernels.dpa4.canonical import (
+                    canonical_model_eligible as sezm_canonical_eligible,
+                )
                 from deepmd.pt_expt.kernels.dpa4c.canonical import (
                     canonical_model_eligible,
                 )
+
+                if not (
+                    canonical_model_eligible(model) or sezm_canonical_eligible(model)
+                ):
+                    raise NotImplementedError(
+                        "compact canonical export requires an eligible compressed "
+                        "DPA1, DPA4C or SeZM energy model"
+                    )
             else:
                 from deepmd.pt_expt.kernels.cuda.dpa1.canonical import (
                     canonical_model_eligible,
                 )
 
-            if not canonical_model_eligible(model):
-                raise NotImplementedError(
-                    "compact canonical export requires an eligible compressed "
-                    "DPA1 or DPA4C energy model"
-                )
+                if not canonical_model_eligible(model):
+                    raise NotImplementedError(
+                        "compact canonical export requires an eligible compressed "
+                        "DPA1 energy model"
+                    )
 
         # Trace-time sizes must be pairwise-distinct AND avoid every static
         # model dim (dim_fparam / dim_aparam / parameter dims): make_fx's
@@ -2526,7 +2650,10 @@ def _trace_and_export_impl(
             # The compact lower of a model with further message-passing blocks
             # reads the border plan of a decomposed frame, whose extents are
             # kept distinct from the other axes.
-            want_border = bool(model.atomic_model.has_message_passing_across_ranks())
+            want_border = (
+                bool(model.atomic_model.has_message_passing_across_ranks())
+                and not with_comm_dict
+            )
             border_sizes = (
                 next_safe_prime(
                     e_sample + 3,
@@ -2538,32 +2665,87 @@ def _trace_and_export_impl(
                 model,
                 e_sample,
                 device=torch.device("cpu"),
+                nframes=1 if with_comm_dict else 2,
                 want_spin=is_native_spin,
                 want_long_range=want_long_range,
                 want_border=want_border,
                 border_sizes=border_sizes,
             )
-            # The inputs after the graph, and the moment of a native-spin
-            # model, reach the lower by name, in the order of the samples.
-            graph_count = 9 if is_native_spin else 8
-            names = (
-                *(("coord",) if want_long_range else ()),
-                *(("communicator",) if want_long_range or want_border else ()),
-                *(("box",) if want_long_range else ()),
-                *(("halo_send", "halo_swaps") if want_border else ()),
-            )
-            traced = model.forward_lower_canonical_graph_exportable(
-                *sample_inputs[:graph_count],
-                **dict(zip(names, sample_inputs[graph_count:], strict=True)),
-                do_atomic_virial=do_atomic_virial,
-                tracing_mode="symbolic",
-                _allow_non_fake_inputs=True,
-            )
-            dynamic_shapes = _build_canonical_graph_dynamic_shapes(
-                is_native_spin=is_native_spin,
-                long_range=want_long_range,
-                border=want_border,
-            )
+            if not with_comm_dict:
+                # The inputs after the graph, and the moment of a native-spin
+                # model, reach the lower by name, in the order of the samples.
+                graph_count = 9 if is_native_spin else 8
+                names = (
+                    *(("coord",) if want_long_range else ()),
+                    *(("communicator",) if want_long_range or want_border else ()),
+                    *(("box",) if want_long_range else ()),
+                    *(("halo_send", "halo_swaps") if want_border else ()),
+                )
+                traced = model.forward_lower_canonical_graph_exportable(
+                    *sample_inputs[:graph_count],
+                    **dict(zip(names, sample_inputs[graph_count:], strict=True)),
+                    do_atomic_virial=do_atomic_virial,
+                    tracing_mode="symbolic",
+                    _allow_non_fake_inputs=True,
+                )
+                dynamic_shapes = _build_canonical_graph_dynamic_shapes(
+                    is_native_spin=is_native_spin,
+                    long_range=want_long_range,
+                    border=want_border,
+                )
+            if with_comm_dict:
+                from deepmd.pt_expt.utils.comm import (
+                    ensure_comm_registered,
+                )
+
+                ensure_comm_registered()
+                if not _needs_canonical_with_comm(model, lower_kind):
+                    raise ValueError(
+                        "with_comm_dict=True requested but the model's "
+                        "descriptor does not need cross-rank message passing "
+                        "— there's nothing to compile."
+                    )
+                if is_native_spin:
+                    raise NotImplementedError(
+                        "the compact canonical with-comm lower has no spin slot."
+                    )
+                # The positions, the communicator that serves the long-range
+                # module and the cells follow the compact eight exactly as in
+                # the plain canonical ABI; the comm payload follows them.
+                # The with-comm ABI always carries the three long-range slots
+                # between the compact eight and the comm payload; a
+                # short-range-only model leaves them None.
+                compact_inputs = tuple(sample_inputs)
+                if not want_long_range and len(compact_inputs) == 8:
+                    compact_inputs = (
+                        *compact_inputs,
+                        torch.empty(
+                            (0, 3), dtype=torch.float64, device=sample_inputs[0].device
+                        ),
+                        torch.empty(
+                            (0,), dtype=torch.int64, device=sample_inputs[0].device
+                        ),
+                        torch.empty(
+                            (0, 9), dtype=torch.float64, device=sample_inputs[0].device
+                        ),
+                    )
+                nnode = int(sample_inputs[1].reshape(-1)[0])
+                nloc = int(sample_inputs[2].reshape(-1)[0])
+                comm_inputs = _make_comm_sample_inputs(
+                    nloc=nloc,
+                    nghost=nnode - nloc,
+                    device=torch.device("cpu"),
+                )
+                sample_inputs = (*compact_inputs, *comm_inputs)
+                traced = model.forward_lower_canonical_graph_exportable_with_comm(
+                    *sample_inputs,
+                    do_atomic_virial=do_atomic_virial,
+                    tracing_mode="symbolic",
+                    _allow_non_fake_inputs=True,
+                )
+                dynamic_shapes = _build_canonical_graph_dynamic_shapes_with_comm(
+                    *sample_inputs, has_long_range=want_long_range
+                )
         elif with_comm_dict:
             # Load libdeepmd_op_pt.so and register border_op fake/autograd
             # metadata now, mirroring the dense with-comm precedent below.

@@ -2383,6 +2383,10 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         """
         return [999999]
 
+    def supports_long_range(self) -> bool:
+        """Whether the combination with long-range modules is validated."""
+        return True
+
     def get_ntypes(self) -> int:
         """Return the number of real atom types."""
         return self.ntypes

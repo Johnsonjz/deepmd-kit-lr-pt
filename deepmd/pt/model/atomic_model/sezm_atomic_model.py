@@ -872,6 +872,13 @@ class SeZMAtomicModel(DPAtomicModel):
         check_version_compatibility(version, 3, 2)
         payload.pop("@class", None)
         payload.pop("type", None)
+        long_range_data = payload.pop("long_range", None)
+        if long_range_data is not None:
+            from deepmd.pt.long_range.base_long_range import (
+                BaseLongRange,
+            )
+
+            payload["long_range"] = BaseLongRange.deserialize(long_range_data)
 
         descriptor_obj = BaseDescriptor.deserialize(payload.pop("descriptor"))
         fitting_payload = payload.pop("fitting")

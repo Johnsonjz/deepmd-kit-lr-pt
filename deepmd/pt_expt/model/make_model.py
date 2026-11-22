@@ -195,6 +195,55 @@ def _fused_energy_force_graph(
     return ret
 
 
+def _add_fused_long_range(
+    model_ret: dict[str, torch.Tensor],
+    lr_out: dict[str, torch.Tensor],
+    n_node_total: int,
+    n_frames: int,
+    do_atomic_virial: bool,
+) -> None:
+    """Add a fused long-range operator's force and virial to a graph lower.
+
+    The operator returns the force and the virial at fixed charges as values,
+    while the response of the charges has already joined the energy that the
+    caller's backward differentiated. The two parts therefore meet here, in
+    the per-atom force ``(N, 1, 3)``, the per-frame virial ``(nf, 1, 9)`` and
+    -- when requested -- the per-atom virial ``(N, 1, 9)`` of the model dict.
+
+    Parameters
+    ----------
+    model_ret
+        The flat model dict of :func:`fit_output_to_model_output_graph`,
+        updated in place.
+    lr_out
+        The operator outputs, with ``force`` ``(N, 3)``, ``virial``
+        ``(nf, 9)`` and ``atom_virial`` ``(N, 9)``.
+    n_node_total
+        The flat node count ``N`` of the node axis.
+    n_frames
+        The frame count ``nf`` of the node axis.
+    do_atomic_virial
+        Whether the per-atom virial was requested.
+    """
+    var = "energy"
+    derv_r = model_ret.get(var + "_derv_r")
+    if derv_r is not None:
+        model_ret[var + "_derv_r"] = derv_r + lr_out["force"].reshape(
+            n_node_total, 1, 3
+        ).to(derv_r.dtype)
+    derv_c_redu = model_ret.get(var + "_derv_c_redu")
+    if derv_c_redu is not None:
+        model_ret[var + "_derv_c_redu"] = derv_c_redu + lr_out["virial"].reshape(
+            n_frames, 1, 9
+        ).to(derv_c_redu.dtype)
+    if do_atomic_virial:
+        derv_c = model_ret.get(var + "_derv_c")
+        if derv_c is not None:
+            model_ret[var + "_derv_c"] = derv_c + lr_out["atom_virial"].reshape(
+                n_node_total, 1, 9
+            ).to(derv_c.dtype)
+
+
 def check_owned_frames(
     n_node: torch.Tensor,
     n_local: torch.Tensor | None,
@@ -694,6 +743,7 @@ def make_model(
             spin: torch.Tensor | None = None,
             comm_dict: dict | None = None,
             topologies: dict[str, Any] | None = None,
+            long_range_op: dict[str, Any] | None = None,
         ) -> dict[str, torch.Tensor]:
             """Graph-native lower with autograd force/virial (dpa1/se_atten concat-tebd, attention included).
 
@@ -789,6 +839,17 @@ def make_model(
                 ``LEAVES`` become autograd leaves next to ``edge_vec``, and
                 force and virial include their pullbacks. ``None`` (default)
                 for models declaring none.
+            long_range_op
+                A fused-operator context for a long-range module, or ``None``
+                to evaluate it on the ``topologies`` above. The dict carries
+                ``coord`` ``(N, 3)`` float64, ``communicator`` and ``box`` for
+                the operator; the module's reciprocal-space sum then runs
+                inside the compiled program and needs no topology tensors.
+                The operator's force and virial at fixed charges are added to
+                ``<var>_derv_r`` and ``<var>_derv_c_redu`` here, after the
+                backward, and the response of the charges rides that backward
+                through the zero-valued linear descriptor term the atomic
+                model adds to the energy.
 
             Returns
             -------
@@ -847,6 +908,17 @@ def make_model(
                 )
                 if fused is not None:
                     return fused
+            # A fused long-range operator returns the force and the virial at
+            # fixed charges as values beside its energy; they are not
+            # derivatives of the energy the backward below differentiates, so
+            # the atomic forward writes them into this dict and they join the
+            # assembled force and virial afterwards.
+            lr_out: dict[str, Any] = {}
+            atomic_kwargs: dict[str, Any] = (
+                {}
+                if long_range_op is None
+                else {"long_range_op": {**long_range_op, "out": lr_out}}
+            )
             atomic_ret = self.atomic_model.forward_common_atomic_graph(
                 graph,
                 atype,
@@ -856,10 +928,11 @@ def make_model(
                 spin=spin,
                 comm_dict=comm_dict,
                 topologies=topologies,
+                **atomic_kwargs,
             )
             # ``forward_common_atomic_graph`` returns flat ``(N, *)`` output.
             # Pass directly to the flat-N transform; no rectangular reshape needed.
-            return fit_output_to_model_output_graph(
+            model_ret = fit_output_to_model_output_graph(
                 atomic_ret,
                 self.atomic_output_def(),
                 graph,
@@ -879,6 +952,15 @@ def make_model(
                 n_local=n_local,
                 topologies=topologies,
             )
+            if lr_out:
+                _add_fused_long_range(
+                    model_ret,
+                    lr_out,
+                    atype.shape[0],
+                    graph.n_node.shape[0],
+                    do_atomic_virial,
+                )
+            return model_ret
 
         def _resolve_graph_method(
             self, neighbor_graph_method: str | None

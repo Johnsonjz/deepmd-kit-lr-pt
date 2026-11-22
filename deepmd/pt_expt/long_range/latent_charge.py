@@ -172,6 +172,12 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
         with torch.enable_grad():
             charge = self.charge_net.call_graph(leaf, atype)["latent_charge"]
         total_charge, channel = self.operator_constraint(n_node.shape[0], coord)
+        # Both midtown families have a fixed order-4 or order-6 stencil, never
+        # the B-spline default of 8.
+        if self.mesh_backend in ("midtown", "quads"):
+            order = 4 if self.pme_order == 4 else 6
+        else:
+            order = self.pme_order
         atom_energy, charge_gradient, force, atom_virial, virial = latent_charge_sum(
             coord.to(torch.float64).contiguous(),
             charge.detach().to(torch.float32).contiguous(),
@@ -185,8 +191,10 @@ class LatentChargeLongRange(LatentChargeLongRangeDP):
             # A module that does not serve periodic systems sums every frame
             # directly.
             box if self.periodic else None,
-            self.pme_order,
+            order,
             self.mesh_spacing() if self.periodic else 1.0,
+            self.mesh_backend,
+            self.force_mode,
         )
         (descriptor_gradient,) = torch.autograd.grad(
             charge, leaf, charge_gradient.to(charge.dtype)

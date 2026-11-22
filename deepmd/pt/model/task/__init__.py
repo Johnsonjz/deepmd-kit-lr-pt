@@ -18,6 +18,12 @@ from .ener import (
 from .fitting import (
     Fitting,
 )
+from .invar_fitting import (
+    InvarFitting,
+)
+from .latent_charge import (
+    LatentChargeFitting,
+)
 from .polarizability import (
     PolarFittingNet,
 )
@@ -39,6 +45,8 @@ __all__ = [
     "EnergyFittingNet",
     "EnergyFittingNetDirect",
     "Fitting",
+    "InvarFitting",
+    "LatentChargeFitting",
     "PolarFittingNet",
     "PopulationFittingNet",
     "PropertyFittingNet",

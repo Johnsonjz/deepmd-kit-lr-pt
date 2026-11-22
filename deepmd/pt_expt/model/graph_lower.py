@@ -30,6 +30,14 @@ def graph_edge_dtype(model: Any, lower_kind: str) -> str:
     """
     if lower_kind not in ("graph", "dpa1_canonical", "dpa4c_canonical"):
         return "float64"
+    if lower_kind in ("dpa1_canonical", "dpa4c_canonical"):
+        # The compact canonical ABI carries float32 edge vectors: that is what
+        # build_synthetic_canonical_graph_inputs traces the program with, and
+        # what the canonical ingestion of the C++ interface requires. A model
+        # whose own graph lower runs in float64, such as the SeZM family, still
+        # deploys through this ABI in float32; reporting its native dtype here
+        # would make every consumer build edges the program does not take.
+        return "float32"
     return str(model.atomic_model.graph_edge_dtype())
 
 
