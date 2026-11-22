@@ -41,13 +41,19 @@ class _Model:
 
 
 @pytest.mark.parametrize("lower_kind", ["dpa4c_canonical", "dpa1_canonical"])
-def test_a_message_passing_canonical_model_builds_the_with_comm_sibling(
+def test_a_message_passing_model_without_a_sezm_descriptor_keeps_the_plain_abi(
     lower_kind: str,
 ) -> None:
-    """A multi-block model's canonical lower must carry the border exchange."""
+    """Only the SeZM canonical lower freezes a sibling.
+
+    The fused DPA4C lower carries its halo exchange in the main ABI and the
+    dense DPA1 lower has no sibling, so a model that does not decompose into a
+    learned SeZM descriptor keeps the plain canonical archive even when its
+    descriptor reports cross-rank message passing.
+    """
     model = _Model(message_passing=True)
-    assert _needs_canonical_with_comm(model, lower_kind) is True
-    assert _needs_with_comm_artifact(model, lower_kind) is True
+    assert _needs_canonical_with_comm(model, lower_kind) is False
+    assert _needs_with_comm_artifact(model, lower_kind) is False
 
 
 def test_a_single_block_canonical_model_needs_no_sibling() -> None:
