@@ -74,3 +74,15 @@ frozen_model.*
 # Test system directories
 system/
 *.expected
+
+# Local development build trees (MPI / gcc variants) and vendored LAMMPS source
+/build-*/
+/lammps_src/
+/log.lammps
+
+# Local test and tool caches
+.pytest_cache/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
