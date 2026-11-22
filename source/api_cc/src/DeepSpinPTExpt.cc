@@ -583,6 +583,10 @@ void DeepSpinPTExpt::extract_outputs(
   for (size_t i = 0; i < output_keys.size(); ++i) {
     output_map[output_keys[i]] = flat_outputs[i];
   }
+  // Same guard as the non-spin backend: an operator exception the AOTI proxy
+  // executor swallowed leaves the slot undefined, and the first reshape on it
+  // reports only "'self'".
+  deepmd::require_defined_outputs(output_map, "DeepSpinPTExpt");
 }
 
 // ============================================================================

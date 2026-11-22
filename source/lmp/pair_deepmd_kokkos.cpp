@@ -242,7 +242,11 @@ void PairDeepMDKokkos<DeviceType>::init_style() {
 
   // The model node set is shared by both input schemas; type_idx_map is
   // populated by the base coeff().
-  compact_graph.setup(type_idx_map, multi_rank);
+  // A long-range module is evaluated by every rank, and the with-comm
+  // artifact expects the extended node set even on one rank: its ghost rows
+  // are the periodic images the reciprocal sum folds in.
+  const bool extended_nodes = multi_rank || (canonical_graph && long_range);
+  compact_graph.setup(type_idx_map, extended_nodes);
   // The halo exchange follows the swaps of the communication atom for atom,
   // which the nodes of an extended node set do only without virtual atoms.
   if (canonical_halo && multi_rank && compact_graph.has_null_types) {
@@ -482,9 +486,12 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
     d_eatom = k_eatom.template view<DeviceType>();
   }
   int nedge = 0;
-  // The source CSR feeds the source-attributed per-atom virial, and every
-  // force assembly of an artifact that groups edges by source.
-  const bool source_csr = canonical_source_csr || cvflag_atom;
+  // The source CSR feeds the source-attributed per-atom virial, every force
+  // assembly of an artifact that groups edges by source, and the with-comm
+  // canonical sibling.  The sibling consumes the full CSR even when the
+  // metadata reports canonical_requires_source_csr=false; passing the
+  // two-slot placeholder makes AOTI fail on the first call.
+  const bool source_csr = canonical_source_csr || cvflag_atom || canonical_halo;
   if (canonical_graph) {
     compact_graph.build(list, cutoff, dist_unit_cvt_factor, source_csr);
   } else {
@@ -570,9 +577,12 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
 
   // Send/recv swap metadata for a message-passing model under domain
   // decomposition: ghost features are exchanged across ranks inside the forward
-  // pass. It is passed only when the raw LAMMPS atom indices in the swap lists
-  // match the model-node indices, i.e. when no virtual (NULL-type) atoms
-  // compact the node set; otherwise the extended edge-input path is rejected.
+  // pass. The swap lists address LAMMPS atoms, which are the model-node indices
+  // too unless virtual (NULL-type) atoms compact the node set. The compact
+  // canonical lower then translates them through the same map its graph was
+  // built from; the edge-input lower has no channel for the translation, so it
+  // states no payload and lets the model layer refuse the decomposed frame
+  // rather than refresh every halo with stale features.
   deepmd_compat::InputNlist comm_list;
   const deepmd_compat::InputNlist* comm_ptr = nullptr;
   if (multi_rank && !compact_graph.has_null_types) {
@@ -586,11 +596,12 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
   // further message-passing blocks refreshes the features of the ghost nodes
   // from the ranks that own them, through the communicator and the swaps of
   // the communication, which a rank without nodes takes no part in.
+  const bool extended_nodes = multi_rank || (canonical_graph && long_range);
   const DP_HaloExchange* const halo =
-      canonical_halo && multi_rank
+      canonical_halo && extended_nodes
           ? halo_exchange.plan(comm, error, neighbor->ago == 0)
           : nullptr;
-  void* const world_ptr = (long_range || halo != nullptr) && multi_rank
+  void* const world_ptr = (long_range || halo != nullptr) && extended_nodes
                               ? static_cast<void*>(&world)
                               : nullptr;
   const bool joins_long_range = long_range && multi_rank;
@@ -679,7 +690,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
   atomKK->sync(execution_space, F_MASK);
   auto f = atomKK->k_f.template view<DeviceType>();
   auto out_force = d_out_force;
-  if (multi_rank) {
+  if (extended_nodes) {
     Kokkos::parallel_for(
         "deepmd/kk:clear_ghost_f",
         Kokkos::RangePolicy<DeviceType>(nlocal, nall),
@@ -698,7 +709,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
         f(i, 2) += fscale * out_force(3 * m + 2);
       });
   atomKK->modified(execution_space, F_MASK);
-  if (multi_rank) {
+  if (extended_nodes) {
     ghost_fold.fold(comm, world, this, 3);
     if (reverse_used_host) {
       atomKK->sync(execution_space, F_MASK);
@@ -773,7 +784,7 @@ void PairDeepMDKokkos<DeviceType>::compute(int eflag, int vflag) {
         cvatom[ii][k] += vscale * h_av(9 * m + map9[k]);
       }
     }
-    if (multi_rank) {
+    if (extended_nodes) {
       reverse_virial = true;
       k_reverse_virial.modify_host();
       auto h_reverse = k_reverse_virial.view_host();

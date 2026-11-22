@@ -1001,7 +1001,8 @@ class DeepPot : public DeepBaseModel {
    * without a synchronization of the stream. A graph without halo nodes is
    * captured into a CUDA graph on the second consecutive call with the same
    * buffers and extents and replayed while they stay the same, except where a
-   * model with a long-range module receives a communicator. A model whose
+   * model with a long-range module receives a communicator or a model with
+   * further message-passing blocks receives a halo plan. A model whose
    * module serves periodic systems copies the cell into memory of its own,
    * which a replay reads, and the mesh size of the cell counts as an extent: a
    * call with another cell than the previous call first waits for the earlier

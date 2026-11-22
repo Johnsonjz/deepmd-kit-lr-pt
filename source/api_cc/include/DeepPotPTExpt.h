@@ -501,6 +501,10 @@ class DeepPotPTExpt : public DeepPotBackend {
   // the source CSR an input of every evaluation rather than of the per-atom
   // virial alone.
   bool canonical_requires_source_csr_ = false;
+  // A canonical artifact with no cross-rank sibling (one-block DPA4) is
+  // faithful on one rank only; multi-rank dispatch must reject it instead of
+  // silently evaluating each domain without the ghost exchange.
+  bool canonical_single_rank_only_ = false;
   // Two-entry source CSR placeholders that decline the per-atom virial.
   at::Tensor source_row_placeholder_;
   at::Tensor source_order_placeholder_;
@@ -727,6 +731,28 @@ class DeepPotPTExpt : public DeepPotBackend {
       const void* world,
       const torch::Tensor& cell,
       const ptexpt::HaloTensors& halo);
+
+  /**
+   * @brief Run the compact canonical with-comm artifact of this model.
+   *
+   * The eight comm tensors follow the compact ABI, and the positions and the
+   * cells of a model with a long-range module sit between them, so the
+   * descriptor's blocks exchange ghost features across the ranks of the
+   * payload's communicator.
+   */
+  std::vector<torch::Tensor> run_model_canonical_graph_with_comm(
+      const torch::Tensor& atype,
+      const torch::Tensor& n_node,
+      const torch::Tensor& n_local,
+      const torch::Tensor& source,
+      const torch::Tensor& edge_vec,
+      const torch::Tensor& destination_row_ptr,
+      const torch::Tensor& source_row_ptr,
+      const torch::Tensor& source_order,
+      const torch::Tensor& coord,
+      const void* world,
+      const torch::Tensor& cell,
+      const std::vector<at::Tensor>& comm_tensors);
 
   /**
    * @brief Evaluate the long-range module on a rank that holds no node.
