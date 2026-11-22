@@ -9,6 +9,8 @@
 #   WATER_SCAN0_PLUGIN    host libdeepmd_lmp.so
 #   WATER_SCAN0_PLUGIN_KK Kokkos libdeepmd_lmp.so
 #   DP_BACKEND_PLUGIN_PATH / LD_LIBRARY_PATH as for the build
+# Optional:
+#   WATER_SCAN0_RANKS     rank counts to run, default "1 2 4"
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 : "${WATER_SCAN0_LMP_DATA:?}" "${WATER_SCAN0_MODEL:?}"
@@ -37,7 +39,7 @@ run_env() {
 		failed=1
 	fi
 }
-for np in 1 2 4; do
+for np in ${WATER_SCAN0_RANKS:-1 2 4}; do
 	if [[ "$run_kk" == 1 ]]; then
 		kk_ld="${WATER_SCAN0_BACKEND_PLUGIN_KK:-}:${LD_LIBRARY_PATH:-}"
 		# One GPU per rank: the Kokkos binary reads the device LAMMPS was

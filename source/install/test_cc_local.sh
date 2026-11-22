@@ -139,6 +139,9 @@ if [ "${ENABLE_PYTORCH:-TRUE}" == "TRUE" ]; then
 			${INFER_SCRIPT_PATH}/deeppot_dpa4c_long_range*.expected
 		run_generator ${INFER_SCRIPT_PATH}/gen_dpa4c_long_range.py --compressed-only
 		run_generator ${INFER_SCRIPT_PATH}/gen_dpa4c_canonical.py
+		# Two-block DPA4 + SOG: the with-comm canonical sibling of the Kokkos
+		# pair-style regression.
+		run_generator ${INFER_SCRIPT_PATH}/gen_dpa4_2l_canonical.py
 		exit 0
 	fi
 	_FIXTURE_MANIFEST="${INFER_SCRIPT_PATH}/.pt-fixture-cache-manifest"
