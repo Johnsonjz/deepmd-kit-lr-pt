@@ -3674,8 +3674,18 @@ def interaction_kernel_sog() -> list[Argument]:
         "k = 0, ..., `n_gaussian` - 1."
     )
     doc_n_gaussian = "The number of Gaussians of the default widths."
-    doc_base_width = "The width of the first default Gaussian, in Å."
-    doc_width_ratio = "The ratio of consecutive default widths. Must exceed one."
+    doc_base_width = (
+        "The width of the first default Gaussian, in Å. Unset leaves the ladder "
+        "to the config layer, which applies the SOG library rule "
+        "sigma = rcut * 0.3633717409009413 for a bare `sog` kernel, at the "
+        "descriptor's single-hop cutoff whatever its depth; "
+        "set it to use an explicit ladder instead."
+    )
+    doc_width_ratio = (
+        "The ratio of consecutive default widths. Must exceed one. Unset leaves "
+        "the ladder to the config layer, which applies the SOG library rule for "
+        "a bare `sog` kernel; set it to use an explicit ladder instead."
+    )
     doc_trainable = "Whether the amplitudes and widths are trained."
     return [
         Argument(
@@ -3692,19 +3702,20 @@ def interaction_kernel_sog() -> list[Argument]:
             default=None,
             doc=doc_width,
         ),
-        Argument("n_gaussian", int, optional=True, default=12, doc=doc_n_gaussian),
+        # The SOG library default, deepmd.dpmodel.long_range.kernel.SOG_DEFAULT_M.
+        Argument("n_gaussian", int, optional=True, default=7, doc=doc_n_gaussian),
         Argument(
             "base_width",
-            float,
+            [float, type(None)],
             optional=True,
-            default=2.180230445405648,
+            default=None,
             doc=doc_base_width,
         ),
         Argument(
             "width_ratio",
-            float,
+            [float, type(None)],
             optional=True,
-            default=1.6297670882677647,
+            default=None,
             doc=doc_width_ratio,
         ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
@@ -3718,6 +3729,12 @@ def latent_charge_net_args() -> list[Argument]:
     doc_precision = f"The precision of the charge network and kernel parameters, supported options are {list_to_doc(PRECISION_DICT.keys())} Defaults to the precision of the energy fitting."
     doc_trainable = "Whether the parameters of the charge network are trained. A list sets every hidden layer and the output layer separately."
     doc_seed = "Random seed for parameter initialization of the charge network. Defaults to a seed derived from the seed of the energy fitting."
+    doc_bias = (
+        "Initial per-type bias of the latent charge, in units of the elementary "
+        "charge, one value per atom type. It seeds the charge network's output "
+        "bias and remains trainable. The module subtracts the per-frame mean "
+        "charge, so a common offset to every type is a gauge freedom."
+    )
     return [
         Argument("neuron", list[int], optional=True, default=[64, 64], doc=doc_neuron),
         Argument(
@@ -3732,6 +3749,7 @@ def latent_charge_net_args() -> list[Argument]:
             default=True,
             doc=doc_trainable,
         ),
+        Argument("bias_atom_q", list[float], optional=True, default=None, doc=doc_bias),
         Argument("seed", [int, None], optional=True, doc=doc_seed),
     ]
 
@@ -3799,20 +3817,30 @@ def long_range_latent_charge() -> list[Argument]:
         "'pme', the default of a periodic module, by the smooth particle-mesh "
         "Ewald method on a mesh sized by the cells of the batch at "
         "`pme_spacing`, whose cost grows nearly linearly with the system; "
-        "'ragged' over the wave numbers "
-        "of every frame within k_max, enumerated per batch, so that the k axis "
-        "is a dynamic dimension; or 'fixed' over one integer grid shared by "
-        "the frames, sized by the largest cell of the data statistics or by "
-        "`k_grid_bounds`, with the points a frame does not reach masked, so "
-        "that the k axis has a static length (a frame whose cell needs points "
-        "beyond the grid is truncated to it, with a warning). A frozen model "
-        "evaluates every periodic frame on the mesh of its cell, whatever the "
-        "mode. 'fixed' and 'pme' require `periodic: true`."
+        "'ragged' over the wave numbers of every frame within k_max, "
+        "enumerated per batch, so that the k axis is a dynamic dimension; "
+        "'fixed' over one integer grid shared by the frames, sized by the "
+        "largest cell of the data statistics or by `k_grid_bounds`, with the "
+        "points a frame does not reach masked, so that the k axis has a "
+        "static length (a frame whose cell needs points beyond the grid is "
+        "truncated to it, with a warning); or 'ellipsoid' over the integer "
+        "points inside the packed ellipsoid sum_d (n_d / nk_d)^2 <= 1, with "
+        "nk from `k_grid_bounds` or the data statistics, which for an "
+        "orthogonal cell is exactly the wave-number sphere and keeps the k "
+        "axis static. The ellipsoid mode requires orthogonal cells; use "
+        "'pme' or 'ragged' for a tilted cell; or 'metric-ellipsoid' over the "
+        "integer points inside `k_grid_bounds` that satisfy the physical "
+        "|k| <= k_max, which serves a tilted cell at the cost of the sphere "
+        "points rather than the box. A frozen model evaluates every periodic "
+        "frame on the mesh of its cell, whatever the mode. 'fixed', "
+        "'ellipsoid', 'metric-ellipsoid' and 'pme' require `periodic: true`."
     )
     doc_k_grid_bounds = (
         "The per-axis integer bounds [n1, n2, n3] of the fixed k grid, in "
-        "place of the data statistics; only meaningful with "
-        "`k_grid_mode: fixed`."
+        "place of the data statistics; for `k_grid_mode: ellipsoid` they are "
+        "the semi-axes nk of the packed ellipsoid. Only meaningful with "
+        "`k_grid_mode: fixed`, `k_grid_mode: ellipsoid` or "
+        "`k_grid_mode: metric-ellipsoid`."
     )
     doc_decouple_k_grid = (
         "Decouple the wave-number cutoff of a periodic system from the kernel "
@@ -3824,12 +3852,53 @@ def long_range_latent_charge() -> list[Argument]:
     )
     doc_pme_spacing = (
         "The largest spacing of the mesh of a periodic frame, in Angstrom; "
-        "the default is three quarters of the Nyquist spacing of the "
-        "wave-number cutoff, 0.75 pi / k_max. Requires `periodic: true`."
+        "overrides `pme_accuracy`. Requires `periodic: true`."
+    )
+    doc_pme_accuracy = (
+        "Target force-relative grid error of a periodic frame, 1e-4 by "
+        "default. The spacing is solved from the measured error law "
+        "eps = C (Delta / sigma_min)^p, with `C` and `p` per (backend, spline "
+        "order) -- see `deepmd/dpmodel/long_range/grid_rule.py`. The force "
+        "exponent is one lower than the energy's for a merely continuous "
+        "assignment window, which is why CubeS2 order 6 uses p = 5. The law "
+        "alone sizes the grid: it is measured at the target spacings "
+        "themselves, so there is no additional Nyquist ceiling and a high "
+        "spline order improves accuracy at the same grid rather than shrinking "
+        "it. Set `pme_spacing` to override. Requires `periodic: true`."
     )
     doc_pme_order = (
         "The order of the B-splines that spread the charges to the mesh, 8 "
-        "by default. Requires `periodic: true`."
+        "by default; 4 to 12 are accepted, and higher orders are more "
+        "accurate per grid point. The midtown backend has a CubeS2 stencil of "
+        "order 4 or 6 only: `pme_order: 4` selects order 4 and every other "
+        "value selects order 6. Requires `periodic: true`."
+    )
+    doc_mesh_backend = (
+        "The mesh solver of a periodic frame: `bspline` (the smooth "
+        "particle-mesh Ewald sum, the default), `midtown` (the CubeS2 splines "
+        "and cuFFT of the SOG library) or `quads` (the separable QuadS stencil "
+        "of the same solver). The midtown and quads backends serve the SOG "
+        "kernel and one channel; they evaluate order 6 or 4 independently of "
+        "`pme_order`."
+    )
+    doc_force_mode = (
+        "How the periodic force is differentiated on the mesh: `ad` (weight "
+        "differentiation, the default) gathers the derivatives of the "
+        "assignment weights, so the force is exactly the gradient of the mesh "
+        "energy; `ik` differentiates the potential in Fourier space, one order "
+        "more accurate in the mesh spacing but at three extra inverse "
+        "transforms and without the exact-gradient property. `ik` requires "
+        "`mesh_backend: midtown` or `mesh_backend: quads`. Requires "
+        "`periodic: true`."
+    )
+    doc_force_mode = (
+        "How the periodic force is differentiated on the mesh: `ad` (weight "
+        "differentiation, the default) gathers the derivatives of the "
+        "assignment weights, so the force is exactly the gradient of the mesh "
+        "energy; `ik` differentiates the potential in Fourier space, one order "
+        "more accurate in the mesh spacing but at three extra inverse "
+        "transforms and without the exact-gradient property. `ik` requires "
+        "`mesh_backend: midtown`. Requires `periodic: true`."
     )
     return [
         Argument("channels", int, optional=True, default=1, doc=doc_channels),
@@ -3879,8 +3948,20 @@ def long_range_latent_charge() -> list[Argument]:
             optional=True,
             default=None,
             doc=doc_k_grid_mode,
-            extra_check=lambda x: x in (None, "ragged", "fixed", "pme"),
-            extra_check_errmsg="must be 'ragged', 'fixed' or 'pme'",
+            extra_check=lambda x: (
+                x
+                in (
+                    None,
+                    "ragged",
+                    "fixed",
+                    "pme",
+                    "ellipsoid",
+                    "metric-ellipsoid",
+                )
+            ),
+            extra_check_errmsg=(
+                "must be 'ragged', 'fixed', 'pme', 'ellipsoid' or 'metric-ellipsoid'"
+            ),
         ),
         Argument(
             "k_grid_bounds",
@@ -3904,22 +3985,46 @@ def long_range_latent_charge() -> list[Argument]:
             doc=doc_pme_spacing,
         ),
         Argument(
+            "pme_accuracy",
+            [float, None],
+            optional=True,
+            default=None,
+            doc=doc_pme_accuracy,
+        ),
+        Argument(
             "pme_order",
             [int, None],
             optional=True,
             default=None,
             doc=doc_pme_order,
         ),
+        Argument(
+            "mesh_backend",
+            str,
+            optional=True,
+            default="bspline",
+            doc=doc_mesh_backend,
+            extra_check=lambda x: x in ("bspline", "midtown", "quads"),
+            extra_check_errmsg="must be 'bspline', 'midtown' or 'quads'",
+        ),
+        Argument(
+            "force_mode",
+            str,
+            optional=True,
+            default="ad",
+            doc=doc_force_mode,
+            extra_check=lambda x: x in ("ad", "ik"),
+            extra_check_errmsg="must be 'ad' or 'ik'",
+        ),
     ]
 
 
-def long_range_args() -> Argument:
+def long_range_args(backends: tuple[str, ...] = ("pt_expt",)) -> Argument:
     doc_long_range = (
         "A long-range module added to the atomic energy of the energy fitting. "
         "It reads the same descriptor and is evaluated on complete systems: "
         "non-periodic ones directly, periodic ones in reciprocal space when "
-        "the module serves them. Currently validated with the DPA4C "
-        "descriptor."
+        "the module serves them. Validated with the DPA4C and DPA4 descriptors."
     )
     return Argument(
         "long_range",
@@ -3933,7 +4038,7 @@ def long_range_args() -> Argument:
             )
         ],
         optional=True,
-        doc=supported_backends("pt_expt") + doc_long_range,
+        doc=supported_backends(*backends) + doc_long_range,
     )
 
 
@@ -4463,6 +4568,7 @@ def sezm_model_args() -> Argument:
                 default={},
                 doc=supported_backends("pt", "pt_expt") + doc_info,
             ),
+            long_range_args(("pt", "pt_expt")),
             *_bridging_method_args(),
             Argument(
                 "lora",
@@ -5046,6 +5152,85 @@ def optimizer_adam() -> list[Argument]:
             default=0.0,
             doc=supported_backends("pt", "pd") + doc_weight_decay,
         ),
+        Argument(
+            "long_range_kernel_lr_scale",
+            float,
+            optional=True,
+            default=1.0,
+            doc=supported_backends("pt_expt")
+            + "Multiplier on the learning rate of the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths). 1.0 keeps the global rate; "
+            "0.3 trains the kernel three times slower than the rest of the model.",
+        ),
+        Argument(
+            "long_range_kernel_amp_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Lower bound applied to the SOG amplitudes after every optimizer step. "
+            "The default leaves them unconstrained; a small positive value keeps the "
+            "kernel a positive sum of Gaussians.",
+        ),
+        Argument(
+            "long_range_kernel_width_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Lower bound (in Angstrom) applied to the SOG widths after every "
+            "optimizer step. The narrowest width sets the wave-number cutoff, so a "
+            "floor here keeps the k grid from being outgrown while the kernel "
+            "trains. 0 leaves the widths unconstrained.",
+        ),
+        Argument(
+            "long_range_kernel_lr_scale_start",
+            [float, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Initial multiplier on the long-range kernel learning rate, ramped "
+            "geometrically to `long_range_kernel_lr_scale`. Unset keeps the scale "
+            "constant. Changing a learning rate leaves the compiled graph untouched, "
+            "so this is how the kernel is switched from effectively frozen to "
+            "trainable without changing `torch.compile`.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_frac",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Fraction of the training over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). 0 disables it.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_steps",
+            [int, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Absolute number of steps over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). Takes precedence "
+            "over `long_range_kernel_lr_ramp_frac` when set; unset falls back to the "
+            "fraction of the total step budget.",
+        ),
+        Argument(
+            "long_range_kernel_train_start_step",
+            int,
+            optional=True,
+            default=0,
+            doc=supported_backends("pt_expt")
+            + "Absolute step index at which the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths) become trainable; before "
+            "this step they are held fixed. Combined with "
+            "`long_range_kernel_lr_ramp_steps` the kernel first freezes, then warms "
+            "its learning rate up from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale`. 0 (the default) trains the kernel from "
+            "the first step.",
+        ),
     ]
 
 
@@ -5086,6 +5271,73 @@ def optimizer_adamw() -> list[Argument]:
             optional=True,
             default=0.001,
             doc=supported_backends("pt", "pd", "pt_expt", "tf2") + doc_weight_decay,
+        ),
+        Argument(
+            "long_range_kernel_lr_scale",
+            float,
+            optional=True,
+            default=1.0,
+            doc="Multiplier on the learning rate of the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths).",
+        ),
+        Argument(
+            "long_range_kernel_amp_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc="Lower bound applied to the SOG amplitudes after every optimizer step.",
+        ),
+        Argument(
+            "long_range_kernel_width_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc="Lower bound (in Angstrom) applied to the SOG widths after every "
+            "optimizer step, keeping the wave-number cutoff inside the k grid.",
+        ),
+        Argument(
+            "long_range_kernel_lr_scale_start",
+            [float, type(None)],
+            optional=True,
+            default=None,
+            doc="Initial multiplier on the long-range kernel learning rate, ramped "
+            "geometrically to `long_range_kernel_lr_scale`. Unset keeps the scale "
+            "constant. Changing a learning rate leaves the compiled graph untouched, "
+            "so this is how the kernel is switched from effectively frozen to "
+            "trainable without changing `torch.compile`.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_frac",
+            float,
+            optional=True,
+            default=0.0,
+            doc="Fraction of the training over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). 0 disables it.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_steps",
+            [int, type(None)],
+            optional=True,
+            default=None,
+            doc="Absolute number of steps over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). Takes precedence "
+            "over `long_range_kernel_lr_ramp_frac` when set; unset falls back to the "
+            "fraction of the total step budget.",
+        ),
+        Argument(
+            "long_range_kernel_train_start_step",
+            int,
+            optional=True,
+            default=0,
+            doc="Absolute step index at which the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths) become trainable; before "
+            "this step they are held fixed. Combined with "
+            "`long_range_kernel_lr_ramp_steps` the kernel first freezes, then warms "
+            "its learning rate up from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale`. 0 (the default) trains the kernel from "
+            "the first step.",
         ),
     ]
 
@@ -5313,6 +5565,85 @@ def optimizer_hybrid_muon() -> list[Argument]:
             "When enabled, HybridMuon computes momentum-gradient alignment "
             "per Muon block, applies EMA smoothing, and rescales Muon updates "
             "to improve stability. Adam/AdamW routes are unchanged.",
+        ),
+        Argument(
+            "long_range_kernel_lr_scale",
+            float,
+            optional=True,
+            default=1.0,
+            doc=supported_backends("pt_expt")
+            + "Multiplier on the learning rate of the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths). 1.0 keeps the global rate; "
+            "0.3 trains the kernel three times slower than the rest of the model.",
+        ),
+        Argument(
+            "long_range_kernel_amp_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Lower bound applied to the SOG amplitudes after every optimizer step. "
+            "The default leaves them unconstrained; a small positive value keeps the "
+            "kernel a positive sum of Gaussians.",
+        ),
+        Argument(
+            "long_range_kernel_width_floor",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Lower bound (in Angstrom) applied to the SOG widths after every "
+            "optimizer step. The narrowest width sets the wave-number cutoff, so a "
+            "floor here keeps the k grid from being outgrown while the kernel "
+            "trains. 0 leaves the widths unconstrained.",
+        ),
+        Argument(
+            "long_range_kernel_lr_scale_start",
+            [float, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Initial multiplier on the long-range kernel learning rate, ramped "
+            "geometrically to `long_range_kernel_lr_scale`. Unset keeps the scale "
+            "constant. Changing a learning rate leaves the compiled graph untouched, "
+            "so this is how the kernel is switched from effectively frozen to "
+            "trainable without changing `torch.compile`.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_frac",
+            float,
+            optional=True,
+            default=0.0,
+            doc=supported_backends("pt_expt")
+            + "Fraction of the training over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). 0 disables it.",
+        ),
+        Argument(
+            "long_range_kernel_lr_ramp_steps",
+            [int, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Absolute number of steps over which the long-range kernel learning "
+            "rate ramps from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale` (geometric, in decades). Takes precedence "
+            "over `long_range_kernel_lr_ramp_frac` when set; unset falls back to the "
+            "fraction of the total step budget.",
+        ),
+        Argument(
+            "long_range_kernel_train_start_step",
+            int,
+            optional=True,
+            default=0,
+            doc=supported_backends("pt_expt")
+            + "Absolute step index at which the long-range interaction kernel "
+            "parameters (the SOG amplitudes and widths) become trainable; before "
+            "this step they are held fixed. Combined with "
+            "`long_range_kernel_lr_ramp_steps` the kernel first freezes, then warms "
+            "its learning rate up from `long_range_kernel_lr_scale_start` to "
+            "`long_range_kernel_lr_scale`. 0 (the default) trains the kernel from "
+            "the first step.",
         ),
     ]
 

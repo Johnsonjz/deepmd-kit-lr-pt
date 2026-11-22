@@ -274,6 +274,8 @@ if(USE_CUDA_TOOLKIT AND DEEPMD_TORCH_HAS_CUDA)
     border_exchange.cc
     long_range/latent_charge_sum.cu
     long_range/mesh_sum.cu
+    long_range/midtown_sum.cu
+    long_range/midtown/sog_gpu.cu
     dpa1_graph_energy_force.cu
     dpa4/so2_conv.cu
     ${DPA4_SO2_CONV_KERNEL_SRC}

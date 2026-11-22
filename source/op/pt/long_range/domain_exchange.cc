@@ -49,6 +49,35 @@ int domain_count(const torch::Tensor& communicator) {
 #endif
 }
 
+int domain_rank(const torch::Tensor& communicator) {
+  if (communicator_address(communicator, kOperator) == 0) {
+    return 0;
+  }
+#ifdef USE_MPI
+  int rank = 0;
+  MPI_Comm_rank(communicator_handle(communicator, kOperator), &rank);
+  return rank;
+#else
+  TORCH_CHECK(false,
+              "domain_rank: an evaluation across MPI ranks requires "
+              "DeePMD-kit built with MPI");
+#endif
+}
+
+void broadcast_bytes(const torch::Tensor& communicator, void* data, int count) {
+#ifdef USE_MPI
+  if (communicator_address(communicator, kOperator) == 0) {
+    return;
+  }
+  MPI_Bcast(data, count, MPI_BYTE, 0,
+            communicator_handle(communicator, kOperator));
+#else
+  TORCH_CHECK(false,
+              "broadcast_bytes: an evaluation across MPI ranks requires "
+              "DeePMD-kit built with MPI");
+#endif
+}
+
 std::pair<torch::Tensor, std::int64_t> gather_domain_rows(
     const torch::Tensor& communicator, const torch::Tensor& rows) {
 #ifdef USE_MPI
@@ -127,6 +156,13 @@ std::pair<torch::Tensor, std::int64_t> gather_domain_rows(
 torch::Tensor sum_over_domains(const torch::Tensor& communicator,
                                const torch::Tensor& values) {
 #ifdef USE_MPI
+  // A zero address is the single-domain caller (no MPI communicator): the sum
+  // over domains is the local values alone.  Dereferencing the handle here
+  // would read address zero and crash, which is exactly what the single-rank
+  // distributed solve hits.
+  if (communicator_address(communicator, kOperator) == 0) {
+    return values;
+  }
   TORCH_CHECK(values.dim() == 1 && values.scalar_type() == torch::kFloat64,
               "sum_over_domains: values must be a float64 vector");
   const MPI_Comm comm = communicator_handle(communicator, kOperator);
@@ -149,6 +185,39 @@ torch::Tensor sum_over_domains(const torch::Tensor& communicator,
   TORCH_CHECK(false,
               "sum_over_domains: an evaluation across MPI ranks requires "
               "DeePMD-kit built with MPI");
+#endif
+}
+
+torch::Tensor sum_over_domains_f32(const torch::Tensor& communicator,
+                                   const torch::Tensor& values) {
+#ifdef USE_MPI
+  // Single-domain caller: the sum over domains is the local values (see
+  // sum_over_domains).  A null handle must not be dereferenced.
+  if (communicator_address(communicator, kOperator) == 0) {
+    return values;
+  }
+  TORCH_CHECK(values.dim() == 1 && values.scalar_type() == torch::kFloat32,
+              "sum_over_domains_f32: values must be a float32 vector");
+  const MPI_Comm comm = communicator_handle(communicator, kOperator);
+  const int count = static_cast<int>(values.numel());
+  if (values.is_cuda() && mpi_reads_device_memory()) {
+    auto total = torch::empty_like(values.contiguous());
+    at::cuda::getCurrentCUDAStream().synchronize();
+    MPI_Allreduce(values.contiguous().data_ptr<float>(),
+                  total.data_ptr<float>(), count, MPI_FLOAT, MPI_SUM, comm);
+    return total;
+  }
+  const auto host_options =
+      torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true);
+  const auto local = values.to(torch::kCPU).contiguous();
+  auto total = torch::empty({values.numel()}, host_options);
+  MPI_Allreduce(local.data_ptr<float>(), total.data_ptr<float>(), count,
+                MPI_FLOAT, MPI_SUM, comm);
+  return total.to(values.device(), /*non_blocking=*/true);
+#else
+  TORCH_CHECK(false,
+              "sum_over_domains_f32: an evaluation across MPI ranks "
+              "requires DeePMD-kit built with MPI");
 #endif
 }
 

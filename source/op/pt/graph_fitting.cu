@@ -668,6 +668,8 @@ struct FusedNetwork {
   double* e;                      //!< (nodes,) atomic energy.
   float* d_x;                     //!< (nodes, din) input cotangent, which
                                   //!< may take the place of ``x``.
+  const float* add_jacobian;      //!< optional (nodes, din) J to fold in.
+  const float* add_v;             //!< optional (nodes,) v for J * v.
   long nodes;
   int din;
   int n_layer;
@@ -1335,7 +1337,8 @@ __global__ void __launch_bounds__(S::threads, S::min_blocks)
         exchange.acquire();
       }
       const bool vector_output =
-          p.din % 4 == 0 && reinterpret_cast<std::uintptr_t>(p.d_x) % 16 == 0;
+          p.d_x != nullptr && p.din % 4 == 0 &&
+          reinterpret_cast<std::uintptr_t>(p.d_x) % 16 == 0;
 #pragma unroll
       for (int i = 0; i < S::tm; ++i) {
         const int r = accumulator_row<S>(o, i);
@@ -1363,8 +1366,14 @@ __global__ void __launch_bounds__(S::threads, S::min_blocks)
             if (r < rows) {
               store4(p.saved + (l - 1) * sheet + mc * S::width + n, v);
             }
-          } else if (r < rows && n < p.din) {
+          } else if (p.d_x != nullptr && r < rows && n < p.din) {
             float* out = p.d_x + mc * p.din + n;
+            if (p.add_jacobian != nullptr) {
+              const float vv = p.add_v[mc];
+              const float* jrow = p.add_jacobian + mc * p.din + n;
+              v = make_float4(v.x + jrow[0] * vv, v.y + jrow[1] * vv,
+                              v.z + jrow[2] * vv, v.w + jrow[3] * vv);
+            }
             if (vector_output) {
               store4(out, v);
             } else {
@@ -2461,7 +2470,9 @@ void fitting_energy_gradient_range(cudaStream_t stream,
                                    float* saved,
                                    double* e,
                                    float* d_x,
-                                   int64_t route) {
+                                   int64_t route,
+                                   const float* add_jacobian,
+                                   const float* add_v) {
   check_energy_parameters(ws, bs, resnets, w_head, b_head, bias_atom_e);
   check_fused_plan(plan, ws);
   FusedNetwork p{};
@@ -2479,6 +2490,8 @@ void fitting_energy_gradient_range(cudaStream_t stream,
   p.saved = saved;
   p.e = e;
   p.d_x = d_x;
+  p.add_jacobian = add_jacobian;
+  p.add_v = add_v;
   p.nodes = run_nodes;
   p.din = (int)input_width;
   p.n_layer = plan.n_layer;

@@ -205,7 +205,11 @@ def dpa4c_canonical_compress_long_range_energy_force(
         kernel,
         channel,
         COULOMB_CONSTANT,
-        long_range.pme_order,
+        # The midtown meshes carry a fixed 4- or 6-node stencil (CubeS2 or
+        # QuadS), never the B-spline default of 8.
+        (4 if long_range.pme_order == 4 else 6)
+        if long_range.mesh_backend in ("midtown", "quads")
+        else long_range.pme_order,
         long_range.mesh_spacing() if long_range.periodic else 1.0,
         # No table is passed as None rather than as an empty list: the
         # AOTInductor proxy executor of torch 2.13 and earlier hands a
@@ -217,6 +221,14 @@ def dpa4c_canonical_compress_long_range_energy_force(
         [float(cutoff) for cutoff in descriptor.block_rcut[1:]]
         if descriptor.attentions
         else None,
+        # 0 is the B-spline mesh, 1 the CubeS2 midtown mesh, 2 the QuadS mesh;
+        # the default is left explicit here because the operator's own default
+        # keeps older graphs valid.
+        # Two small enums travel in one integer: the operator schema is at the
+        # 64-argument limit of the dispatcher. Low byte is the mesh backend,
+        # next byte the force mode (0 = AD/weights, 1 = ik/Fourier).
+        {"bspline": 0, "midtown": 1, "quads": 2}[long_range.mesh_backend]
+        | ({"ad": 0, "ik": 1}[long_range.force_mode] << 8),
     )
 
 

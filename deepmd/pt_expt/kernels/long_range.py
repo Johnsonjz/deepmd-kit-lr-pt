@@ -282,8 +282,20 @@ def _reference(
     prefactor: float,
     order: int,
     spacing: float,
+    mesh_backend: int = 0,
+    force_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate the operator in float64, over the explicit pairs or the meshes."""
+    if mesh_backend != 0:
+        raise NotImplementedError(
+            "the CPU reference evaluates the B-spline mesh; the midtown and "
+            "quads mesh backends are CUDA only"
+        )
+    if force_mode != 0:
+        raise NotImplementedError(
+            "the CPU reference differentiates by the assignment weights "
+            "(`force_mode='ad'`); the Fourier (`ik`) force is CUDA only"
+        )
     if int(communicator.reshape(-1)[0]) != 0:
         raise NotImplementedError(
             "the CPU reference of latent_charge_sum evaluates a single domain; "
@@ -349,6 +361,8 @@ def _fake(
     prefactor: float,
     order: int,
     spacing: float,
+    mesh_backend: int = 0,
+    force_mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n = coord.shape[0]
     return (
@@ -378,6 +392,36 @@ def ensure_registered() -> None:
         _register()
 
 
+_MESH_BACKEND_CODES = {"bspline": 0, "midtown": 1, "quads": 2}
+"""The mesh backend of a periodic call, as the operator's integer code."""
+
+_FORCE_MODE_CODES = {"ad": 0, "ik": 1}
+"""How the periodic force is differentiated, as the operator's integer code:
+``ad`` gathers the weight derivatives, ``ik`` differentiates in Fourier space."""
+
+
+def _kernel_version(kernel: Any) -> tuple:
+    """A cheap version stamp of the trainable parameters of a kernel.
+
+    The in-place version counter catches every optimiser step; the storage
+    address catches a parameter that was replaced outright, whose counter
+    would restart at zero and could otherwise collide with a cached stamp.
+    """
+    try:
+        stamp: list[int] = []
+        for name in ("log_alpha", "log_width", "amplitude"):
+            value = getattr(kernel, name, None)
+            if value is None:
+                stamp.append(-1)
+                stamp.append(0)
+            else:
+                stamp.append(int(getattr(value, "_version", -1)))
+                stamp.append(int(value.data_ptr()))
+        return tuple(stamp)
+    except Exception:
+        return ()
+
+
 def latent_charge_sum(
     coord: torch.Tensor,
     charge: torch.Tensor,
@@ -391,6 +435,8 @@ def latent_charge_sum(
     box: torch.Tensor | None = None,
     order: int = 8,
     spacing: float = 1.0,
+    mesh_backend: str = "bspline",
+    force_mode: str = "ad",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Energy, charge gradient, force and virial of the charges of complete frames.
 
@@ -440,6 +486,19 @@ def latent_charge_sum(
         The order of the B-splines of the mesh, at most :data:`MAX_ORDER`.
     spacing
         The largest mesh spacing, in Å.
+    mesh_backend
+        ``"bspline"`` (default) for the smooth particle-mesh Ewald sum, or
+        ``"midtown"`` for the CubeS2 splines and cuFFT of the SOG library,
+        which serves the SOG kernel, one channel, orthogonal cells and a
+        single rank; ``"quads"`` selects the separable QuadS stencil of the
+        same solver.
+    force_mode
+        ``"ad"`` (default) gathers the weight derivatives on the mesh, whose
+        force equals ``-dE_mesh/dr`` exactly; ``"ik"`` differentiates in
+        Fourier space instead (three inverse transforms of ``i·k·φ̂``), one
+        order more accurate in the mesh spacing but not the exact mesh
+        gradient.  ``"ik"`` requires ``mesh_backend="midtown"`` or
+        ``"quads"``.
 
     Returns
     -------
@@ -460,21 +519,95 @@ def latent_charge_sum(
         Per-frame virial at fixed charges with shape ``(F, 9)`` in eV.
     """
     ensure_registered()
-    code, coefficient = kernel_operator_arguments(kernel)
+    # The kernel coefficients are rebuilt only when the kernel parameters
+    # change: the conversion allocates and copies on every call otherwise.
+    cached = getattr(kernel, "_operator_arguments_cache", None)
+    if cached is not None:
+        version, code, coefficient = cached
+        if version == _kernel_version(kernel):
+            pass
+        else:
+            code, coefficient = kernel_operator_arguments(kernel)
+            kernel._operator_arguments_cache = (
+                _kernel_version(kernel),
+                code,
+                coefficient,
+            )
+            # The device copy belongs to the old coefficients.
+            kernel._operator_coefficient_device = None
+    else:
+        code, coefficient = kernel_operator_arguments(kernel)
+        kernel._operator_arguments_cache = (
+            _kernel_version(kernel),
+            code,
+            coefficient,
+        )
+    try:
+        backend_code = _MESH_BACKEND_CODES[mesh_backend]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown mesh backend {mesh_backend!r}; expected 'bspline', "
+            "'midtown' or 'quads'"
+        ) from exc
+    try:
+        force_code = _FORCE_MODE_CODES[force_mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown force mode {force_mode!r}; expected 'ad' or 'ik'"
+        ) from exc
+    if force_code != 0 and backend_code == 0:
+        raise ValueError(
+            "force_mode='ik' (Fourier differentiation) needs a midtown or "
+            "quads mesh backend"
+        )
     if communicator is None:
         communicator = torch.zeros(1, dtype=torch.int64, device="cpu")
-    return torch.ops.deepmd.latent_charge_sum(
+    if backend_code != 0:
+        # The midtown backend reads the coefficients on the host, so they stay
+        # on the CPU: moving them to the device would add a copy per call and
+        # force the operator to synchronize to read them back.
+        coefficient_arg = coefficient
+    else:
+        # The B-spline backend evaluates them inside its device kernels.  The
+        # copy is cached on the kernel: rebuilding it every call allocates and
+        # uploads on each step.
+        device = coord.device
+        cached_device = (
+            coefficient
+            if coefficient.device == device
+            else getattr(kernel, "_operator_coefficient_device", None)
+        )
+        if (
+            cached_device is None
+            or cached_device.device != device
+            or cached_device.shape != coefficient.shape
+        ):
+            cached_device = coefficient.to(device)
+            kernel._operator_coefficient_device = cached_device
+        coefficient_arg = cached_device
+    args = [
         coord,
         charge,
         node_mask,
         n_node_per_frame,
         total_charge,
         box,
-        coefficient.to(coord.device),
+        coefficient_arg,
         communicator,
         code,
         int(channel),
         float(prefactor),
         int(order),
         float(spacing),
-    )
+    ]
+    if backend_code != 0:
+        # The operator takes a code rather than a string: a string argument to
+        # a custom op does not survive the AOTInductor freeze.  The default
+        # backend stays implicit so a frozen graph keeps its argument count.
+        args.append(backend_code)
+    if force_code != 0:
+        # The default force mode stays implicit too; it is only ever non-zero
+        # together with backend_code, so the argument lands in the force_mode
+        # slot.
+        args.append(force_code)
+    return torch.ops.deepmd.latent_charge_sum(*args)

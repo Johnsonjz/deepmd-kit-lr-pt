@@ -174,7 +174,7 @@ TORCH_LIBRARY_FRAGMENT(deepmd, library) {
       "float prefactor, int order, float spacing, "
       "int[]? fitting_routes=None, int[]? charge_fitting_routes=None, "
       "Tensor? blocks=None, Tensor? halo_send=None, Tensor? halo_swaps=None, "
-      "float[]? block_rcut=None) "
+      "float[]? block_rcut=None, int mesh_mode=0) "
       "-> (Tensor energy, Tensor atom_energy, Tensor force, Tensor virial, "
       "Tensor atom_virial, Tensor mask)");
 }

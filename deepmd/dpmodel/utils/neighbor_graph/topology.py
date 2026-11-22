@@ -40,7 +40,9 @@ from .reciprocal_graph import (
     PME_MESH,
     KGrid,
     MeshGrid,
+    build_ellipsoid_k_grid,
     build_fixed_k_grid,
+    build_metric_ellipsoid_k_grid,
     build_k_grid,
     build_mesh_grid,
     check_periodic_cells,
@@ -87,6 +89,12 @@ def _build_reciprocal(
     check_periodic_cells(box)
     if name == PME_MESH:
         return build_mesh_grid(box, params["spacing"], coord)
+    if "nk" in params:
+        return build_ellipsoid_k_grid(box, params["k_max"], coord, n_node, params["nk"])
+    if "metric_bounds" in params:
+        return build_metric_ellipsoid_k_grid(
+            box, params["k_max"], coord, n_node, params["metric_bounds"]
+        )
     if "bounds" in params:
         return build_fixed_k_grid(box, params["bounds"], params["k_max"], coord, n_node)
     return build_k_grid(box, params["k_max"], coord, n_node)

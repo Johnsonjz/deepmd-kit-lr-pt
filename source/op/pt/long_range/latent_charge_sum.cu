@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 #include "charge_sum.h"
 #include "domain_exchange.h"
@@ -42,6 +44,8 @@ struct Evaluation {
   int64_t order;
   double spacing;
   bool periodic;
+  int64_t mesh_backend;
+  int64_t force_mode;
 
   ChargeSumOutputs operator()(const torch::Tensor& coord,
                               const torch::Tensor& charge,
@@ -64,6 +68,19 @@ struct Evaluation {
         "latent_charge_sum: owners other than every node lie in one "
         "frame");
     if (periodic) {
+      if (mesh_backend == 1 || mesh_backend == 2) {
+        return deepmd::long_range::midtown_sum(
+            coord, charge, node_mask, n_node_per_frame, total_charge, box,
+            coefficient, kernel, channel, prefactor, order, spacing,
+            owner_begin, owner_count, communicator, force_mode,
+            /*quads=*/mesh_backend == 2);
+      }
+      TORCH_CHECK(mesh_backend == 0,
+                  "latent_charge_sum: unknown mesh backend code ", mesh_backend,
+                  "; expected 0 (bspline), 1 (midtown) or 2 (quads)");
+      TORCH_CHECK(force_mode == 0,
+                  "latent_charge_sum: force_mode != 0 (ik) needs the midtown "
+                  "backend");
       return deepmd::long_range::mesh_sum(
           coord, charge, node_mask, n_node_per_frame, total_charge, box,
           coefficient, kernel, channel, prefactor, order, spacing, owner_begin,
@@ -166,18 +183,26 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
                                    int64_t channel,
                                    double prefactor,
                                    int64_t order,
-                                   double spacing) {
+                                   double spacing,
+                                   int64_t mesh_backend,
+                                   int64_t force_mode) {
+  // Both midtown families (CubeS2 = 1, QuadS = 2) read the kernel coefficients
+  // on the host, so they take them as a CPU tensor and never synchronize to get
+  // them.  The B-spline backend evaluates them inside its device kernels and
+  // needs them on the device.
+  const bool coefficients_on_host = mesh_backend != 0;
   TORCH_CHECK(coord.is_cuda() && charge.is_cuda() && node_mask.is_cuda() &&
                   n_node_per_frame.is_cuda() && total_charge.is_cuda() &&
-                  coefficient.is_cuda(),
+                  (coefficient.is_cuda() || coefficients_on_host),
               "latent_charge_sum: inputs must be CUDA tensors, except box and "
               "communicator");
-  TORCH_CHECK(charge.device() == coord.device() &&
-                  node_mask.device() == coord.device() &&
-                  n_node_per_frame.device() == coord.device() &&
-                  total_charge.device() == coord.device() &&
-                  coefficient.device() == coord.device(),
-              "latent_charge_sum: inputs must share one device");
+  TORCH_CHECK(
+      charge.device() == coord.device() &&
+          node_mask.device() == coord.device() &&
+          n_node_per_frame.device() == coord.device() &&
+          total_charge.device() == coord.device() &&
+          (coefficient.device() == coord.device() || coefficients_on_host),
+      "latent_charge_sum: inputs must share one device");
   TORCH_CHECK(coord.dim() == 2 && coord.size(1) == 3 &&
                   coord.scalar_type() == torch::kFloat64,
               "latent_charge_sum: coord must be float64 with shape (N, 3)");
@@ -235,9 +260,105 @@ ChargeSumOutputs latent_charge_sum(torch::Tensor coord,
   const bool periodic = periodic_frames(box);
   const torch::Tensor cells = periodic ? box->contiguous() : torch::Tensor();
   coefficient = coefficient.contiguous();
-  const Evaluation evaluation{cells,     coefficient, kernel,  channel,
-                              prefactor, order,       spacing, periodic};
-  if (deepmd::long_range::domain_count(communicator) == 1) {
+  const Evaluation evaluation{cells,        coefficient, kernel,  channel,
+                              prefactor,    order,       spacing, periodic,
+                              mesh_backend, force_mode};
+  const int64_t ranks = deepmd::long_range::domain_count(communicator);
+  // The z-slab distributed solve runs behind an opt-in switch.  It now serves
+  // every mesh backend: CubeS2 (1), QuadS (2) and the cardinal B-spline (0),
+  // all through the same two-transpose FFT pipeline, each with its own
+  // deconvolution (variance subtraction, exact separable window, or the
+  // B-spline assignment factor) built by build_green_slab_half.
+  const char* slab_env = std::getenv("SOG_MIDTOWN_SLAB");
+  bool slab_ok = slab_env != nullptr && std::atoi(slab_env) != 0 &&
+                 (mesh_backend == 0 || mesh_backend == 1 || mesh_backend == 2);
+  if (slab_ok && force_mode != 0) {
+    // The distributed solve carries the ik force mode behind its own opt-in
+    // switch: ik needs one extra transpose + inverse z per Cartesian component,
+    // ~4x the collective traffic of the AD solve and one extra pencil and
+    // brick, so it must not follow a SOG_MIDTOWN_SLAB that a bench harness or
+    // a container profile set process-wide.
+    const char* ik_env = std::getenv("SOG_SLAB_IK");
+    const bool ik_slab = ik_env != nullptr && std::atoi(ik_env) != 0;
+    if (!ik_slab) {
+      // Falling back to the replicated solve is a PARALLELISM change, not a
+      // physics one -- the replicated solve evaluates the same force law -- so
+      // warn and continue instead of aborting an MD run from an env var.  Each
+      // rank then holds the full mesh, which is why SOG_SLAB_STRICT=1 restores
+      // the hard error for batch runs that must not silently take the more
+      // memory-hungry path.
+      const char* strict = std::getenv("SOG_SLAB_STRICT");
+      TORCH_CHECK(
+          strict == nullptr || std::atoi(strict) == 0,
+          "latent_charge_sum: force_mode != 0 (ik) on the distributed mesh "
+          "needs SOG_SLAB_IK=1; unset SOG_MIDTOWN_SLAB (or unset "
+          "SOG_SLAB_STRICT to fall back automatically)");
+      static bool warned_ik_slab = false;
+      if (!warned_ik_slab) {
+        warned_ik_slab = true;
+        TORCH_WARN(
+            "SOG_MIDTOWN_SLAB is set but force_mode != 0 (ik) and "
+            "SOG_SLAB_IK is not: this call runs the REPLICATED solve, so every "
+            "rank holds the full mesh. Set SOG_SLAB_IK=1 to run ik on the "
+            "distributed mesh. The force law is identical either way.");
+      }
+      slab_ok = false;
+    } else {
+      TORCH_CHECK(mesh_backend != 0,
+                  "latent_charge_sum: the ik force mode is defined for the "
+                  "midtown and quads mesh backends only, not the B-spline");
+    }
+  }
+  if (slab_ok) {
+    TORCH_CHECK(periodic, "the slab backend needs periodic frames");
+    // The B-spline slab builds its green table from the SOG bands, so it serves
+    // the SOG kernel only (the replicated mesh_sum carries both LES and SOG).
+    TORCH_CHECK(mesh_backend != 0 || kernel == kSog,
+                "the slab B-spline backend evaluates the SOG kernel only");
+    return deepmd::long_range::midtown_sum_slab(
+        coord, charge, node_mask, n_node_per_frame, total_charge, cells,
+        coefficient, kernel, channel, prefactor, order, spacing, &communicator,
+        /*quads=*/mesh_backend == 2,
+        /*bspline=*/mesh_backend == 0, force_mode);
+  }
+  const char* dist_env = std::getenv("SOG_MIDTOWN_DIST");
+  const bool want_dist = dist_env != nullptr && std::atoi(dist_env) != 0;
+  // The local-spread distributed solve runs `sog_gpu_spread_f`/`solve_f`, whose
+  // stencils are hardwired to CubeS2 order 6; it is not spline-parametric, so
+  // it stays on the `midtown` backend and QuadS falls through to the replicated
+  // (gathered) path rather than being served with the wrong stencil.
+  if (mesh_backend == 1 && ranks > 1 && want_dist && force_mode == 0) {
+    // The midtown mesh spreads this rank's atoms itself and sums the meshes
+    // over the ranks, so it takes the caller's local arrays rather than the
+    // gathered frame.
+    TORCH_CHECK(periodic,
+                "the distributed midtown backend needs periodic frames");
+    return deepmd::long_range::midtown_sum_local(
+        coord, charge, node_mask, n_node_per_frame, total_charge, cells,
+        coefficient, kernel, channel, prefactor, order, spacing, &communicator);
+  }
+  if (mesh_backend == 1 && ranks > 1 && want_dist && force_mode != 0) {
+    // Same fallback as the slab branch above, but this one has no ik path at
+    // all: the local-spread stencils are hardwired to CubeS2 order 6 and have
+    // no Fourier-differentiated gather.
+    const char* strict = std::getenv("SOG_SLAB_STRICT");
+    TORCH_CHECK(
+        strict == nullptr || std::atoi(strict) == 0,
+        "latent_charge_sum: force_mode != 0 (ik) is not implemented on the "
+        "local-spread distributed solve; unset SOG_MIDTOWN_DIST (or unset "
+        "SOG_SLAB_STRICT to fall back automatically)");
+    static bool warned_ik_dist = false;
+    if (!warned_ik_dist) {
+      warned_ik_dist = true;
+      TORCH_WARN(
+          "SOG_MIDTOWN_DIST is set but force_mode != 0 (ik): the local-spread "
+          "solve has no Fourier-differentiated force, so this call runs the "
+          "replicated solve. The force law is identical; every rank now holds "
+          "the full mesh. (The z-slab solve does implement ik: "
+          "SOG_MIDTOWN_SLAB=1 SOG_SLAB_IK=1.)");
+    }
+  }
+  if (ranks == 1) {
     return evaluation(coord, charge, node_mask, n_node_per_frame, total_charge,
                       0, static_cast<int>(coord.size(0)), nullptr);
   }

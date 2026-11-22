@@ -100,7 +100,10 @@ def kspace_energy(
     charge: Array,
     k_grid: KGrid,
     kernel: BaseInteractionKernel,
-) -> Array:
+    want_potential: bool = False,
+    want_force: bool = False,
+    want_box: bool = False,
+) -> Array | tuple[Array, ...]:
     r"""Energy of the periodic frames over explicit wave numbers, per atom.
 
     The structure factors of the wave numbers of every frame come from the
@@ -157,9 +160,12 @@ def kspace_energy(
     rho_real = xp.matmul(cos_phase, charge_slot[:, None, :, :])
     rho_imag = xp.matmul(sin_phase, charge_slot[:, None, :, :])
     # === Step 4. Potential at the nodes of every frame, (nf, ns, C) ===
-    weight = COULOMB_CONSTANT * kernel.kspace(xp.sum(strained_k * strained_k, axis=-1))
-    weight = weight / volume[:, None, None]
-    weight = xp.where(k_grid.mask, weight, xp.zeros_like(weight))[..., None]
+    weight_sq = (
+        COULOMB_CONSTANT
+        * kernel.kspace(xp.sum(strained_k * strained_k, axis=-1))
+        / volume[:, None, None]
+    )
+    weight = xp.where(k_grid.mask, weight_sq, xp.zeros_like(weight_sq))[..., None]
     block_potential = xp.matmul(xp.matrix_transpose(cos_phase), weight * rho_real)
     block_potential = block_potential + xp.matmul(
         xp.matrix_transpose(sin_phase), weight * rho_imag
@@ -175,7 +181,61 @@ def kspace_energy(
     # === Step 5. Energy on the node axis ===
     # A padding slot carries no charge and adds a zero to the first node.
     energy = xp.zeros((n_node,), dtype=dtype, device=device)
-    return xp_add_at(energy, index, xp.reshape(slot_energy, (-1,)))
+    energy = xp_add_at(energy, index, xp.reshape(slot_energy, (-1,)))
+    potential_nodes = None
+    if want_potential:
+        potential_nodes = xp.zeros((n_node, n_channel), dtype=dtype, device=device)
+        potential_nodes = xp_add_at(
+            potential_nodes, index, xp.reshape(potential, (-1, n_channel))
+        )
+    force = None
+    box = None
+    if want_force or want_box:
+        n_slot = potential.shape[1]
+        n_k = weight_sq.shape[1] * weight_sq.shape[2]
+        w = xp.reshape(
+            xp.where(k_grid.mask, weight_sq, xp.zeros_like(weight_sq)),
+            (nf, n_k),
+        )
+        kv = xp.reshape(k_vec, (nf, n_k, 3))
+        rr = xp.reshape(rho_real, (nf, n_k, n_channel))
+        ri = xp.reshape(rho_imag, (nf, n_k, n_channel))
+        cos_f = xp.reshape(cos_phase, (nf, n_k, n_slot))
+        sin_f = xp.reshape(sin_phase, (nf, n_k, n_slot))
+        a = xp.matmul(charge_slot, xp.matrix_transpose(ri))
+        b = xp.matmul(charge_slot, xp.matrix_transpose(rr))
+        # a/b have shape (nf, n_slot, n_k); the phase transpose is (nf, n_slot, n_k).
+        mix = a * xp.matrix_transpose(cos_f) - b * xp.matrix_transpose(sin_f)
+        force = -xp.matmul(mix * w[:, None, :], kv)
+        force_nodes = xp.zeros((n_node, 3), dtype=dtype, device=device)
+        force = xp_add_at(force_nodes, index, xp.reshape(force, (-1, 3)))
+        if want_box:
+            rho2 = xp.sum(rr * rr + ri * ri, axis=-1)
+            k_val = xp.where(
+                k_grid.mask,
+                kernel.kspace(xp.sum(strained_k * strained_k, axis=-1)),
+                xp.zeros_like(weight_sq),
+            )
+            k_vir = xp.where(
+                k_grid.mask,
+                kernel.kspace_virial(xp.sum(strained_k * strained_k, axis=-1)),
+                xp.zeros_like(weight_sq),
+            )
+            k_val = xp.reshape(k_val, (nf, n_k))
+            k_vir = xp.reshape(k_vir, (nf, n_k))
+            diag = xp.sum(k_val * rho2, axis=-1)
+            quad = xp.matmul(xp.matrix_transpose(kv * (k_vir * rho2)[..., None]), kv)
+            eye = xp.eye(3, dtype=dtype, device=device)
+            box = (
+                (quad - eye * diag[:, None, None])
+                / (2.0 * volume[:, None, None])
+                * COULOMB_CONSTANT
+            )
+    if want_force or want_box:
+        return energy, potential_nodes, force, box
+    if want_potential:
+        return energy, potential_nodes
+    return energy
 
 
 def bspline_integer_weights(order: int) -> np.ndarray:
@@ -289,7 +349,8 @@ def mesh_energy(
     frame_id: Array,
     kernel: BaseInteractionKernel,
     order: int,
-) -> Array:
+    want_potential: bool = False,
+) -> Array | tuple[Array, Array]:
     r"""Energy of the periodic frames by the smooth particle-mesh Ewald method, per atom.
 
     The charges spread to the mesh of every frame with B-splines of order
@@ -426,4 +487,7 @@ def mesh_energy(
     )
     periodic_node = xp.take(mesh.mask, frame_id, axis=0)
     potential = potential - _self_potential(kernel, charge, periodic_node)
-    return 0.5 * xp.sum(charge * potential, axis=-1)
+    energy = 0.5 * xp.sum(charge * potential, axis=-1)
+    if want_potential:
+        return energy, potential
+    return energy

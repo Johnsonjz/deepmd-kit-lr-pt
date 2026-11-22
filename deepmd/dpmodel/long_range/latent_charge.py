@@ -12,6 +12,7 @@ import numpy as np
 
 from deepmd.dpmodel.array_api import (
     Array,
+    xp_add_at,
 )
 from deepmd.dpmodel.common import (
     GLOBAL_NP_FLOAT_PRECISION,
@@ -42,6 +43,9 @@ from deepmd.utils.version import (
 from .base_long_range import (
     BaseLongRange,
 )
+from . import (
+    grid_rule,
+)
 from .kernel import (
     COULOMB_CONSTANT,
     BaseInteractionKernel,
@@ -57,11 +61,70 @@ CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
 CHARGE_NET_NEURON = [64, 64]
 """Default hidden widths of the charge network."""
 
+RCUT_TO_SIGMA = 10.0 / 3.633717409009413
+"""The SOG library's receptive field to width ratio, ``sigma = r_c / this``.
+
+``1 / this = 0.3633717409009413`` is the canonical scale of the
+sum-of-Gaussians decomposition of ``1/r``, so a single-hop descriptor with
+``rcut = 6`` Å starts at ``sigma = 2.180230445405648`` Å, the width the
+:class:`~deepmd.dpmodel.long_range.kernel.SOGKernel` ladder uses by default.
+"""
+
+SOG_DEFAULT_B = 1.62976708826776469
+"""The SOG library's default width ratio, the canonical SOG ``b``."""
+
+SOG_DEFAULT_M = 7
+"""The SOG library's default number of Gaussian bands."""
+
+
+def sog_default_ladder(
+    descriptor: Any,
+    n_gaussian: int = SOG_DEFAULT_M,
+    b: float = SOG_DEFAULT_B,
+) -> tuple[list[float], list[float]]:
+    r"""Default SOG widths and amplitudes from the descriptor's receptive field.
+
+    The SOG library rule is ``sigma = rcut / RCUT_TO_SIGMA``, the canonical
+    sum-of-Gaussians decomposition of ``1/r`` at the descriptor's single-hop
+    cutoff.  Scaling the widest Gaussian with the descriptor's *receptive
+    field* instead makes it wider than a typical ionic cell, where a Gaussian
+    flat across the box carries no structure: the reciprocal sum then keeps
+    only the ``k = 0`` shell, which a neutral charge constraint removes, and
+    the long-range head contributes nothing.  The head therefore always starts
+    from one hop, whatever the descriptor depth; the message-passing layers
+    change how the descriptor *carries* information, not the length scale at
+    which the reciprocal term has to act.
+
+    Parameters
+    ----------
+    descriptor
+        The descriptor that owns the receptive field.
+    n_gaussian
+        Number of Gaussian bands.
+    b
+        Ratio between successive widths.
+
+    Returns
+    -------
+    tuple[list[float], list[float]]
+        ``width`` and ``amplitude`` in the units of the upstream kernel,
+        :math:`a_k = \sqrt{2/\pi}\ln b / \sigma_k`.
+    """
+    sigma = float(descriptor.get_rcut()) / RCUT_TO_SIGMA
+    widths = sigma * np.power(b, np.arange(n_gaussian, dtype=np.float64))
+    amplitudes = np.sqrt(2.0 / np.pi) * np.log(b) / widths
+    return widths.tolist(), amplitudes.tolist()
+
+
 PME_ORDER = 8
 """Default order of the B-splines that spread the charges to the mesh."""
 
 PME_SPACING_FRACTION = 0.75
-"""Default mesh spacing, as a fraction of the Nyquist spacing of the wave-number cutoff.
+"""Fallback mesh spacing, as a fraction of the Nyquist spacing of the wave-number cutoff.
+
+Only used when the kernel's width is unknown to the error law of
+:mod:`deepmd.dpmodel.long_range.grid_rule`; a known width is sized by that law
+instead, with no Nyquist ceiling.
 
 At order 8 the mesh evaluation of a periodic frame then stays within a few
 parts in a million of the sum over the wave numbers, in the reciprocal energy
@@ -157,11 +220,26 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         live parameters. The frozen cutoff is serialized with the model.
         Requires ``periodic=True``.
     pme_spacing
-        The largest spacing of the mesh of a periodic frame, in Å; the
-        default is three quarters of the Nyquist spacing of the wave-number
-        cutoff, :math:`0.75 \pi / k_{max}`. Requires ``periodic=True``.
+        The largest spacing of the mesh of a periodic frame, in Å; overrides
+        ``pme_accuracy``. The default is the spacing the measured error law of
+        :mod:`deepmd.dpmodel.long_range.grid_rule` gives at that target (and
+        three quarters of the Nyquist spacing of the wave-number cutoff when
+        the kernel's width is unknown to the rule). Requires ``periodic=True``.
     pme_order
         The order of the B-splines that spread the charges to the mesh.
+        Requires ``periodic=True``.
+    mesh_backend
+        ``"bspline"`` (default) for the smooth particle-mesh Ewald sum, or
+        ``"midtown"`` for the CubeS2 splines and cuFFT of the SOG library.
+        Requires ``periodic=True``.
+    force_mode
+        How the periodic force is differentiated: ``"ad"`` (default) gathers
+        the derivatives of the assignment weights, whose force is exactly the
+        gradient of the mesh energy; ``"ik"`` differentiates the potential in
+        Fourier space, gaining one order in the mesh spacing at the cost of
+        three extra inverse transforms and a force that is not the exact
+        gradient of the mesh energy. ``"ik"`` requires ``mesh_backend="midtown"``
+        or ``mesh_backend="quads"``.
         Requires ``periodic=True``.
     """
 
@@ -177,6 +255,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         decouple_k_grid: bool = False,
         pme_spacing: float | None = None,
         pme_order: int | None = None,
+        pme_accuracy: float | None = None,
+        mesh_backend: str = "bspline",
+        force_mode: str = "ad",
     ) -> None:
         if charge_net.vacuum_ref:
             raise ValueError(
@@ -203,17 +284,38 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         if k_grid_mode is None:
             k_grid_mode = "pme" if self.periodic else "ragged"
         self.k_grid_mode = str(k_grid_mode)
-        if self.k_grid_mode not in ("ragged", "fixed", "pme"):
+        if self.k_grid_mode not in (
+            "ragged",
+            "fixed",
+            "pme",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             raise ValueError(
-                f"`k_grid_mode` must be 'ragged', 'fixed' or 'pme', got {self.k_grid_mode!r}"
+                f"`k_grid_mode` must be 'ragged', 'fixed', 'pme', 'ellipsoid' or "
+                f"'metric-ellipsoid', got {self.k_grid_mode!r}"
             )
-        if self.k_grid_mode in ("fixed", "pme") and not self.periodic:
+        if (
+            self.k_grid_mode
+            in (
+                "fixed",
+                "pme",
+                "ellipsoid",
+                "metric-ellipsoid",
+            )
+            and not self.periodic
+        ):
             raise ValueError(
                 f"`k_grid_mode='{self.k_grid_mode}'` requires `periodic=True`"
             )
-        if k_grid_bounds is not None and self.k_grid_mode != "fixed":
+        if k_grid_bounds is not None and self.k_grid_mode not in (
+            "fixed",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             raise ValueError(
-                "`k_grid_bounds` is only meaningful with `k_grid_mode='fixed'`"
+                "`k_grid_bounds` is only meaningful with `k_grid_mode='fixed'`, "
+                "'ellipsoid' or 'metric-ellipsoid'"
             )
         self.decouple_k_grid = bool(decouple_k_grid)
         if self.decouple_k_grid and not self.periodic:
@@ -240,14 +342,41 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                     f"all zero, got {list(k_grid_bounds)}"
                 )
             self.k_grid_bounds = bounds
-        elif self.k_grid_mode == "fixed":
+        elif self.k_grid_mode in (
+            "fixed",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             self.k_grid_bounds = np.zeros(3, dtype=np.int64)
         else:
             self.k_grid_bounds = None
         # The mesh of a periodic frame, on which training in the "pme" mode
         # and every frozen model evaluate the reciprocal sum.
-        if not self.periodic and (pme_spacing is not None or pme_order is not None):
-            raise ValueError("`pme_spacing` and `pme_order` require `periodic=True`")
+        if not self.periodic and (
+            pme_spacing is not None or pme_order is not None or pme_accuracy is not None
+        ):
+            raise ValueError(
+                "`pme_spacing`, `pme_order` and `pme_accuracy` require `periodic=True`"
+            )
+        self.mesh_backend = str(mesh_backend)
+        if self.mesh_backend not in ("bspline", "midtown", "quads"):
+            raise ValueError(
+                "`mesh_backend` must be 'bspline', 'midtown' or 'quads', got "
+                f"{self.mesh_backend!r}"
+            )
+        self.force_mode = str(force_mode)
+        if self.force_mode not in ("ad", "ik"):
+            raise ValueError(
+                f"`force_mode` must be 'ad' or 'ik', got {self.force_mode!r}"
+            )
+        if self.force_mode != "ad" and self.mesh_backend not in (
+            "midtown",
+            "quads",
+        ):
+            raise ValueError(
+                "`force_mode='ik'` (Fourier differentiation) requires "
+                "`mesh_backend='midtown'` or `'quads'`"
+            )
         self.pme_order = PME_ORDER if pme_order is None else int(pme_order)
         if self.pme_order < 2:
             raise ValueError(f"`pme_order` must be at least 2, got {self.pme_order}")
@@ -258,6 +387,15 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                     f"`pme_spacing` must be finite and positive, got {pme_spacing}"
                 )
         self.pme_spacing = pme_spacing
+        # Target force-relative accuracy of the spacing rule; ``None`` uses the
+        # module default.  See :mod:`deepmd.dpmodel.long_range.grid_rule`.
+        if pme_accuracy is not None:
+            pme_accuracy = float(pme_accuracy)
+            if not np.isfinite(pme_accuracy) or pme_accuracy <= 0.0:
+                raise ValueError(
+                    f"`pme_accuracy` must be finite and positive, got {pme_accuracy}"
+                )
+        self.pme_accuracy = pme_accuracy
 
     @staticmethod
     def _normalize_constraint(
@@ -322,12 +460,25 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             "seed": child_seed(fitting_seed, CHARGE_NET_SEED_INDEX),
             **config.get("charge_net", {}),
         }
+        bias_atom_q = charge_net_config.pop("bias_atom_q", None)
         kernel_config = {
             "type": "les",
             "precision": charge_net_config["precision"],
             **config.get("kernel", {}),
         }
-        kernel_cls = BaseInteractionKernel.get_class_by_type(kernel_config.pop("type"))
+        kernel_type = str(kernel_config.pop("type"))
+        if kernel_type == "sog" and not any(
+            kernel_config.get(key) is not None
+            for key in ("width", "amplitude", "base_width", "width_ratio")
+        ):
+            # The SOG library rule: sigma = rcut / RCUT_TO_SIGMA (one hop).
+            widths, amplitudes = sog_default_ladder(
+                descriptor,
+                n_gaussian=int(kernel_config.get("n_gaussian", SOG_DEFAULT_M)),
+            )
+            kernel_config["width"] = widths
+            kernel_config["amplitude"] = amplitudes
+        kernel_cls = BaseInteractionKernel.get_class_by_type(kernel_type)
         charge_net = LatentChargeFitting(
             var_name="latent_charge",
             ntypes=descriptor.get_ntypes(),
@@ -340,6 +491,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             use_aparam_as_mask=fitting.use_aparam_as_mask,
             mixed_types=descriptor.mixed_types(),
             type_map=fitting.get_type_map(),
+            bias_atom=(
+                None
+                if bias_atom_q is None
+                else np.asarray(bias_atom_q, dtype=np.float64).reshape(
+                    -1, int(config.get("channels", 1))
+                )
+            ),
             **charge_net_config,
         )
         return cls(
@@ -353,6 +511,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             decouple_k_grid=config.get("decouple_k_grid", False),
             pme_spacing=config.get("pme_spacing"),
             pme_order=config.get("pme_order"),
+            pme_accuracy=config.get("pme_accuracy"),
+            mesh_backend=config.get("mesh_backend", "bspline"),
+            force_mode=config.get("force_mode", "ad"),
         )
 
     def _k_max(self) -> float:
@@ -369,12 +530,68 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
     def mesh_spacing(self) -> float:
         r"""The largest spacing of the mesh of a periodic frame, in Å.
 
-        The configured ``pme_spacing``, or :data:`PME_SPACING_FRACTION` of the
-        Nyquist spacing :math:`\pi / k_{max}` of the wave-number cutoff.
+        The configured ``pme_spacing``; otherwise the spacing that reaches the
+        target force-relative accuracy under the measured error law of
+        :mod:`deepmd.dpmodel.long_range.grid_rule`.  The law alone sizes the
+        grid; there is no extra Nyquist ceiling (the fitted law is measured at
+        1e-4 spacings well inside its band).  A kernel whose width the rule
+        does not know falls back to ``PME_SPACING_FRACTION * pi / k_max``.
         """
         if self.pme_spacing is not None:
             return self.pme_spacing
-        return PME_SPACING_FRACTION * math.pi / self._k_max()
+        k_max = self._k_max()
+        sigma_min = self._sigma_min()
+        if sigma_min is None:
+            return PME_SPACING_FRACTION * math.pi / k_max
+        accuracy = self.pme_accuracy
+        if accuracy is None:
+            accuracy = grid_rule.DEFAULT_ACCURACY
+        spacing = grid_rule.spacing(
+            self.mesh_backend,
+            self.effective_order(),
+            sigma_min,
+            k_max,
+            accuracy,
+            force_mode=self.force_mode,
+        )
+        if self.mesh_backend == "bspline" and self.effective_order() >= 8:
+            # The measured law stops at order 4/6; its order-8 extrapolation
+            # leaves the B-spline assignment aliasing above the target (the
+            # PME model tests see ~2e-3 relative energy error at the default
+            # 1e-4).  A Nyquist-fraction cap keeps the high-order PME mesh
+            # inside the band where the assignment factor is accurate.  This
+            # is a PME-model policy; the general grid rule keeps its law.
+            spacing = min(spacing, PME_SPACING_FRACTION * math.pi / k_max)
+        return spacing
+
+    def effective_order(self) -> int:
+        """The spline order the mesh actually evaluates.
+
+        The midtown mesh carries a CubeS2 stencil and has order 4 or 6 only, so
+        any other configured ``pme_order`` (including the 8 default) means 6.
+        Sizing the grid from the *configured* value would size it for the wrong
+        stencil, so every consumer goes through this.
+        """
+        if self.mesh_backend in ("midtown", "quads"):
+            return 4 if self.pme_order == 4 else 6
+        return int(self.pme_order)
+
+    def _sigma_min(self) -> float | None:
+        """The width of the narrowest Gaussian of the kernel, in angstrom.
+
+        ``None`` for a kernel whose width the rule does not know, which makes
+        :meth:`mesh_spacing` fall back to the Nyquist fraction.
+        """
+        if hasattr(self.kernel, "log_width"):
+            lw = to_numpy_array(self.kernel.log_width).astype(np.float64)
+            return float(np.exp(np.min(lw)))
+        if hasattr(self.kernel, "log_alpha"):
+            # LES: K(r) = exp(-alpha^2 r^2) = exp(-r^2 / (2 sigma^2)).
+            alpha = float(
+                np.exp(to_numpy_array(self.kernel.log_alpha).astype(np.float64))
+            )
+            return 1.0 / (alpha * math.sqrt(2.0))
+        return None
 
     def use_mesh_evaluation(self) -> None:
         """Evaluate the reciprocal sum of every periodic batch on the mesh.
@@ -410,14 +627,22 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         if self.k_grid_mode == "pme":
             return {PME_MESH: {"spacing": self.mesh_spacing()}}
         params = {"k_max": self._k_max()}
-        if self.k_grid_mode == "fixed":
+        if self.k_grid_mode in (
+            "fixed",
+            "ellipsoid",
+            "metric-ellipsoid",
+        ):
             if not self._k_grid_sized():
                 raise ValueError(
-                    "the fixed k grid is not sized yet: run the data "
-                    "statistics (`compute_input_stats`) on periodic "
+                    f"the {self.k_grid_mode} k grid is not sized yet: run the "
+                    "data statistics (`compute_input_stats`) on periodic "
                     "frames, or configure `k_grid_bounds`"
                 )
-            params["bounds"] = to_numpy_array(self.k_grid_bounds)
+            key = {
+                "ellipsoid": "nk",
+                "metric-ellipsoid": "metric_bounds",
+            }.get(self.k_grid_mode, "bounds")
+            params[key] = to_numpy_array(self.k_grid_bounds)
         return {K_GRID: params}
 
     def required_topologies(self) -> tuple[str, ...]:
@@ -434,6 +659,16 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             and self.charge_constraint["source"] == "charge_spin"
             and self.charge_state is None
         )
+
+    def supports_multi_rank(self) -> bool:
+        """The latent-charge sum decomposes a frame over the ranks that hold it.
+
+        ``deepmd::latent_charge_sum`` takes the communicator of the domains and
+        sums the charges of every rank, and its outputs are the share of the
+        caller's charged nodes, including a share of the frame virial. The
+        module therefore keeps the cross-rank capability of its descriptor.
+        """
+        return True
 
     def fold_charge_state(self, charge_spin: list[float]) -> None:
         """Specialize the constraint to one frame charge/spin condition.
@@ -476,7 +711,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         fparam: Array | None = None,
         aparam: Array | None = None,
         charge_spin: Array | None = None,
-    ) -> Array:
+        want_potential: bool = False,
+        want_derivatives: bool = False,
+    ) -> Array | tuple[Array, ...]:
         xp = array_api_compat.array_namespace(descriptor)
         n = descriptor.shape[0]
         pairs = topologies[ALL_PAIRS]
@@ -493,7 +730,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             charge = self._constrain(
                 charge, node_mask, frame_id, n_node, fparam, charge_spin
             )
-        energy = self._pair_branch(charge, pairs, n)
+        if want_potential:
+            energy, phi = self._pair_branch(charge, pairs, n, want_potential=True)
+        else:
+            energy = self._pair_branch(charge, pairs, n)
+            phi = None
+        force = None
+        box = None
         if self.periodic:
             # The lattice sum of a periodic frame and its self term cancel to
             # a small fraction of either, so the reciprocal-space energy is
@@ -506,26 +749,64 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                     frame_id,
                     self.kernel,
                     self.pme_order,
+                    want_potential=want_potential,
                 )
+                if want_potential:
+                    reciprocal, phi_rec = reciprocal
+                    phi = phi + xp.astype(phi_rec, phi.dtype)
             else:
-                reciprocal = kspace_energy(charge_64, topologies[K_GRID], self.kernel)
+                reciprocal = kspace_energy(
+                    charge_64,
+                    topologies[K_GRID],
+                    self.kernel,
+                    want_potential=want_potential,
+                    want_force=want_derivatives,
+                    want_box=want_derivatives,
+                )
+                if want_derivatives:
+                    reciprocal, phi_rec, force, box = reciprocal
+                    if want_potential:
+                        phi = phi + xp.astype(phi_rec, phi.dtype)
+                    force = xp.astype(force, energy.dtype)
+                    box = xp.astype(box, energy.dtype)
+                elif want_potential:
+                    reciprocal, phi_rec = reciprocal
+                    phi = phi + xp.astype(phi_rec, phi.dtype)
             energy = energy + xp.astype(reciprocal, energy.dtype)
-        return xp.reshape(energy, (n, 1))
+        energy = xp.reshape(energy, (n, 1))
+        if want_derivatives:
+            if want_potential:
+                return energy, phi, force, box
+            return energy, force, box
+        if want_potential:
+            return energy, phi
+        return energy
 
-    def _pair_branch(self, charge: Array, pairs: Any, n: int) -> Array:
+    def _pair_branch(
+        self, charge: Array, pairs: Any, n: int, want_potential: bool = False
+    ) -> Array | tuple[Array, Array]:
         """Direct pair sum over the non-periodic frames, per atom."""
         xp = array_api_compat.array_namespace(charge)
         src = pairs.index[0]
         dst = pairs.index[1]
-        pair_charge = xp.sum(
-            xp.take(charge, src, axis=0) * xp.take(charge, dst, axis=0), axis=-1
-        )
+        q_src = xp.take(charge, src, axis=0)
+        q_dst = xp.take(charge, dst, axis=0)
+        pair_charge = xp.sum(q_src * q_dst, axis=-1)
         r_sq = xp.sum(pairs.vec * pairs.vec, axis=-1)
-        pair_energy = pair_charge * self._pair_kernel(r_sq, src, n)
-        half_energy = (0.5 * COULOMB_CONSTANT) * xp.where(
-            pairs.mask, pair_energy, xp.zeros_like(r_sq)
+        kernel = self._pair_kernel(r_sq, src, n)
+        kernel = xp.where(pairs.mask, kernel, xp.zeros_like(r_sq))
+        half_energy = (0.5 * COULOMB_CONSTANT) * pair_charge * kernel
+        energy = segment_sum(half_energy, src, n) + segment_sum(half_energy, dst, n)
+        if not want_potential:
+            return energy
+        phi = xp.zeros(
+            charge.shape,
+            dtype=charge.dtype,
+            device=array_api_compat.device(charge),
         )
-        return segment_sum(half_energy, src, n) + segment_sum(half_energy, dst, n)
+        phi = xp_add_at(phi, src, COULOMB_CONSTANT * q_dst * kernel[:, None])
+        phi = xp_add_at(phi, dst, COULOMB_CONSTANT * q_src * kernel[:, None])
+        return energy, phi
 
     def _pair_kernel(self, r_sq: Array, src: Array, n: int) -> Array:
         """Kernel values of the pairs.
@@ -627,7 +908,15 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         protection: float = 1e-2,
         stat_file_path: DPPath | None = None,
     ) -> None:
-        if self.k_grid_mode == "fixed" and not self._k_grid_sized():
+        if (
+            self.k_grid_mode
+            in (
+                "fixed",
+                "ellipsoid",
+                "metric-ellipsoid",
+            )
+            and not self._k_grid_sized()
+        ):
             # Materialize the samples once for the grid sizing and the
             # networks; a lazy sampler is shared by the callers.
             sampled = merged() if callable(merged) else merged
@@ -689,15 +978,27 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
             data["k_grid_mode"] = self.k_grid_mode
-        if self.k_grid_mode == "fixed" and self._k_grid_sized():
+        if (
+            self.k_grid_mode
+            in (
+                "fixed",
+                "ellipsoid",
+                "metric-ellipsoid",
+            )
+            and self._k_grid_sized()
+        ):
             data["k_grid_bounds"] = to_numpy_array(self.k_grid_bounds).tolist()
         if self.decouple_k_grid:
             data["decouple_k_grid"] = True
             data["frozen_k_max"] = self.frozen_k_max
         if self.periodic:
             data["pme_order"] = self.pme_order
+            data["mesh_backend"] = self.mesh_backend
+            data["force_mode"] = self.force_mode
             if self.pme_spacing is not None:
                 data["pme_spacing"] = self.pme_spacing
+            if self.pme_accuracy is not None:
+                data["pme_accuracy"] = self.pme_accuracy
         if self.charge_state is not None:
             data["charge_state"] = to_numpy_array(self.charge_state).tolist()
         return data
@@ -712,6 +1013,8 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             data["charge_constraint"],
             periodic=data.get("periodic", False),
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),
+            mesh_backend=data.get("mesh_backend", "bspline"),
+            force_mode=data.get("force_mode", "ad"),
             # A periodic record without a mode is one of the explicit wave
             # numbers.
             k_grid_mode=data.get("k_grid_mode", "ragged"),
@@ -719,6 +1022,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             decouple_k_grid=data.get("decouple_k_grid", False),
             pme_spacing=data.get("pme_spacing"),
             pme_order=data.get("pme_order"),
+            pme_accuracy=data.get("pme_accuracy"),
         )
         if data.get("frozen_k_max") is not None:
             # The constructor derives the frozen cutoff from the (possibly

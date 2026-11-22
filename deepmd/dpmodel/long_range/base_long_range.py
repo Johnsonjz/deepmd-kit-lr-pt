@@ -39,15 +39,22 @@ def check_long_range_support(descriptor: Any) -> None:
     NotImplementedError
         If the descriptor is not among the validated ones.
     """
-    from deepmd.dpmodel.descriptor.dpa4c import (
-        DescrptDPA4C,
-    )
-
-    if not isinstance(descriptor, DescrptDPA4C):
-        raise NotImplementedError(
-            "long-range modules are currently validated with the DPA4C "
-            f"descriptor only, got {type(descriptor).__name__}"
+    supports = getattr(descriptor, "supports_long_range", None)
+    if callable(supports):
+        if supports():
+            return
+    else:
+        # Back-compat for descriptors written before the capability flag.
+        from deepmd.dpmodel.descriptor.dpa4c import (
+            DescrptDPA4C,
         )
+
+        if isinstance(descriptor, DescrptDPA4C):
+            return
+    raise NotImplementedError(
+        "long-range modules are currently validated with the DPA4C and DPA4 "
+        f"descriptors only, got {type(descriptor).__name__}"
+    )
 
 
 def make_base_long_range(t_tensor: Any) -> type:
@@ -85,6 +92,17 @@ def make_base_long_range(t_tensor: Any) -> type:
         @abstractmethod
         def uses_charge_spin(self) -> bool:
             """Whether the module reads the frame-level charge/spin condition."""
+
+        def supports_multi_rank(self) -> bool:
+            """Whether the module sums a frame decomposed over several ranks.
+
+            A module that answers ``True`` reads the domains of a frame through
+            the communicator its evaluation takes, so the model it belongs to
+            keeps the cross-rank capability of its descriptor. ``False`` (the
+            default) means the module needs the whole frame on one domain, and
+            a model carrying it is single rank whatever its descriptor can do.
+            """
+            return False
 
         @abstractmethod
         def call_graph(

@@ -103,8 +103,17 @@ class Border : public torch::autograd::Function<Border> {
       cuda_aware = MPIX_Query_cuda_support();
 #endif
       if (cuda_aware == 0) {
-        recv_g1_tensor = torch::empty_like(g1).to(torch::kCPU);
-        recv_g1_tensor.copy_(g1);
+        if (g1.device().is_cuda()) {
+          // Pageable staging made every exchange a slow, synchronizing round
+          // trip; the buffer is allocated pinned so the copies take the fast
+          // path. The copy itself stays blocking, so MPI reads a finished
+          // buffer.
+          recv_g1_tensor = torch::empty_like(
+              g1, g1.options().pinned_memory(true).device(torch::kCPU));
+          recv_g1_tensor.copy_(g1);
+        } else {
+          recv_g1_tensor = g1;
+        }
       } else if (g1.device().is_cuda()) {
         // nlocal/nghost are HOST tensors (their .item() reads above no
         // longer synchronize the device): explicitly order the prior CUDA
@@ -277,8 +286,14 @@ class Border : public torch::autograd::Function<Border> {
       cuda_aware = MPIX_Query_cuda_support();
 #endif
       if (cuda_aware == 0) {
-        d_local_g1_tensor = torch::empty_like(grad_g1).to(torch::kCPU);
-        d_local_g1_tensor.copy_(grad_g1);
+        if (grad_g1.device().is_cuda()) {
+          d_local_g1_tensor = torch::empty_like(
+              grad_g1,
+              grad_g1.options().pinned_memory(true).device(torch::kCPU));
+          d_local_g1_tensor.copy_(grad_g1);
+        } else {
+          d_local_g1_tensor = grad_g1;
+        }
       } else if (grad_g1.device().is_cuda()) {
         // Same explicit CUDA-stream-to-MPI ordering as the forward: the
         // host-side nlocal/nghost reads no longer act as an accidental

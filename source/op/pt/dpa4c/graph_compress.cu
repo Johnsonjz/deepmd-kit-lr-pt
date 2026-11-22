@@ -1648,6 +1648,9 @@ struct FittingNetwork {
   const torch::Tensor& b_head;
   const torch::Tensor& bias_atom_e;
   int64_t act;
+  // Optional charge response folded into the input cotangent: d_x += J * v.
+  const float* add_jacobian = nullptr;
+  const float* add_v = nullptr;
 };
 
 // The fitting routes of the runs of ``run`` nodes into which a fused operator
@@ -1718,8 +1721,11 @@ class FittingRuns {
                             long width,
                             const long* node_type,
                             const double* seed,
-                            double* output) const {
-    forward(stream, begin, count, x, d_x, width, node_type, seed, output);
+                            double* output,
+                            const float* add_jacobian = nullptr,
+                            const float* add_v = nullptr) const {
+    forward(stream, begin, count, x, d_x, width, node_type, seed, output,
+            add_jacobian, add_v);
     backward(stream, begin, count, seed, d_x);
   }
 
@@ -1735,7 +1741,9 @@ class FittingRuns {
                long width,
                const long* node_type,
                const double* seed,
-               double* output) const {
+               double* output,
+               const float* add_jacobian = nullptr,
+               const float* add_v = nullptr) const {
     const FittingNetwork& fitting = fitting_;
     const int64_t route = route_of(count);
     if (route != kFittingPerLayer) {
@@ -1743,7 +1751,7 @@ class FittingRuns {
           stream, fitting.plan, x, width, node_type, fitting.ws, fitting.bs,
           fitting.resnets, fitting.w_head, fitting.b_head, fitting.bias_atom_e,
           fitting.act, transposed_.data_ptr<float>(), seed, count, saved(begin),
-          output, d_x, route);
+          output, d_x, route, add_jacobian, add_v);
       return;
     }
     fitting_forward_range(stream, fitting.plan, x, width, node_type, fitting.ws,
@@ -3409,9 +3417,14 @@ dpa4c_canonical_compress_long_range_energy_force(
     std::optional<torch::Tensor> blocks,
     std::optional<torch::Tensor> halo_send,
     std::optional<torch::Tensor> halo_swaps,
-    std::optional<std::vector<double>> block_rcut) {
+    std::optional<std::vector<double>> block_rcut,
+    int64_t mesh_mode) {
   constexpr const char* kOp =
       "dpa4c_canonical_compress_long_range_energy_force";
+  // Two small enums travel in one integer: the operator schema of this call
+  // is already at the 64-argument limit of the dispatcher.
+  const int64_t mesh_backend = mesh_mode & 0xff;
+  const int64_t force_mode = (mesh_mode >> 8) & 0xff;
   const bool atom_virial = check_energy_force_inputs(
       kOp, edge_vec, source, destination_row_ptr, source_row_ptr, source_order,
       n_node, n_local, atype, type_embedding, contact_radius, f_inner, f_outer);
@@ -3585,7 +3598,7 @@ dpa4c_canonical_compress_long_range_energy_force(
       long_range = deepmd::long_range::latent_charge_sum(
           coord, raw_charge.to(torch::kFloat32).unsqueeze(1), charged, n_node,
           total_charge, box, coefficient, communicator, kernel, channel,
-          prefactor, order, spacing);
+          prefactor, order, spacing, mesh_backend, force_mode);
     };
     // Across ranks the sum waits on the host for the device before each of
     // its exchanges, and the device idles while the host exchanges and
@@ -3723,7 +3736,6 @@ dpa4c_canonical_compress_long_range_energy_force(
     arguments.clear_padding = true;
     dispatch(channels, true, arguments, stream);
   }
-
   // === Step 6. Node results and frame totals ===
   // The further blocks attribute the virial of every edge to the node that
   // emits it, its source, which is how the per-atom virial attributes it, so
