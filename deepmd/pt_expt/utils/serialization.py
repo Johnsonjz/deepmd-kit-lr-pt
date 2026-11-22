@@ -284,20 +284,34 @@ def _needs_with_comm_artifact(
 def _needs_canonical_with_comm(model: Any, lower_kind: str) -> bool:
     """Whether the compact canonical lower of this model needs a comm sibling.
 
-    The plain canonical ABI carries no border exchange, so a message-passing
-    descriptor reuses the ghost features of its first block for every later
-    one. The with-comm sibling carries the eight comm tensors the descriptor's
-    ``border_op`` drives. A model with a long-range module qualifies as soon as
-    its module serves a decomposed frame: the module reads the same
-    communicator through the operator, and nothing else about the canonical
-    lower changes.
+    Only the SeZM (two-block DPA4) compact canonical lower freezes an
+    eight-tensor sibling: its fused lower has no border exchange, and a further
+    interaction block reads the ghost features of its sources. The fused DPA4C
+    lower carries its halo exchange in the main ABI, and the dense DPA1 lower
+    has no sibling at all, so both keep the plain canonical archive.
     """
     if lower_kind not in ("dpa1_canonical", "dpa4c_canonical"):
         return False
     atomic_model = model.atomic_model
     if not atomic_model.has_message_passing_across_ranks():
         return False
-    return bool(atomic_model.supports_edge_parallel())
+    if not atomic_model.supports_edge_parallel():
+        return False
+    return _is_sezm_learned_model(model)
+
+
+def _is_sezm_learned_model(model: Any) -> bool:
+    """Whether the model deploys through a learned SeZM (DPA4) descriptor."""
+    from deepmd.dpmodel.descriptor.dpa4 import (
+        DescrptDPA4,
+    )
+
+    decomposition_fn = getattr(model.atomic_model, "fused_decomposition", None)
+    decomposition = None if decomposition_fn is None else decomposition_fn()
+    learned = None if decomposition is None else decomposition[0]
+    if learned is None:
+        return False
+    return isinstance(getattr(learned, "descriptor", None), DescrptDPA4)
 
 
 def check_graph_trace_torch_version(model: torch.nn.Module) -> None:
