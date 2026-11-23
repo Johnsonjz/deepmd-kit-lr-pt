@@ -51,7 +51,7 @@ TEST_ARGS=(
 run_ranks() {
 	local ranks=$1
 	if ! timeout "${TIMEOUT}" "${MPIEXEC}" -n "${ranks}" \
-		bash -c "r=\${OMPI_COMM_WORLD_LOCAL_RANK:-\${MPI_LOCALRANKID:-\${SLURM_LOCALID:-0}}}; export CUDA_VISIBLE_DEVICES=\$((r % ${GPU_COUNT})); exec \"\$@\"" \
+		bash -c "r=\${OMPI_COMM_WORLD_LOCAL_RANK:-\${MPI_LOCALRANKID:-\${SLURM_LOCALID:-0}}}; export CUDA_VISIBLE_DEVICES=\$((r % ${GPU_COUNT})); export DP_VISIBLE_GPUS=${GPU_COUNT}; exec \"\$@\"" \
 		bash "${PYTHON}" -m pytest "${TEST_ARGS[@]}"; then
 		echo "multi-rank Python leg failed at ${ranks} ranks" >&2
 		return 1
