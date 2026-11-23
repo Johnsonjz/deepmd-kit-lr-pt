@@ -59,11 +59,13 @@ jobs:
           useCloudCache: false
       - run: |
           # This fork runs on a self-hosted Rocky 8 box with its own toolkit;
-          # pin CUDA_HOME as well so torch finds the headers for the AOTI builds.
-          CUDA_BIN=/usr/local/cuda/bin
+          # CUDA_HOME (set by the runner) selects it, so the AOTI builds and the
+          # C++ tests see the same CUDA as the torch wheel.
+          CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+          CUDA_BIN=$CUDA_HOME/bin
           echo "CUDA toolkit: $("$CUDA_BIN/nvcc" --version | tail -1)"
-          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
-          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=$CUDA_HOME" >> "$GITHUB_ENV"
           echo "$CUDA_BIN" >> "$GITHUB_PATH"
         # if: false # skip as we use nvidia image
       - run: python -m pip install -U uv
@@ -140,11 +142,13 @@ jobs:
           useCloudCache: false
       - run: |
           # This fork runs on a self-hosted Rocky 8 box with its own toolkit;
-          # pin CUDA_HOME as well so torch finds the headers for the AOTI builds.
-          CUDA_BIN=/usr/local/cuda/bin
+          # CUDA_HOME (set by the runner) selects it, so the AOTI builds and the
+          # C++ tests see the same CUDA as the torch wheel.
+          CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+          CUDA_BIN=$CUDA_HOME/bin
           echo "CUDA toolkit: $("$CUDA_BIN/nvcc" --version | tail -1)"
-          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
-          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=$CUDA_HOME" >> "$GITHUB_ENV"
           echo "$CUDA_BIN" >> "$GITHUB_PATH"
         # if: false # skip as we use nvidia image
       - run: python -m pip install -U uv
@@ -297,11 +301,13 @@ jobs:
           useCloudCache: false
       - run: |
           # This fork runs on a self-hosted Rocky 8 box with its own toolkit;
-          # pin CUDA_HOME as well so torch finds the headers for the AOTI builds.
-          CUDA_BIN=/usr/local/cuda/bin
+          # CUDA_HOME (set by the runner) selects it, so the AOTI builds and the
+          # C++ tests see the same CUDA as the torch wheel.
+          CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+          CUDA_BIN=$CUDA_HOME/bin
           echo "CUDA toolkit: $("$CUDA_BIN/nvcc" --version | tail -1)"
-          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
-          echo "CUDA_PATH=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
+          echo "CUDA_PATH=$CUDA_HOME" >> "$GITHUB_ENV"
           echo "$CUDA_BIN" >> "$GITHUB_PATH"
       - run: python -m pip install -U uv
       - run: source/install/uv_with_retry.sh pip install --system --group pin_tensorflow_gpu --group pin_pytorch_gpu
