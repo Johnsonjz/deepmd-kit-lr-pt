@@ -3851,8 +3851,9 @@ def long_range_latent_charge() -> list[Argument]:
         "Requires `periodic: true`."
     )
     doc_pme_spacing = (
-        "The largest spacing of the mesh of a periodic frame, in Angstrom; "
-        "overrides `pme_accuracy`. Requires `periodic: true`."
+        "The largest spacing of the mesh of a periodic frame, in Angstrom. "
+        "Used when `pme_accuracy` is left at its default; an explicit "
+        "`pme_accuracy` wins over it. Requires `periodic: true`."
     )
     doc_pme_accuracy = (
         "Target force-relative grid error of a periodic frame, 1e-4 by "
@@ -3864,7 +3865,8 @@ def long_range_latent_charge() -> list[Argument]:
         "alone sizes the grid: it is measured at the target spacings "
         "themselves, so there is no additional Nyquist ceiling and a high "
         "spline order improves accuracy at the same grid rather than shrinking "
-        "it. Set `pme_spacing` to override. Requires `periodic: true`."
+        "it. An explicit `pme_accuracy` wins over an explicit `pme_spacing`. "
+        "Requires `periodic: true`."
     )
     doc_pme_order = (
         "The order of the B-splines that spread the charges to the mesh, 8 "

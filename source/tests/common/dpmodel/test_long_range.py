@@ -1033,6 +1033,13 @@ def test_pme_mode_configuration() -> None:
             )
     # every periodic mode takes them: a frozen model evaluates on the mesh
     assert _periodic_long_range(pme_spacing=1.0).mesh_spacing() == 1.0
+    # An explicit accuracy wins over an explicit spacing: both requests go
+    # through the measured error law, and the spacing only stands in when the
+    # accuracy is left at its default.
+    accuracy_only = _periodic_long_range(pme_accuracy=2e-5).mesh_spacing()
+    both = _periodic_long_range(pme_accuracy=2e-5, pme_spacing=1.0).mesh_spacing()
+    assert both == pytest.approx(accuracy_only)
+    assert both < 1.0
     assert _periodic_long_range().pme_order == 8
     with pytest.raises(ValueError, match="pme_order"):
         _pme_long_range(pme_order=1)

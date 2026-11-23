@@ -530,14 +530,17 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
     def mesh_spacing(self) -> float:
         r"""The largest spacing of the mesh of a periodic frame, in Å.
 
-        The configured ``pme_spacing``; otherwise the spacing that reaches the
+        The spacing that reaches the configured ``pme_accuracy`` under the
+        measured error law, so an explicit accuracy wins over an explicit
+        ``pme_spacing``; with only ``pme_spacing`` configured, that spacing is
+        used.  Otherwise the spacing that reaches the
         target force-relative accuracy under the measured error law of
         :mod:`deepmd.dpmodel.long_range.grid_rule`.  The law alone sizes the
         grid; there is no extra Nyquist ceiling (the fitted law is measured at
         1e-4 spacings well inside its band).  A kernel whose width the rule
         does not know falls back to ``PME_SPACING_FRACTION * pi / k_max``.
         """
-        if self.pme_spacing is not None:
+        if self.pme_accuracy is None and self.pme_spacing is not None:
             return self.pme_spacing
         k_max = self._k_max()
         sigma_min = self._sigma_min()
@@ -595,6 +598,10 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
 
     def use_mesh_evaluation(self) -> None:
         """Evaluate the reciprocal sum of every periodic batch on the mesh.
+
+        The ``pme_spacing`` recorded for a periodic model is the spacing this
+        rule solved (an explicit ``pme_accuracy`` wins over an explicit
+        ``pme_spacing``), so a reloaded artifact keeps the accuracy verdict.
 
         A frozen model takes the mesh of every frame as an input of dynamic
         size, sized by the cell of the frame, so that it serves any cell at
