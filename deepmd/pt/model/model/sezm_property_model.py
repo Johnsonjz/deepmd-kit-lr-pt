@@ -134,6 +134,7 @@ class SeZMPropertyModel(SeZMModel):
         spin: torch.Tensor | None = None,
         embedding_only: bool = False,
         atomic_output_only: bool = False,
+        box: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute property outputs through the SeZM forward-only graph."""
         return super().core_compute(
@@ -152,6 +153,7 @@ class SeZMPropertyModel(SeZMModel):
             embedding_only=embedding_only,
             conservative=False,
             atomic_output_only=atomic_output_only,
+            box=box,
         )
 
     def _inductor_compile_options(self, *, inference: bool = False) -> dict[str, Any]:
