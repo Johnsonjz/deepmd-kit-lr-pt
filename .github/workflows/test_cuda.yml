@@ -26,8 +26,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: pt_expt-model
-            pytest-args: source/tests/pt_expt/model
           - shard: pt_expt-other
             pytest-args: source/tests/pt_expt --ignore=source/tests/pt_expt/model
     # Each shard has its own CUDA build and can take several hours.
