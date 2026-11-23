@@ -2083,7 +2083,14 @@ def _select_graph_lower_kind(data: dict, *, allow_canonical: bool) -> str | None
             raise ValueError(reason)
         if dpa4c_canonical_eligible(model):
             return "dpa4c_canonical"
-        if sezm_canonical_eligible(model):
+        # Automatic selection keeps the upstream contract for native-spin
+        # containers, which the caller resolves to the NeighborGraph schema
+        # (``test_native_spin_auto_pte_reports_target_constraint``); the
+        # compact canonical lower of a native-spin model stays available
+        # through an explicit ``lower_kind``.
+        if data["model"].get("type") != "native_spin" and sezm_canonical_eligible(
+            model
+        ):
             return "dpa4c_canonical"
         if dpa1_canonical_eligible(model):
             return "dpa1_canonical"
