@@ -46,14 +46,18 @@ jobs:
           python-version: "3.11"
           # cache: 'pip'
       - name: Install wget and unzip
-        run: sudo apt-get update && sudo apt-get install -y wget unzip
+        run: |
+          # A self-hosted runner without passwordless sudo keeps its own tools.
+          if command -v wget >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+            echo "wget and unzip are present"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y wget unzip
       - uses: lukka/get-cmake@latest
         with:
           useLocalCache: true
           useCloudCache: false
       - run: |
-          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
-          OS_NAME="ubuntu${UBUNTU_VERSION}"
           # A self-hosted runner usually carries the toolkit already; reuse it
           # instead of requiring passwordless sudo on the machine.
           if command -v nvcc >/dev/null 2>&1; then
@@ -63,6 +67,8 @@ jobs:
             echo "$CUDA_BIN" >> "$GITHUB_PATH"
             exit 0
           fi
+          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
+          OS_NAME="ubuntu${UBUNTU_VERSION}"
           echo "Current OS: ${OS_NAME}"
 
           wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
@@ -133,14 +139,18 @@ jobs:
           python-version: "3.11"
           # cache: 'pip'
       - name: Install build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y wget unzip
+        run: |
+          # A self-hosted runner without passwordless sudo keeps its own tools.
+          if command -v wget >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+            echo "wget and unzip are present"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y wget unzip
       - uses: lukka/get-cmake@latest
         with:
           useLocalCache: true
           useCloudCache: false
       - run: |
-          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
-          OS_NAME="ubuntu${UBUNTU_VERSION}"
           # A self-hosted runner usually carries the toolkit already; reuse it
           # instead of requiring passwordless sudo on the machine.
           if command -v nvcc >/dev/null 2>&1; then
@@ -150,6 +160,8 @@ jobs:
             echo "$CUDA_BIN" >> "$GITHUB_PATH"
             exit 0
           fi
+          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
+          OS_NAME="ubuntu${UBUNTU_VERSION}"
           echo "Current OS: ${OS_NAME}"
 
           wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
@@ -308,8 +320,6 @@ jobs:
           useLocalCache: true
           useCloudCache: false
       - run: |
-          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
-          OS_NAME="ubuntu${UBUNTU_VERSION}"
           # A self-hosted runner usually carries the toolkit already; reuse it
           # instead of requiring passwordless sudo on the machine.
           if command -v nvcc >/dev/null 2>&1; then
@@ -319,6 +329,8 @@ jobs:
             echo "$CUDA_BIN" >> "$GITHUB_PATH"
             exit 0
           fi
+          UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
+          OS_NAME="ubuntu${UBUNTU_VERSION}"
           wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
           && sudo dpkg -i cuda-keyring_1.1-1_all.deb \
           && sudo apt-get update \
