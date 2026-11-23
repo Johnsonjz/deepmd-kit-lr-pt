@@ -24,6 +24,15 @@ from pathlib import (
 
 import pytest
 
+# Kokkos reads the device LAMMPS was launched on, so each rank gets its own
+# GPU.  OpenMPI exports OMPI_COMM_WORLD_LOCAL_RANK, MPICH MPI_LOCALRANKID and
+# Slurm SLURM_LOCALID; the modulo keeps a single-GPU runner on device 0.
+_GPU_BY_RANK = (
+    "r=${OMPI_COMM_WORLD_LOCAL_RANK:-${MPI_LOCALRANKID:-${SLURM_LOCALID:-0}}}; "
+    'n=$(nvidia-smi -L 2>/dev/null | wc -l); [ "$n" -gt 0 ] || n=1; '
+    'export CUDA_VISIBLE_DEVICES=$((r % n)); exec "$@"'
+)
+
 pytestmark = pytest.mark.skipif(
     not all(
         os.environ.get(name)
@@ -89,7 +98,7 @@ def test_two_block_canonical_runs_kokkos_multi_rank() -> None:
             str(np),
             "bash",
             "-c",
-            'export CUDA_VISIBLE_DEVICES=${OMPI_COMM_WORLD_LOCAL_RANK:-0}; exec "$@"',
+            _GPU_BY_RANK,
             "bash",
             env["LMP_KK"],
             "-k",
