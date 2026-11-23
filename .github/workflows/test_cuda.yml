@@ -233,6 +233,10 @@ jobs:
         if: matrix.suite == 'kokkos'
         run: |
           export LD_LIBRARY_PATH=$MPI_HOME/lib:$CUDA_PATH/lib64:/usr/lib/x86_64-linux-gnu/:${LD_LIBRARY_PATH:-}
+          # CUDA 12.8 rejects the -std=c++2a alias that the bundled Kokkos
+          # nvcc_wrapper derives from -std=gnu++2a; use the C++20 spelling.
+          wrapper=$(find source/build_tests/_deps/lammps_download-src/lib/kokkos/bin -name nvcc_wrapper 2>/dev/null | head -1)
+          if [ -n "$wrapper" ]; then sed -i 's/c++2a/c++20/g' "$wrapper"; fi
           source/install/test_lammps_kokkos.sh
         env:
           CMAKE_GENERATOR: Ninja
