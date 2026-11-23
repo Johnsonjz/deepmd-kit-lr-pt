@@ -50,24 +50,23 @@ TAG = 7
 ENTRIES = 9
 
 
-def _world():
-    """The OpenMPI library and an ``MPI_Comm`` variable holding MPI_COMM_WORLD.
+def _mpi():
+    """The MPI library, the world communicator handle and ``MPI_DOUBLE``.
 
     The operator reads an ``MPI_Comm`` variable at the address it is given, so
-    the test hands it the address of a variable that holds the handle of the
-    world communicator.  The handle of OpenMPI is the address of its global
-    ``ompi_mpi_comm_world``.  ``(None, None)`` without an OpenMPI to read.
+    the test hands it a variable that holds the handle of the world
+    communicator.  OpenMPI exports that handle as the address of its global
+    ``ompi_mpi_comm_world``; MPICH has no such global, so both handles come
+    from ``MPI_Comm_f2c`` / ``MPI_Type_f2c`` of the Fortran handles mpi4py
+    knows.  ``(None, None, None)`` without an MPI to read.
     """
-    for name in ("libmpi.so.40", "libmpi.so"):
+    for name in ("libmpi.so.12", "libmpi.so.40", "libmpi.so"):
         try:
             mpi = ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
         except OSError:
             continue
-        try:
-            world = ctypes.c_void_p(
-                ctypes.addressof(ctypes.c_char.in_dll(mpi, "ompi_mpi_comm_world"))
-            )
-        except (ValueError, AttributeError):
+        world, mpi_double = _handles(mpi)
+        if world is None:
             continue
         initialized = ctypes.c_int()
         mpi.MPI_Initialized(ctypes.byref(initialized))
@@ -76,13 +75,36 @@ def _world():
             # A rank that initializes MPI has to finalize it, or mpirun
             # reports the whole job as an abnormal termination.
             atexit.register(mpi.MPI_Finalize)
-        return mpi, world
-    return None, None
+        return mpi, world, mpi_double
+    return None, None, None
 
 
-def _address(mpi, name: str) -> ctypes.c_void_p:
-    """The handle of the MPI object ``ompi_<name>``, such as a datatype."""
-    return ctypes.c_void_p(ctypes.addressof(ctypes.c_char.in_dll(mpi, name)))
+def _handles(mpi):
+    """The world communicator and the double datatype, through any MPI."""
+    try:
+        from mpi4py import MPI
+    except ImportError:
+        MPI = None
+    if MPI is not None and hasattr(mpi, "MPI_Comm_f2c"):
+        mpi.MPI_Comm_f2c.argtypes = [ctypes.c_int]
+        mpi.MPI_Comm_f2c.restype = ctypes.c_void_p
+        mpi.MPI_Type_f2c.argtypes = [ctypes.c_int]
+        mpi.MPI_Type_f2c.restype = ctypes.c_void_p
+        return (
+            ctypes.c_void_p(mpi.MPI_Comm_f2c(int(MPI.COMM_WORLD.py2f()))),
+            ctypes.c_void_p(mpi.MPI_Type_f2c(int(MPI.DOUBLE.py2f()))),
+        )
+    try:
+        return (
+            ctypes.c_void_p(
+                ctypes.addressof(ctypes.c_char.in_dll(mpi, "ompi_mpi_comm_world"))
+            ),
+            ctypes.c_void_p(
+                ctypes.addressof(ctypes.c_char.in_dll(mpi, "ompi_mpi_double"))
+            ),
+        )
+    except (ValueError, AttributeError):
+        return None, None
 
 
 def _system(atoms: int = 192, length: float = 12.4447):
@@ -116,9 +138,9 @@ def test_rank_shares_add_up_to_the_frame_virial(
     monkeypatch.delenv("SOG_MIDTOWN_FULLBRICK", raising=False)
     if mesh_backend == "midtown":
         monkeypatch.setenv("SOG_MIDTOWN_FORM_A", "0")
-    mpi, world = _world()
+    mpi, world, mpi_double = _mpi()
     if mpi is None:
-        pytest.skip("the test needs an OpenMPI world communicator")
+        pytest.skip("the test needs an MPI world communicator (mpi4py or OpenMPI)")
     rank = ctypes.c_int()
     size = ctypes.c_int()
     mpi.MPI_Comm_rank(world, ctypes.byref(rank))
@@ -127,7 +149,6 @@ def test_rank_shares_add_up_to_the_frame_virial(
     if size < 2:
         pytest.skip("the test needs at least two MPI ranks (mpirun -np 2)")
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    mpi_double = _address(mpi, "ompi_mpi_double")
 
     coord, charge, mask, n_node, total, box = _system()
     kernel = SOGKernel(
@@ -236,9 +257,9 @@ def test_an_empty_rank_joins_the_slab_collective(
     rank and finite shares on the owner, not abort inside a kernel launch or
     hang in an all-to-all.
     """
-    mpi, world = _world()
+    mpi, world, mpi_double = _mpi()
     if mpi is None:
-        pytest.skip("the test needs an OpenMPI world communicator")
+        pytest.skip("the test needs an MPI world communicator (mpi4py or OpenMPI)")
     rank = ctypes.c_int()
     size = ctypes.c_int()
     mpi.MPI_Comm_rank(world, ctypes.byref(rank))

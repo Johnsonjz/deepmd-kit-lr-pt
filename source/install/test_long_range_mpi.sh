@@ -7,7 +7,9 @@
 # the same ranks.  Every rank is bound to its own device, so the same script
 # covers one-GPU and multi-GPU runners:
 #
-#   * ``OMPI_COMM_WORLD_LOCAL_RANK`` picks the device inside a rank;
+#   * the launcher's local rank (``OMPI_COMM_WORLD_LOCAL_RANK`` under
+#     OpenMPI, ``MPI_LOCALRANKID`` under MPICH, ``SLURM_LOCALID`` under
+#     Slurm) picks the device inside a rank;
 #   * a single-GPU runner maps every rank to device 0, which is the
 #     multi-rank case the upstream CI job already runs;
 #   * a multi-GPU runner spreads the ranks over the devices it sees.
@@ -49,7 +51,7 @@ TEST_ARGS=(
 run_ranks() {
 	local ranks=$1
 	if ! timeout "${TIMEOUT}" "${MPIEXEC}" -n "${ranks}" \
-		bash -c "export CUDA_VISIBLE_DEVICES=\$((\${OMPI_COMM_WORLD_LOCAL_RANK:-0} % ${GPU_COUNT})); exec \"\$@\"" \
+		bash -c "r=\${OMPI_COMM_WORLD_LOCAL_RANK:-\${MPI_LOCALRANKID:-\${SLURM_LOCALID:-0}}}; export CUDA_VISIBLE_DEVICES=\$((r % ${GPU_COUNT})); exec \"\$@\"" \
 		bash "${PYTHON}" -m pytest "${TEST_ARGS[@]}"; then
 		echo "multi-rank Python leg failed at ${ranks} ranks" >&2
 		return 1
