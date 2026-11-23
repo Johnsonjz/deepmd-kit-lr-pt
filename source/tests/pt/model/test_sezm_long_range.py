@@ -26,6 +26,10 @@ from deepmd.pt.long_range import (
 from deepmd.pt.model.model import (
     get_model,
 )
+from deepmd.pt.utils.compile_compat import (
+    SUPPORTED_COMPILE_TORCH,
+    _torch_release,
+)
 from deepmd.pt.model.task.invar_fitting import (
     InvarFitting,
 )
@@ -184,7 +188,10 @@ class TestSeZMLongRange(unittest.TestCase):
             ),
         )
 
-    @unittest.skipUnless(torch.cuda.is_available(), "compile parity needs a GPU")
+    @unittest.skipUnless(
+        torch.cuda.is_available() and _torch_release() in SUPPORTED_COMPILE_TORCH,
+        "compile parity needs a GPU and a torch release deepmd compiles on",
+    )
     def test_compiled_static_grid_matches_eager(self) -> None:
         cfg = _config(mode="ellipsoid", k_grid_bounds=[4, 4, 4])
         cfg["use_compile"] = True
