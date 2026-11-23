@@ -370,21 +370,25 @@ def test_kokkos_models_reuse_build_and_preserve_other_fixtures(
         path.touch()
     result, commands = run_script(build_tree, "--models-only=kokkos")
     assert result.returncode == 0, result.stderr
-    assert [c["name"] for c in commands] == ["python", "python", "python"]
+    assert [c["name"] for c in commands] == ["python", "python", "python", "python"]
     assert commands[0]["args"][0] == "-c"
     assert generated_models(commands) == [
         "gen_dpa4c_long_range.py",
         "gen_dpa4c_canonical.py",
+        "gen_dpa4_2l_canonical.py",
     ]
     assert commands[1]["args"][0] == "-u"
     assert commands[1]["args"][2:] == ["--compressed-only"]
     assert commands[2]["args"][0] == "-u"
     assert commands[2]["args"][2:] == []
+    assert commands[3]["args"][0] == "-u"
+    assert commands[3]["args"][2:] == []
     reports = generator_reports(root)
-    assert len(reports) == 2
+    assert len(reports) == 3
     assert {path.stem for path in reports} == {
         "gen_dpa4c_long_range",
         "gen_dpa4c_canonical",
+        "gen_dpa4_2l_canonical",
     }
     assert {row["exit_status"] for row in reports.values()} == {"0"}
     assert not (root / "source/build_tests/gtest-reports").exists()
