@@ -3399,12 +3399,15 @@ bool DeepPotPTExpt::canonical_graph_requires_source_csr() const {
 }
 
 bool DeepPotPTExpt::canonical_graph_requires_halo() const {
-  // A message-passing descriptor needs the halo only when the artifact was
-  // frozen with the cross-rank sibling.  A one-block DPA4 model reports
-  // has_message_passing=true at the descriptor level yet freezes no sibling
-  // (canonical_single_rank_only), so keying on the descriptor alone makes the
-  // host pair style pass 11/13 inputs to an 8-input regular canonical program.
-  return lower_input_is_canonical_ && has_comm_artifact_;
+  // The compact canonical lower reads the border plan of a decomposed frame
+  // whenever the atomic model needs a cross-rank ghost exchange: the exporter
+  // then puts the communicator and the halo exchange in the artifact's main
+  // ABI (a long-range module orders them before the cell).  A one-block
+  // artifact reports has_message_passing=false in its metadata and keeps the
+  // eight-tensor ABI, so this flag distinguishes the two cases; an archive
+  // frozen with the cross-rank sibling reports has_comm_artifact and keeps
+  // the halo too.
+  return lower_input_is_canonical_ && (has_comm_artifact_ || has_message_passing_);
 }
 
 bool DeepPotPTExpt::has_long_range() const { return long_range_; }
