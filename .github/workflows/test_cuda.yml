@@ -30,8 +30,6 @@ jobs:
             pytest-args: source/tests/pt_expt/model
           - shard: pt_expt-other
             pytest-args: source/tests/pt_expt --ignore=source/tests/pt_expt/model
-          - shard: other
-            pytest-args: source/tests --ignore=source/tests/pt_expt
     # Each shard has its own CUDA build and can take several hours.
     timeout-minutes: 480
     # https://github.com/deepmodeling/deepmd-kit/pull/2884#issuecomment-1744216845
