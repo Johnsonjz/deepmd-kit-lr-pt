@@ -20,6 +20,11 @@ if [[ "$run_kk" == 1 ]]; then
 	: "${LMP_KK:?}" "${WATER_SCAN0_PLUGIN_KK:?}"
 fi
 
+# Kokkos reads the device LAMMPS was launched on, so the harness binds one
+# GPU per rank; modulo the visible devices keeps a single-GPU runner working.
+gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l)
+[ "$gpu_count" -gt 0 ] || gpu_count=1
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 failed=0
@@ -49,7 +54,7 @@ for np in ${WATER_SCAN0_RANKS:-1 2 4}; do
 			"DP_BACKEND_PLUGIN_PATH=${WATER_SCAN0_BACKEND_PLUGIN_KK:-$DP_BACKEND_PLUGIN_PATH}" \
 			"LD_LIBRARY_PATH=$kk_ld" \
 			mpirun -np "$np" bash -c \
-			'export CUDA_VISIBLE_DEVICES=${OMPI_COMM_WORLD_LOCAL_RANK:-0}; exec "$@"' \
+			'export CUDA_VISIBLE_DEVICES=$(( ${OMPI_COMM_WORLD_LOCAL_RANK:-${MPI_LOCALRANKID:-${SLURM_LOCALID:-0}}} % '"${gpu_count}"' )); exec "$@"' \
 			bash "$LMP_KK" -k on g 1 -sf kk \
 			-var DATA "$WATER_SCAN0_LMP_DATA" -var MODEL "$WATER_SCAN0_MODEL" \
 			-var PLUGIN "$WATER_SCAN0_PLUGIN_KK" -log none -in "$here/in.water.lammps"
