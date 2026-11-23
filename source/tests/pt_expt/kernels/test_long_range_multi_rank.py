@@ -148,6 +148,8 @@ def test_rank_shares_add_up_to_the_frame_virial(
     rank, size = rank.value, size.value
     if size < 2:
         pytest.skip("the test needs at least two MPI ranks (mpirun -np 2)")
+    if slab and torch.cuda.device_count() < size:
+        pytest.skip("the slab solve needs one GPU per rank")
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
     coord, charge, mask, n_node, total, box = _system()
@@ -267,6 +269,8 @@ def test_an_empty_rank_joins_the_slab_collective(
     rank, size = rank.value, size.value
     if size < 2:
         pytest.skip("the test needs at least two MPI ranks (mpirun -np 2)")
+    if torch.cuda.device_count() < size:
+        pytest.skip("the slab solve needs one GPU per rank")
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
     coord, charge, mask, n_node, total, box = _system()
