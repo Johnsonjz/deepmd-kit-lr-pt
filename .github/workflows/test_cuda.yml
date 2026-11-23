@@ -365,7 +365,8 @@ jobs:
   pass:
     name: Pass testing on CUDA
     needs: [test_python, test_cc]
-    runs-on: ubuntu-slim
+    # A fork without GitHub-hosted runners needs the gate on the same machine.
+    runs-on: gpu
     if: always()
     steps:
       - name: Decide whether the needed jobs succeeded or failed
