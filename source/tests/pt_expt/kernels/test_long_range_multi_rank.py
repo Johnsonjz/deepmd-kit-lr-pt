@@ -27,6 +27,7 @@ from __future__ import (
 import array
 import atexit
 import ctypes
+import os
 
 import pytest
 import torch
@@ -77,6 +78,16 @@ def _mpi():
             atexit.register(mpi.MPI_Finalize)
         return mpi, world, mpi_double
     return None, None, None
+
+
+def _visible_devices() -> int:
+    """How many GPUs the job has, not only the ones this rank may open.
+
+    A launcher that binds one GPU per rank makes ``torch.cuda.device_count()``
+    one on every rank while the job still has one device per rank; it exports
+    the job-wide count so the slab cases know whether the ranks are distinct.
+    """
+    return int(os.environ.get("DP_VISIBLE_GPUS", torch.cuda.device_count()) or 1)
 
 
 def _handles(mpi):
@@ -148,7 +159,7 @@ def test_rank_shares_add_up_to_the_frame_virial(
     rank, size = rank.value, size.value
     if size < 2:
         pytest.skip("the test needs at least two MPI ranks (mpirun -np 2)")
-    if slab and torch.cuda.device_count() < size:
+    if slab and _visible_devices() < size:
         pytest.skip("the slab solve needs one GPU per rank")
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
@@ -269,7 +280,7 @@ def test_an_empty_rank_joins_the_slab_collective(
     rank, size = rank.value, size.value
     if size < 2:
         pytest.skip("the test needs at least two MPI ranks (mpirun -np 2)")
-    if torch.cuda.device_count() < size:
+    if _visible_devices() < size:
         pytest.skip("the slab solve needs one GPU per rank")
     torch.cuda.set_device(rank % torch.cuda.device_count())
 
