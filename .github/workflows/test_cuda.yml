@@ -54,6 +54,15 @@ jobs:
       - run: |
           UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
           OS_NAME="ubuntu${UBUNTU_VERSION}"
+          # A self-hosted runner usually carries the toolkit already; reuse it
+          # instead of requiring passwordless sudo on the machine.
+          if command -v nvcc >/dev/null 2>&1; then
+            CUDA_BIN=$(dirname "$(command -v nvcc)")
+            echo "CUDA toolkit present: $("$CUDA_BIN/nvcc" --version | tail -1)"
+            echo "CUDA_PATH=$(dirname "$CUDA_BIN")" >> "$GITHUB_ENV"
+            echo "$CUDA_BIN" >> "$GITHUB_PATH"
+            exit 0
+          fi
           echo "Current OS: ${OS_NAME}"
 
           wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
@@ -132,6 +141,15 @@ jobs:
       - run: |
           UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
           OS_NAME="ubuntu${UBUNTU_VERSION}"
+          # A self-hosted runner usually carries the toolkit already; reuse it
+          # instead of requiring passwordless sudo on the machine.
+          if command -v nvcc >/dev/null 2>&1; then
+            CUDA_BIN=$(dirname "$(command -v nvcc)")
+            echo "CUDA toolkit present: $("$CUDA_BIN/nvcc" --version | tail -1)"
+            echo "CUDA_PATH=$(dirname "$CUDA_BIN")" >> "$GITHUB_ENV"
+            echo "$CUDA_BIN" >> "$GITHUB_PATH"
+            exit 0
+          fi
           echo "Current OS: ${OS_NAME}"
 
           wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
@@ -292,6 +310,15 @@ jobs:
       - run: |
           UBUNTU_VERSION=$(lsb_release -rs | tr -d '.')
           OS_NAME="ubuntu${UBUNTU_VERSION}"
+          # A self-hosted runner usually carries the toolkit already; reuse it
+          # instead of requiring passwordless sudo on the machine.
+          if command -v nvcc >/dev/null 2>&1; then
+            CUDA_BIN=$(dirname "$(command -v nvcc)")
+            echo "CUDA toolkit present: $("$CUDA_BIN/nvcc" --version | tail -1)"
+            echo "CUDA_PATH=$(dirname "$CUDA_BIN")" >> "$GITHUB_ENV"
+            echo "$CUDA_BIN" >> "$GITHUB_PATH"
+            exit 0
+          fi
           wget https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME}/x86_64/cuda-keyring_1.1-1_all.deb \
           && sudo dpkg -i cuda-keyring_1.1-1_all.deb \
           && sudo apt-get update \
