@@ -38,7 +38,7 @@ jobs:
     # container:
     #   image: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
     #   options: --gpus all
-    if: github.repository_owner == 'deepmodeling' && (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test CUDA' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: (github.repository_owner == 'deepmodeling' || vars.SELF_CI == '1') && (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test CUDA' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -114,7 +114,7 @@ jobs:
             name: C++
           - suite: kokkos
             name: Kokkos
-    if: github.repository_owner == 'deepmodeling' && (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test CUDA' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    if: (github.repository_owner == 'deepmodeling' || vars.SELF_CI == '1') && (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test CUDA' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     steps:
       # Jobs run on separate runners, so the C++ job needs its own complete
       # CUDA toolchain and Python dependency installation.
@@ -278,7 +278,7 @@ jobs:
     # still run.
     name: Test long-range MPI and multi-GPU
     runs-on: ${{ vars.DP_MULTI_GPU_RUNNER || 'gpu' }}
-    if: github.repository_owner == 'deepmodeling' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test Multi GPU'))
+    if: (github.repository_owner == 'deepmodeling' || vars.SELF_CI == '1') && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test Multi GPU'))
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
@@ -334,4 +334,4 @@ jobs:
         with:
           jobs: ${{ toJSON(needs) }}
           # Require all Python, C++, and Kokkos matrix jobs on requested GPU runs.
-          allowed-skips: ${{ !(github.repository_owner == 'deepmodeling' && (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test CUDA' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')) && 'test_python, test_cc' || '' }}
+          allowed-skips: ${{ !((github.repository_owner == 'deepmodeling' || vars.SELF_CI == '1') && (github.event_name == 'pull_request' && github.event.label && github.event.label.name == 'Test CUDA' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')) && 'test_python, test_cc' || '' }}
