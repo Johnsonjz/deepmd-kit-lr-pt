@@ -50,10 +50,14 @@ class TestDPIPIInputValidation(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 1, msg=result.stderr)
+        # A CUDA build dlopens libcudart and reports it on stderr before the
+        # driver validates the atom names, so compare the driver's own line
+        # instead of the whole stream (fork CI builds that way).
+        lines = [line for line in result.stderr.splitlines() if line]
         self.assertEqual(
-            result.stderr,
+            lines[-1],
             "dp_ipi: Unknown atom name 'Xx' in coordinate file: "
-            "no matching entry in atom_type.\n",
+            "no matching entry in atom_type.",
         )
 
     def test_missing_atom_type_is_rejected_before_model_loading(self) -> None:
