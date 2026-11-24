@@ -228,6 +228,20 @@ class CallerStreamScope {
       return;
     }
 #ifdef DEEPMD_TORCH_HAS_CUDA
+    // c10::cuda::getStreamFromExternal stores the handle verbatim as a stream
+    // id and c10::cuda::CUDAStream::stream() treats an even, non-zero id as an
+    // external stream, but decodes an odd id as a native one: the caller then
+    // fails on its first PyTorch operation with "Unrecognized stream ...
+    // PRIORITY ...". A CUDA stream handle is aligned, so an odd value means the
+    // caller passed something else, which a caller built against another C API
+    // version does when its shifted arguments put, for example, an edge count
+    // in the stream slot. Name the fault here instead of inside PyTorch.
+    if ((reinterpret_cast<std::uintptr_t>(stream) & 1U) != 0U) {
+      throw deepmd::deepmd_exception(
+          "the caller stream is not a CUDA stream handle (its low bit is set); "
+          "the caller was probably built against another DeePMD-kit C API "
+          "version, so its arguments do not line up with this library");
+    }
     guard_.emplace(c10::cuda::getStreamFromExternal(
         static_cast<cudaStream_t>(stream),
         static_cast<c10::DeviceIndex>(device)));
