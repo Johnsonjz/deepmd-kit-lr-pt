@@ -123,6 +123,35 @@ if(DEFINED LAMMPS_SOURCE_ROOT OR DEFINED LAMMPS_VERSION)
     target_compile_definitions(${libname} PRIVATE LMP_KOKKOS)
     target_include_directories(${libname} PRIVATE ${LAMMPS_HEADER_DIR}/KOKKOS)
 
+    # The Kokkos launcher redirects these sources to nvcc for their device
+    # pass, and nvcc's host compiler does not inherit the include path that an
+    # mpiCC-style wrapper adds implicitly: without it LAMMPS' "mpi.h" is not
+    # found. Ask the wrapper for the path when FindMPI, which treats such a
+    # wrapper as self-sufficient, reports none.
+    find_package(MPI QUIET COMPONENTS CXX)
+    set(_mpi_include_dirs ${MPI_CXX_INCLUDE_DIRS})
+    if(NOT _mpi_include_dirs AND MPI_CXX_COMPILER)
+      foreach(_mpi_probe "--showme:compile" "-show")
+        execute_process(COMMAND ${MPI_CXX_COMPILER} ${_mpi_probe}
+                        OUTPUT_VARIABLE _mpi_probe_output
+                        ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(_mpi_probe_output)
+          separate_arguments(_mpi_probe_output UNIX_COMMAND "${_mpi_probe_output}")
+          foreach(_mpi_flag IN LISTS _mpi_probe_output)
+            if(_mpi_flag MATCHES "^-I")
+              list(APPEND _mpi_include_dirs "${_mpi_flag}")
+            endif()
+          endforeach()
+          if(_mpi_include_dirs)
+            break()
+          endif()
+        endif()
+      endforeach()
+    endif()
+    if(_mpi_include_dirs)
+      target_compile_options(${libname} PRIVATE ${_mpi_include_dirs})
+    endif()
+
     # A runtime LAMMPS plugin must use the Kokkos runtime already linked into
     # liblammps. Linking the static Kokkos libraries here creates a second CUDA
     # runtime instance and corrupts its shutdown state when the plugin is

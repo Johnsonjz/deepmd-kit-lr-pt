@@ -2,10 +2,15 @@
 /**
  * See https://docs.lammps.org/Developer_plugins.html
  */
+#include <string>
+
+#include "c_api.h"
 #include "compute_deepmd_fparam_dedn.h"
 #include "compute_deeptensor_atom.h"
 #include "deepmd_version.h"
+#include "error.h"
 #include "fix_dplr.h"
+#include "lammps.h"
 #include "lammpsplugin.h"
 #ifdef LMP_KOKKOS
 #include "pair_deepmd_kokkos.h"
@@ -59,6 +64,25 @@ static KSpace* pppmdplr(LAMMPS* lmp) { return new PPPMDPLR(lmp); }
 #endif
 
 extern "C" void lammpsplugin_init(void* lmp, void* handle, void* regfunc) {
+  // A C symbol hides a changed argument list: a binary built against another
+  // DeePMD-kit C API calls this library with shifted arguments instead of
+  // failing to load, and an old canonical call then hands its edge count to
+  // the stream argument. Compare the versions before registering any style.
+  const int loaded_api = DP_GetApiVersion();
+  if (loaded_api != DP_C_API_VERSION) {
+    static_cast<LAMMPS*>(lmp)->error->all(
+        FLERR,
+        std::string("DeePMD-kit C API version mismatch: this plugin was built "
+                    "for C API ") +
+            std::to_string(DP_C_API_VERSION) +
+            " but the loaded DeePMD-kit library reports " +
+            std::to_string(loaded_api) +
+            ". The argument lists differ, so a call reads the wrong arguments "
+            "(an old canonical call hands its edge count to the stream "
+            "argument). Put the library of the tree this plugin was built from "
+            "on LD_LIBRARY_PATH, or rebuild the plugin against that tree.");
+  }
+
   lammpsplugin_t plugin;
   lammpsplugin_regfunc register_plugin = (lammpsplugin_regfunc)regfunc;
 

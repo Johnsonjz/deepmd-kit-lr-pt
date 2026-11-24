@@ -15,7 +15,21 @@ extern "C" {
 /** C API version. Bumped whenever the API is changed.
  * @since API version 22
  */
-#define DP_C_API_VERSION 32
+#define DP_C_API_VERSION 33
+
+/**
+ * @brief Return the API version of the library this symbol resolves to.
+ *
+ * Compare the returned value with the DP_C_API_VERSION the caller was compiled
+ * against. A mismatch means the caller and the library follow different
+ * argument lists, which the C ABI cannot detect: a call then runs with shifted
+ * arguments instead of failing to load (API 31 to 32 changed the tail of
+ * DP_DPA4ComputeCanonicalGraphGPU, so an old caller handed its edge count to
+ * the new library's stream argument). Refuse to use such a library.
+ * @return the DP_C_API_VERSION of the library.
+ * @since API version 33
+ */
+extern int DP_GetApiVersion(void);
 
 /**
  * @brief Neighbor list.
@@ -554,10 +568,14 @@ extern void DP_DPA4ComputeCanonicalGraphGPU2(
     void* stream);
 
 /**
- * @brief API 31 canonical GPU evaluation without a halo exchange plan.
+ * @brief Canonical GPU evaluation with a halo exchange plan.
  *
- * The parameter order is preserved for existing binaries. A model that needs
- * halo exchange requires DP_DPA4ComputeCanonicalGraphGPU2.
+ * The argument list of API version 31, which shipped binaries were built
+ * against, is kept unchanged in API version 33: removing or reordering an
+ * argument of a C symbol is not detected at load time and shifts every later
+ * argument instead, so an old caller would hand this library its
+ * ``edge_storage`` as ``stream``. This entry point forwards to
+ * DP_DPA4ComputeCanonicalGraphGPU2, which is the entry point to build against.
  * @since API version 31
  */
 extern void DP_DPA4ComputeCanonicalGraphGPU(
@@ -575,6 +593,7 @@ extern void DP_DPA4ComputeCanonicalGraphGPU(
     const int64_t* d_source_order,
     const double* d_coord,
     void* world,
+    const DP_HaloExchange* halo,
     const double* box,
     int64_t nloc,
     int64_t nall_nodes,
