@@ -129,7 +129,11 @@ if(DEFINED LAMMPS_SOURCE_ROOT OR DEFINED LAMMPS_VERSION)
     # found. Ask the wrapper for the path when FindMPI, which treats such a
     # wrapper as self-sufficient, reports none.
     find_package(MPI QUIET COMPONENTS CXX)
+    # FindMPI reports include *directories*; the wrapper probe reports complete
+    # ``-I`` flags. Keep the two apart: passing a bare directory as a compile
+    # option makes the compiler read it as a second input file.
     set(_mpi_include_dirs ${MPI_CXX_INCLUDE_DIRS})
+    set(_mpi_include_flags "")
     if(NOT _mpi_include_dirs AND MPI_CXX_COMPILER)
       foreach(_mpi_probe "--showme:compile" "-show")
         execute_process(COMMAND ${MPI_CXX_COMPILER} ${_mpi_probe}
@@ -139,17 +143,20 @@ if(DEFINED LAMMPS_SOURCE_ROOT OR DEFINED LAMMPS_VERSION)
           separate_arguments(_mpi_probe_output UNIX_COMMAND "${_mpi_probe_output}")
           foreach(_mpi_flag IN LISTS _mpi_probe_output)
             if(_mpi_flag MATCHES "^-I")
-              list(APPEND _mpi_include_dirs "${_mpi_flag}")
+              list(APPEND _mpi_include_flags "${_mpi_flag}")
             endif()
           endforeach()
-          if(_mpi_include_dirs)
+          if(_mpi_include_flags)
             break()
           endif()
         endif()
       endforeach()
     endif()
     if(_mpi_include_dirs)
-      target_compile_options(${libname} PRIVATE ${_mpi_include_dirs})
+      target_include_directories(${libname} PRIVATE ${_mpi_include_dirs})
+    endif()
+    if(_mpi_include_flags)
+      target_compile_options(${libname} PRIVATE ${_mpi_include_flags})
     endif()
 
     # A runtime LAMMPS plugin must use the Kokkos runtime already linked into
