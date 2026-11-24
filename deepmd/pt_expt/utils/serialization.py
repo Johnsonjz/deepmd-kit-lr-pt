@@ -1693,13 +1693,15 @@ def _collect_metadata(
         meta["canonical_requires_source_csr"] = _canonical_requires_source_csr(
             model, lower_kind
         )
-        # A compact canonical artifact without the with-comm sibling runs its
-        # descriptor with comm_dict=None and reuses the ghost features of its
-        # first block for every later one. Record the limitation so a
-        # deployment can refuse the multi-rank case instead of running it.
+        # An artifact is faithful on a single rank only when its descriptor
+        # needs further blocks but the frozen lower carries neither the halo
+        # exchange in its main ABI nor the with-comm sibling.  A fused DPA4C
+        # lower puts the halo into the main ABI (eleven tensor inputs), so it
+        # stays usable across ranks even without a sibling.
         single_rank_only = bool(
             meta["has_message_passing"]
             and not _needs_canonical_with_comm(model, lower_kind)
+            and not model.atomic_model.has_message_passing_across_ranks()
         )
         meta["canonical_single_rank_only"] = single_rank_only
         if single_rank_only:
